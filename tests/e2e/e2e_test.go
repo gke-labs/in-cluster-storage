@@ -15,12 +15,16 @@
 package e2e
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestE2E(t *testing.T) {
@@ -192,4 +196,168 @@ spec:
 	}
 
 	h.DeletePod(pod3Name, "default")
+
+	// Step 4: Verify Incremental Snapshot & Deletion/Whiteout behavior
+	incVolumeID := "test-incremental-vol"
+	pod4Name := "test-pod-4"
+	pod4Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "echo 'first file' > /data/file1.txt && echo 'second file' > /data/file2.txt && sync && sleep 10"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: agentfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod4Name, incVolumeID)
+
+	t.Logf("Creating Pod 4 (Incremental initial state)")
+	h.KubectlApplyContent(pod4Name, pod4Yaml)
+	if err := h.WaitForPodReady(pod4Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Test Pod 4 failed to start: %v", err)
+	}
+
+	time.Sleep(5 * time.Second)
+	t.Logf("Deleting Pod 4 to trigger snapshot push")
+	h.DeletePod(pod4Name, "default")
+	t.Logf("Pod 4 deleted")
+
+	// Verify snapshot has file1.txt and file2.txt
+	snap1 := getLatestSnapshot(t, h, incVolumeID)
+	t.Logf("Snapshot 1: %v", snap1)
+	if len(snap1.Files) != 2 {
+		t.Fatalf("Expected 2 files in initial snapshot, got %d", len(snap1.Files))
+	}
+
+	hasFile1 := false
+	hasFile2 := false
+	var file2Metadata *pb.FileMetadata
+
+	for _, file := range snap1.Files {
+		if file.Path == "file1.txt" {
+			hasFile1 = true
+		}
+		if file.Path == "file2.txt" {
+			hasFile2 = true
+			file2Metadata = file
+		}
+	}
+	if !hasFile1 || !hasFile2 {
+		t.Fatalf("Snapshot 1 is missing file1.txt or file2.txt")
+	}
+
+	// Now start Pod 5:
+	// - Reads both file1.txt and file2.txt to verify they exist.
+	// - Deletes file1.txt.
+	// - Creates file3.txt.
+	pod5Name := "test-pod-5"
+	pod5Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "cat /data/file1.txt && cat /data/file2.txt && rm /data/file1.txt && echo 'third file' > /data/file3.txt && sync && sleep 10"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: agentfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod5Name, incVolumeID)
+
+	t.Logf("Creating Pod 5 (modifying volume)")
+	h.KubectlApplyContent(pod5Name, pod5Yaml)
+	if err := h.WaitForPodReady(pod5Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Test Pod 5 failed to start: %v", err)
+	}
+
+	time.Sleep(5 * time.Second)
+	logs5 := h.GetPodLogsByName(pod5Name, "default")
+	if !strings.Contains(logs5, "first file") || !strings.Contains(logs5, "second file") {
+		t.Fatalf("Pod 5 did not read file1.txt or file2.txt successfully. Logs:\n%s", logs5)
+	}
+
+	t.Logf("Deleting Pod 5 to trigger second snapshot push")
+	h.DeletePod(pod5Name, "default")
+	t.Logf("Pod 5 deleted")
+
+	// Verify second snapshot
+	snap2 := getLatestSnapshot(t, h, incVolumeID)
+	t.Logf("Snapshot 2: %v", snap2)
+
+	// It should have exactly file2.txt and file3.txt, but NOT file1.txt (which was deleted)
+	hasFile1_2 := false
+	hasFile2_2 := false
+	hasFile3_2 := false
+	var file2Metadata_2 *pb.FileMetadata
+
+	for _, file := range snap2.Files {
+		if file.Path == "file1.txt" {
+			hasFile1_2 = true
+		}
+		if file.Path == "file2.txt" {
+			hasFile2_2 = true
+			file2Metadata_2 = file
+		}
+		if file.Path == "file3.txt" {
+			hasFile3_2 = true
+		}
+	}
+
+	if hasFile1_2 {
+		t.Fatalf("Deleted file 'file1.txt' still exists in the second snapshot!")
+	}
+	if !hasFile2_2 {
+		t.Fatalf("Expected file 'file2.txt' to exist in the second snapshot")
+	}
+	if !hasFile3_2 {
+		t.Fatalf("Expected new file 'file3.txt' to exist in the second snapshot")
+	}
+
+	// Verify that the snapshot was incremental:
+	// file2.txt was not modified, so its metadata (like Sha256 and ModTime) should be identical!
+	if file2Metadata_2.Sha256 != file2Metadata.Sha256 {
+		t.Fatalf("file2.txt Sha256 mismatch: expected %q, got %q (snapshot was not incremental or file was corrupted)", file2Metadata.Sha256, file2Metadata_2.Sha256)
+	}
+	if !file2Metadata_2.ModTime.AsTime().Equal(file2Metadata.ModTime.AsTime()) {
+		t.Fatalf("file2.txt ModTime changed: expected %v, got %v", file2Metadata.ModTime.AsTime(), file2Metadata_2.ModTime.AsTime())
+	}
+
+	t.Logf("Successfully verified incremental and whiteout snapshotting behavior!")
+}
+
+func getLatestSnapshot(t *testing.T, h *Harness, volumeID string) *pb.SnapshotMetadata {
+	out, err := h.RunInPod("agentfs-controller-0", "default", "base64", filepath.Join("/data/snapshots", volumeID, "latest.pb"))
+	if err != nil {
+		t.Fatalf("Failed to get snapshot from controller: %v", err)
+	}
+	cleanOut := strings.Join(strings.Fields(out), "")
+	data, err := base64.StdEncoding.DecodeString(cleanOut)
+	if err != nil {
+		t.Fatalf("Failed to base64 decode snapshot output: %v\nRaw output:\n%s", err, out)
+	}
+	snapshot := &pb.SnapshotMetadata{}
+	if err := proto.Unmarshal(data, snapshot); err != nil {
+		t.Fatalf("Failed to unmarshal snapshot: %v", err)
+	}
+	return snapshot
 }

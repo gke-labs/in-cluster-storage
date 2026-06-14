@@ -165,13 +165,23 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 	targetPath := req.GetTargetPath()
 	klog.Infof("Publishing volume %s (logical: %s) to %s", k8sVolumeID, logicalVolumeID, targetPath)
 
-	sourcePath := filepath.Join(*storagePath, k8sVolumeID)
-	if err := os.MkdirAll(sourcePath, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create source path %s: %v", sourcePath, err)
+	volumeDir := filepath.Join(*storagePath, k8sVolumeID)
+	lowerPath := filepath.Join(volumeDir, "lower")
+	upperPath := filepath.Join(volumeDir, "upper")
+	workPath := filepath.Join(volumeDir, "work")
+
+	if err := os.MkdirAll(lowerPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create lower path %s: %v", lowerPath, err)
+	}
+	if err := os.MkdirAll(upperPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create upper path %s: %v", upperPath, err)
+	}
+	if err := os.MkdirAll(workPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create work path %s: %v", workPath, err)
 	}
 
-	// Pull snapshot from controller
-	if err := d.pullSnapshot(ctx, logicalVolumeID, sourcePath); err != nil {
+	// Pull snapshot from controller to lower directory
+	if err := d.pullSnapshot(ctx, logicalVolumeID, lowerPath); err != nil {
 		klog.Errorf("failed to pull snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
 	}
 
@@ -189,9 +199,10 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
-	// Bind mount the source directory to the target path
-	if err := syscall.Mount(sourcePath, targetPath, "none", syscall.MS_BIND, ""); err != nil {
-		return nil, fmt.Errorf("failed to mount %s to %s: %v", sourcePath, targetPath, err)
+	// Mount overlayfs to target path
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerPath, upperPath, workPath)
+	if err := syscall.Mount("overlay", targetPath, "overlay", 0, opts); err != nil {
+		return nil, fmt.Errorf("failed to mount overlayfs to %s: %v", targetPath, err)
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
@@ -218,12 +229,12 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 	}
 
 	// Push snapshot to controller
-	sourcePath := filepath.Join(*storagePath, k8sVolumeID)
-	if err := d.pushSnapshot(ctx, logicalVolumeID, sourcePath); err != nil {
+	volumeDir := filepath.Join(*storagePath, k8sVolumeID)
+	if err := d.pushSnapshot(ctx, logicalVolumeID, volumeDir); err != nil {
 		klog.Errorf("failed to push snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
 	} else {
-		if err := os.RemoveAll(sourcePath); err != nil {
-			klog.Errorf("failed to cleanup source path %s: %v", sourcePath, err)
+		if err := os.RemoveAll(volumeDir); err != nil {
+			klog.Errorf("failed to cleanup source path %s: %v", volumeDir, err)
 		}
 	}
 
@@ -290,19 +301,52 @@ func (d *agentFSDriver) pushSnapshot(ctx context.Context, volumeID, sourcePath s
 
 	client := pb.NewAgentFSControllerClient(conn)
 
-	snapshot := &pb.SnapshotMetadata{}
+	// Fetch latest snapshot from the controller to use as base
+	resp, err := client.GetLatestSnapshot(ctx, &pb.GetLatestSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		return fmt.Errorf("failed to get latest snapshot: %v", err)
+	}
 
-	err = filepath.Walk(sourcePath, func(path string, info os.FileInfo, err error) error {
+	filesMap := make(map[string]*pb.FileMetadata)
+	if resp != nil && resp.Snapshot != nil {
+		for _, file := range resp.Snapshot.Files {
+			filesMap[file.Path] = file
+		}
+	}
+
+	upperPath := filepath.Join(sourcePath, "upper")
+
+	err = filepath.Walk(upperPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
+
+		relPath, err := filepath.Rel(upperPath, path)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
 			return nil
 		}
 
-		relPath, err := filepath.Rel(sourcePath, path)
-		if err != nil {
-			return err
+		// Check if it is a whiteout (deleted file/directory)
+		sys, ok := info.Sys().(*syscall.Stat_t)
+		isWhiteout := ok && (info.Mode()&os.ModeCharDevice != 0) && (sys.Rdev == 0)
+
+		if isWhiteout {
+			// Delete this file and any of its descendants (if it was a directory)
+			delete(filesMap, relPath)
+			prefix := relPath + "/"
+			for k := range filesMap {
+				if strings.HasPrefix(k, prefix) {
+					delete(filesMap, k)
+				}
+			}
+			return nil
+		}
+
+		if info.IsDir() {
+			return nil
 		}
 
 		sha, err := calculateSHA256(path)
@@ -310,13 +354,13 @@ func (d *agentFSDriver) pushSnapshot(ctx context.Context, volumeID, sourcePath s
 			return err
 		}
 
-		snapshot.Files = append(snapshot.Files, &pb.FileMetadata{
+		filesMap[relPath] = &pb.FileMetadata{
 			Path:    relPath,
 			Mode:    uint32(info.Mode()),
 			Size:    info.Size(),
 			ModTime: timestamppb.New(info.ModTime()),
 			Sha256:  sha,
-		})
+		}
 
 		// Check if controller has the blob
 		hasResp, err := client.HasBlob(ctx, &pb.HasBlobRequest{Sha256: sha})
@@ -335,6 +379,12 @@ func (d *agentFSDriver) pushSnapshot(ctx context.Context, volumeID, sourcePath s
 
 	if err != nil {
 		return err
+	}
+
+	// Rebuild the snapshot files list
+	snapshot := &pb.SnapshotMetadata{}
+	for _, file := range filesMap {
+		snapshot.Files = append(snapshot.Files, file)
 	}
 
 	_, err = client.UploadSnapshot(ctx, &pb.UploadSnapshotRequest{
