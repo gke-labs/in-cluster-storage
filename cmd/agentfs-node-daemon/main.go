@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"flag"
@@ -86,12 +87,17 @@ func main() {
 			pending:            make(map[string]*pb.FileMetadata),
 			downloadOperations: make(map[string]*downloadOperation),
 		},
-		fanotifyFd: -1,
-		ctx:        ctx,
-		cancelFunc: cancel,
-		grpcServer: server,
+		fanotifyFd:            -1,
+		rootContextCancelFunc: cancel,
 	}
 	defer driver.closeControllerConn()
+
+	// Stop gRPC server gracefully when context is cancelled (including fatal lazy load errors)
+	go func() {
+		<-ctx.Done()
+		klog.Info("Shutting down gRPC server cleanly...")
+		server.GracefulStop()
+	}()
 
 	if *lazyLoadThreshold >= 0 {
 		if err := driver.startLazyLoader(ctx); err != nil {
@@ -123,12 +129,12 @@ func parseEndpoint(endpoint string) (string, string, error) {
 
 type downloadOperation struct {
 	sync.Mutex
-	path      string
-	meta      *pb.FileMetadata
-	driver    *agentFSDriver
-	done      bool
-	err       error
-	waitCh    chan struct{}
+	path   string
+	meta   *pb.FileMetadata
+	driver *agentFSDriver
+	done   bool
+	err    error
+	waitCh chan struct{}
 }
 
 func newDownloadOperation(path string, meta *pb.FileMetadata, driver *agentFSDriver) *downloadOperation {
@@ -161,8 +167,10 @@ func (op *downloadOperation) Download(ctx context.Context) error {
 }
 
 type lazyLoader struct {
-	sync.Mutex
-	pending            map[string]*pb.FileMetadata // absolute path on disk -> metadata
+	pendingMu sync.RWMutex
+	pending   map[string]*pb.FileMetadata // absolute path on disk -> metadata
+
+	downloadMu         sync.Mutex
 	downloadOperations map[string]*downloadOperation
 }
 
@@ -179,9 +187,7 @@ type agentFSDriver struct {
 	fanotifyFd int
 
 	// Clean shutdown / context integration
-	ctx        context.Context
-	cancelFunc context.CancelFunc
-	grpcServer *grpc.Server
+	rootContextCancelFunc context.CancelFunc
 
 	// Controller connection cache
 	controllerConn     *grpc.ClientConn
@@ -338,18 +344,21 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 		klog.Errorf("failed to push snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
 	} else {
 		// Clean up lazyLoader pending entries for this volume
-		d.lazyLoader.Lock()
+		d.lazyLoader.pendingMu.Lock()
 		for path := range d.lazyLoader.pending {
 			if strings.HasPrefix(path, volumeDir) {
 				delete(d.lazyLoader.pending, path)
 			}
 		}
+		d.lazyLoader.pendingMu.Unlock()
+
+		d.lazyLoader.downloadMu.Lock()
 		for path := range d.lazyLoader.downloadOperations {
 			if strings.HasPrefix(path, volumeDir) {
 				delete(d.lazyLoader.downloadOperations, path)
 			}
 		}
-		d.lazyLoader.Unlock()
+		d.lazyLoader.downloadMu.Unlock()
 
 		if err := os.RemoveAll(volumeDir); err != nil {
 			klog.Errorf("failed to cleanup source path %s: %v", volumeDir, err)
@@ -413,9 +422,9 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 			}
 
 			// Register in lazyLoader
-			d.lazyLoader.Lock()
+			d.lazyLoader.pendingMu.Lock()
 			d.lazyLoader.pending[targetFile] = file
-			d.lazyLoader.Unlock()
+			d.lazyLoader.pendingMu.Unlock()
 
 			continue
 		}
@@ -652,44 +661,64 @@ func (d *agentFSDriver) startLazyLoader(ctx context.Context) error {
 	// Mark storagePath with FAN_MARK_MOUNT to watch all filesystem events on that mount
 	err = unix.FanotifyMark(fd, uint(unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT), uint64(unix.FAN_OPEN_PERM), unix.AT_FDCWD, *storagePath)
 	if err != nil {
-		unix.Close(fd)
+		if closeErr := unix.Close(fd); closeErr != nil {
+			klog.Errorf("failed to close fanotify fd during recovery: %v", closeErr)
+		}
 		d.fanotifyFd = -1
 		return fmt.Errorf("failed to mark fanotify on %s: %v", *storagePath, err)
 	}
 
 	klog.Infof("Successfully initialized fanotify lazy loader on %s with threshold %d bytes", *storagePath, *lazyLoadThreshold)
 
-	go d.fanotifyLoop(ctx)
+	go func() {
+		if err := d.fanotifyLoop(ctx); err != nil {
+			klog.Errorf("fanotify loop terminated with error: %v", err)
+			d.shutdownCleanly()
+		}
+	}()
 	return nil
 }
 
 func (d *agentFSDriver) shutdownCleanly() {
-	if d.ctx == nil {
-		return
-	}
-	select {
-	case <-d.ctx.Done():
-		return // already shutting down
-	default:
-	}
-
 	klog.Errorf("Cleanly shutting down agentfs-node-daemon due to a fatal fanotify/lazy-loading error")
-	if d.cancelFunc != nil {
-		d.cancelFunc()
-	}
-	if d.grpcServer != nil {
-		go d.grpcServer.GracefulStop()
-	}
+	d.rootContextCancelFunc()
 }
 
-func (d *agentFSDriver) fanotifyLoop(ctx context.Context) {
+// getMyHostPid finds the actual host PID of the current process, even if running
+// in a container-local PID namespace. This is crucial for avoiding self-deadlocks
+// when the daemon reads/writes files on the monitored OverlayFS mounts.
+func getMyHostPid() int32 {
+	f, err := os.Open("/proc/self/status")
+	if err != nil {
+		return int32(os.Getpid())
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "NSpid:") {
+			fields := strings.Fields(line)
+			if len(fields) > 1 {
+				var hostPid int32
+				if _, err := fmt.Sscanf(fields[1], "%d", &hostPid); err == nil {
+					return hostPid
+				}
+			}
+		}
+	}
+	return int32(os.Getpid())
+}
+
+func (d *agentFSDriver) fanotifyLoop(ctx context.Context) error {
 	buf := make([]byte, 4096)
-	myPid := int32(os.Getpid())
+	myPid := getMyHostPid()
+	klog.Infof("Starting fanotify loop (my PID local/host matches: %d / %d)", os.Getpid(), myPid)
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		default:
 		}
 
@@ -702,20 +731,16 @@ func (d *agentFSDriver) fanotifyLoop(ctx context.Context) {
 				eventLen := int(metadata.Event_len)
 
 				if eventLen < sizeofMetadata {
-					klog.Errorf("corrupt fanotify event received: eventLen %d is smaller than sizeofMetadata %d", eventLen, sizeofMetadata)
-					d.shutdownCleanly()
-					return
+					return fmt.Errorf("corrupt fanotify event received: eventLen %d is smaller than sizeofMetadata %d", eventLen, sizeofMetadata)
 				}
 
-				if metadata.Mask&uint64(unix.FAN_OPEN_PERM) == 0 {
-					klog.Errorf("received unexpected fanotify event mask: 0x%x (expected FAN_OPEN_PERM)", metadata.Mask)
+				if metadata.Mask != uint64(unix.FAN_OPEN_PERM) {
 					if metadata.Fd != int32(unix.FAN_NOFD) {
-						if err := unix.Close(int(metadata.Fd)); err != nil {
-							klog.Errorf("failed to close unexpected event fd %d: %v", metadata.Fd, err)
+						if closeErr := unix.Close(int(metadata.Fd)); closeErr != nil {
+							klog.Errorf("failed to close unexpected event fd %d: %v", metadata.Fd, closeErr)
 						}
 					}
-					d.shutdownCleanly()
-					return
+					return fmt.Errorf("received unexpected fanotify event mask: 0x%x (expected FAN_OPEN_PERM)", metadata.Mask)
 				}
 
 				eventFd := int(metadata.Fd)
@@ -723,8 +748,8 @@ func (d *agentFSDriver) fanotifyLoop(ctx context.Context) {
 				// Skip if event caused by our own daemon process to avoid deadlock
 				if metadata.Pid == myPid {
 					d.sendFanotifyResponse(eventFd, unix.FAN_ALLOW)
-					if err := unix.Close(eventFd); err != nil {
-						klog.Errorf("failed to close self-event fd %d: %v", eventFd, err)
+					if closeErr := unix.Close(eventFd); closeErr != nil {
+						klog.Errorf("failed to close self-event fd %d: %v", eventFd, closeErr)
 					}
 				} else {
 					// Handle the event concurrently to allow other processes to open files in parallel
@@ -739,20 +764,20 @@ func (d *agentFSDriver) fanotifyLoop(ctx context.Context) {
 			if err == unix.EINTR {
 				continue
 			}
-			klog.Errorf("fanotify read error: %v", err)
-			d.shutdownCleanly()
-			return
+			return fmt.Errorf("fanotify read error: %v", err)
 		}
 	}
 }
 
 func (d *agentFSDriver) handleFanotifyEvent(ctx context.Context, pid int32, eventFd int) {
 	defer func() {
-		if err := unix.Close(eventFd); err != nil {
-			klog.Errorf("failed to close event fd %d: %v", eventFd, err)
+		if closeErr := unix.Close(eventFd); closeErr != nil {
+			klog.Errorf("failed to close event fd %d: %v", eventFd, closeErr)
 		}
 	}()
 
+	// Resolving symbolic links under /proc/self/fd is the standard, documented method for
+	// fanotify applications to map an open event file descriptor back to its full path.
 	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", eventFd))
 	if err != nil {
 		klog.Warningf("failed to resolve path for event fd %d: %v. Failing closed.", eventFd, err)
@@ -761,15 +786,17 @@ func (d *agentFSDriver) handleFanotifyEvent(ctx context.Context, pid int32, even
 	}
 
 	// Check if path is in our pending list
-	d.lazyLoader.Lock()
+	d.lazyLoader.pendingMu.RLock()
 	meta, exists := d.lazyLoader.pending[path]
+	d.lazyLoader.pendingMu.RUnlock()
+
 	if !exists {
-		d.lazyLoader.Unlock()
 		// Not a pending lazy-loaded file, allow immediately
 		d.sendFanotifyResponse(eventFd, unix.FAN_ALLOW)
 		return
 	}
 
+	d.lazyLoader.downloadMu.Lock()
 	op, found := d.lazyLoader.downloadOperations[path]
 	var isInitiator bool
 	if !found {
@@ -777,7 +804,7 @@ func (d *agentFSDriver) handleFanotifyEvent(ctx context.Context, pid int32, even
 		d.lazyLoader.downloadOperations[path] = op
 		isInitiator = true
 	}
-	d.lazyLoader.Unlock()
+	d.lazyLoader.downloadMu.Unlock()
 
 	klog.Infof("Lazy loading file requested by PID %d: %s (initiator: %t)", pid, path, isInitiator)
 
@@ -788,18 +815,18 @@ func (d *agentFSDriver) handleFanotifyEvent(ctx context.Context, pid int32, even
 			d.sendFanotifyResponse(eventFd, unix.FAN_DENY)
 		} else {
 			// Success! Remove from pending list
-			d.lazyLoader.Lock()
+			d.lazyLoader.pendingMu.Lock()
 			delete(d.lazyLoader.pending, path)
-			d.lazyLoader.Unlock()
+			d.lazyLoader.pendingMu.Unlock()
 
 			d.sendFanotifyResponse(eventFd, unix.FAN_ALLOW)
 		}
 
-		d.lazyLoader.Lock()
+		d.lazyLoader.downloadMu.Lock()
 		delete(d.lazyLoader.downloadOperations, path)
-		d.lazyLoader.Unlock()
+		d.lazyLoader.downloadMu.Unlock()
 	} else {
-		// Wait for the download to complete
+		// Wait for the download to complete, then fallthrough to evaluate success status
 		select {
 		case <-op.waitCh:
 		case <-ctx.Done():

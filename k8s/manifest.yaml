@@ -75,6 +75,7 @@ spec:
       labels:
         app: agentfs-node-daemon
     spec:
+      hostPID: true
       serviceAccountName: agentfs-node-daemon
       containers:
         - name: node-driver-registrar
