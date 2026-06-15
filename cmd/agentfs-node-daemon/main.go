@@ -17,7 +17,6 @@ limitations under the License.
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"flag"
@@ -684,36 +683,10 @@ func (d *agentFSDriver) shutdownCleanly() {
 	d.rootContextCancelFunc()
 }
 
-// getMyHostPid finds the actual host PID of the current process, even if running
-// in a container-local PID namespace. This is crucial for avoiding self-deadlocks
-// when the daemon reads/writes files on the monitored OverlayFS mounts.
-func getMyHostPid() int32 {
-	f, err := os.Open("/proc/self/status")
-	if err != nil {
-		return int32(os.Getpid())
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "NSpid:") {
-			fields := strings.Fields(line)
-			if len(fields) > 1 {
-				var hostPid int32
-				if _, err := fmt.Sscanf(fields[1], "%d", &hostPid); err == nil {
-					return hostPid
-				}
-			}
-		}
-	}
-	return int32(os.Getpid())
-}
-
 func (d *agentFSDriver) fanotifyLoop(ctx context.Context) error {
 	buf := make([]byte, 4096)
-	myPid := getMyHostPid()
-	klog.Infof("Starting fanotify loop (my PID local/host matches: %d / %d)", os.Getpid(), myPid)
+	myPid := int32(os.Getpid())
+	klog.Infof("Starting fanotify loop (my PID: %d)", myPid)
 
 	for {
 		select {
@@ -734,13 +707,13 @@ func (d *agentFSDriver) fanotifyLoop(ctx context.Context) error {
 					return fmt.Errorf("corrupt fanotify event received: eventLen %d is smaller than sizeofMetadata %d", eventLen, sizeofMetadata)
 				}
 
-				if metadata.Mask != uint64(unix.FAN_OPEN_PERM) {
+				if (metadata.Mask & uint64(unix.FAN_OPEN_PERM)) == 0 {
 					if metadata.Fd != int32(unix.FAN_NOFD) {
 						if closeErr := unix.Close(int(metadata.Fd)); closeErr != nil {
 							klog.Errorf("failed to close unexpected event fd %d: %v", metadata.Fd, closeErr)
 						}
 					}
-					return fmt.Errorf("received unexpected fanotify event mask: 0x%x (expected FAN_OPEN_PERM)", metadata.Mask)
+					return fmt.Errorf("received unexpected fanotify event mask: 0x%x (expected FAN_OPEN_PERM bit to be set)", metadata.Mask)
 				}
 
 				eventFd := int(metadata.Fd)

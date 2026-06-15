@@ -44,13 +44,6 @@ func TestLazyLoaderInitialization(t *testing.T) {
 	}
 }
 
-func TestGetMyHostPid(t *testing.T) {
-	pid := getMyHostPid()
-	if pid <= 0 {
-		t.Fatalf("expected host PID to be greater than 0, got %d", pid)
-	}
-}
-
 func TestLazyLoaderCoordinationWithDownloadOperation(t *testing.T) {
 	// Simple test exercising the split lock initialization and basic status of pending map
 	d := &agentFSDriver{
