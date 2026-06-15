@@ -112,10 +112,12 @@ func (s *server) GetLatestSnapshot(ctx context.Context, req *pb.GetLatestSnapsho
 					return nil, fmt.Errorf("failed to create placeholder for %s: %v", file.Path, err)
 				}
 				if err := f.Truncate(file.Size); err != nil {
-					f.Close()
+					_ = f.Close()
 					return nil, fmt.Errorf("failed to truncate placeholder for %s: %v", file.Path, err)
 				}
-				f.Close()
+				if err := f.Close(); err != nil {
+					return nil, fmt.Errorf("failed to close placeholder for %s: %v", file.Path, err)
+				}
 			} else {
 				// Copy fully downloaded file
 				blobPath := filepath.Join(*dataPath, "blobs", file.Sha256)
@@ -136,7 +138,10 @@ func (s *server) GetLatestSnapshot(ctx context.Context, req *pb.GetLatestSnapsho
 			return nil, fmt.Errorf("failed to create temp erofs img: %v", err)
 		}
 		imgPath := imgFile.Name()
-		imgFile.Close()
+		if err := imgFile.Close(); err != nil {
+			os.Remove(imgPath)
+			return nil, fmt.Errorf("failed to close temp erofs img: %v", err)
+		}
 		defer os.Remove(imgPath)
 
 		cmd := exec.Command("mkfs.erofs", imgPath, stageDir)
