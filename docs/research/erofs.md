@@ -2,7 +2,7 @@
 
 **Author:** Gemini CLI / codebot-robot  
 **Date:** June 15, 2026  
-**Status:** Proposal / Research Phase  
+**Status:** Implemented / Configurable Feature  
 **Issue Reference:** Issue #8 (Try building EROFS filesystem)
 
 ---

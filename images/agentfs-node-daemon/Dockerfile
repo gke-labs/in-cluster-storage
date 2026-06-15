@@ -23,8 +23,8 @@ RUN CGO_ENABLED=0 go build -o agentfs-node-daemon ./cmd/agentfs-node-daemon
 
 FROM debian:bookworm-slim
 
-# Install mount utilities
-RUN apt-get update && apt-get install -y mount ca-certificates && rm -rf /var/lib/apt/lists/*
+# Install mount utilities and erofs-utils
+RUN apt-get update && apt-get install -y mount ca-certificates erofs-utils && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/agentfs-node-daemon /usr/local/bin/agentfs-node-daemon
 

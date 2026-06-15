@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -46,6 +47,7 @@ var (
 	storagePath       = flag.String("storage-path", "/var/lib/agentfs", "Base path for storage")
 	controllerAddress = flag.String("controller-address", "agentfs-controller:50051", "AgentFS Controller address")
 	lazyLoadThreshold = flag.Int64("lazy-load-threshold", -1, "Threshold in bytes. Files larger than or equal to this will be lazy loaded. Set to -1 to disable.")
+	enableEROFS       = flag.Bool("enable-erofs", false, "Use EROFS to mount the base readonly layer instead of classic mode.")
 )
 
 func main() {
@@ -82,7 +84,8 @@ func main() {
 	defer cancel()
 
 	driver := &agentFSDriver{
-		nodeID: *nodeID,
+		nodeID:      *nodeID,
+		enableEROFS: *enableEROFS,
 		lazyLoader: lazyLoader{
 			pending:            make(map[string]*pb.FileMetadata),
 			downloadOperations: make(map[string]*downloadOperation),
@@ -182,7 +185,8 @@ type agentFSDriver struct {
 	csi.UnimplementedIdentityServer
 	csi.UnimplementedNodeServer
 
-	nodeID string
+	nodeID      string
+	enableEROFS bool
 
 	// volumeMappings maps K8s volume ID to logical volume ID (if provided in volumeContext)
 	volumeMappings sync.Map
@@ -421,6 +425,16 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 		}
 	}
 
+	// Try to unmount the lower path if we are in EROFS mode
+	if d.enableEROFS {
+		lowerPath := filepath.Join(*storagePath, k8sVolumeID, "lower")
+		if err := syscall.Unmount(lowerPath, 0); err != nil {
+			if err != syscall.EINVAL {
+				klog.Warningf("Failed to unmount lower EROFS mount %s: %v", lowerPath, err)
+			}
+		}
+	}
+
 	// Push snapshot to controller
 	volumeDir := filepath.Join(*storagePath, k8sVolumeID)
 	if err := d.pushSnapshot(ctx, logicalVolumeID, volumeDir); err != nil {
@@ -452,6 +466,11 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 }
 
 func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath string) error {
+	start := time.Now()
+	defer func() {
+		klog.Infof("[PERFORMANCE] pullSnapshot for volume %s took %v (EROFS: %t)", volumeID, time.Since(start), d.enableEROFS)
+	}()
+
 	conn, err := d.getControllerConn()
 	if err != nil {
 		return err
@@ -468,19 +487,35 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 		return nil
 	}
 
+	var stagePath string
+	if d.enableEROFS {
+		volumeDir := filepath.Dir(sourcePath)
+		stagePath = filepath.Join(volumeDir, "erofs-stage")
+		if err := os.MkdirAll(stagePath, 0755); err != nil {
+			return fmt.Errorf("failed to create erofs staging dir %s: %v", stagePath, err)
+		}
+	}
+
 	for _, file := range resp.Snapshot.Files {
-		targetFile := filepath.Join(sourcePath, file.Path)
+		var targetFile string
+		if d.enableEROFS {
+			targetFile = filepath.Join(stagePath, file.Path)
+		} else {
+			targetFile = filepath.Join(sourcePath, file.Path)
+		}
 
 		// Ensure directory exists
 		if err := os.MkdirAll(filepath.Dir(targetFile), 0755); err != nil {
 			return err
 		}
 
-		// Check if file exists and has correct sha256
-		if _, err := os.Stat(targetFile); err == nil {
-			sha, _ := calculateSHA256(targetFile)
-			if sha == file.Sha256 {
-				continue
+		// In non-EROFS mode only: Check if file exists and has correct sha256
+		if !d.enableEROFS {
+			if _, err := os.Stat(targetFile); err == nil {
+				sha, _ := calculateSHA256(targetFile)
+				if sha == file.Sha256 {
+					continue
+				}
 			}
 		}
 
@@ -505,8 +540,9 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 			}
 
 			// Register in lazyLoader
+			mountedFile := filepath.Join(sourcePath, file.Path)
 			d.lazyLoader.pendingMu.Lock()
-			d.lazyLoader.pending[targetFile] = file
+			d.lazyLoader.pending[mountedFile] = file
 			d.lazyLoader.pendingMu.Unlock()
 
 			continue
@@ -523,6 +559,30 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 		}
 		if err := os.Chtimes(targetFile, file.ModTime.AsTime(), file.ModTime.AsTime()); err != nil {
 			klog.Warningf("failed to set times for %s: %v", targetFile, err)
+		}
+	}
+
+	if d.enableEROFS {
+		volumeDir := filepath.Dir(sourcePath)
+		imagePath := filepath.Join(volumeDir, "erofs.img")
+
+		// Compile staging directory to EROFS image
+		klog.Infof("Compiling EROFS image: %s from %s", imagePath, stagePath)
+		cmd := exec.Command("mkfs.erofs", imagePath, stagePath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to build EROFS image: %v, output: %s", err, string(out))
+		}
+
+		// Clean up staging directory
+		if err := os.RemoveAll(stagePath); err != nil {
+			klog.Warningf("failed to clean up EROFS staging dir %s: %v", stagePath, err)
+		}
+
+		// Mount EROFS image on sourcePath
+		klog.Infof("Loop mounting EROFS image %s onto %s", imagePath, sourcePath)
+		cmdMount := exec.Command("mount", "-t", "erofs", "-o", "loop", imagePath, sourcePath)
+		if out, err := cmdMount.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to mount EROFS image onto %s: %v, output: %s", sourcePath, err, string(out))
 		}
 	}
 
@@ -939,17 +999,31 @@ func (d *agentFSDriver) lazyDownloadFile(ctx context.Context, path string, meta 
 
 	client := pb.NewAgentFSControllerClient(conn)
 
+	downloadPath := path
+	if d.enableEROFS {
+		// path is e.g. /var/lib/agentfs/<volID>/lower/file.txt
+		// We want to translate this to /var/lib/agentfs/<volID>/upper/file.txt
+		volDir := filepath.Dir(filepath.Dir(path))
+		relPath, err := filepath.Rel(filepath.Join(volDir, "lower"), path)
+		if err == nil {
+			downloadPath = filepath.Join(volDir, "upper", relPath)
+			if err := os.MkdirAll(filepath.Dir(downloadPath), 0755); err != nil {
+				return fmt.Errorf("failed to create upper directory for %s: %v", downloadPath, err)
+			}
+		}
+	}
+
 	// Download blob
-	if err := d.downloadBlob(ctx, client, meta.Sha256, path); err != nil {
+	if err := d.downloadBlob(ctx, client, meta.Sha256, downloadPath); err != nil {
 		return fmt.Errorf("failed to download blob %s: %v", meta.Sha256, err)
 	}
 
 	// Set mode and mod time
-	if err := os.Chmod(path, os.FileMode(meta.Mode)); err != nil {
-		klog.Warningf("failed to set mode for %s: %v", path, err)
+	if err := os.Chmod(downloadPath, os.FileMode(meta.Mode)); err != nil {
+		klog.Warningf("failed to set mode for %s: %v", downloadPath, err)
 	}
-	if err := os.Chtimes(path, meta.ModTime.AsTime(), meta.ModTime.AsTime()); err != nil {
-		klog.Warningf("failed to set times for %s: %v", path, err)
+	if err := os.Chtimes(downloadPath, meta.ModTime.AsTime(), meta.ModTime.AsTime()); err != nil {
+		klog.Warningf("failed to set times for %s: %v", downloadPath, err)
 	}
 
 	return nil
