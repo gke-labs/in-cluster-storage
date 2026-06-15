@@ -123,16 +123,16 @@ We implemented the hybrid lazy-loading model as an optional, high-performance ex
 
 ### A. Performance Impact on Pod Startup
 
-We measured the time elapsed from creating a Pod to the Pod transitioning to `Running` (using a 1GB ML model file in the snapshot):
+We estimated the time elapsed from creating a Pod to the Pod transitioning to `Running` (using simulated metrics for a 1GB ML model file in the snapshot under typical network conditions):
 
 * **Standard Pre-population (Lazy-Load Disabled)**:
-  - Startup time: **~18.5 seconds** (fully blocked on downloading the 1GB blob over the network).
+  - Startup time: **~18.5 seconds** (fully blocked on downloading the 1GB blob over a simulated 500 Mbps connection).
 * **Hybrid Lazy-Loading (Threshold = 4096 bytes)**:
-  - Startup time: **~1.2 seconds** (the pod starts immediately as only small metadata/configuration files are pre-downloaded).
+  - Startup time: **~1.2 seconds** (the pod starts immediately as only small metadata/configuration files are pre-downloaded, while the heavy model file is loaded on demand).
 
 ### B. Network and Storage Savings
 
-When starting a container with a 10GB snapshot but only executing a command that reads a 10KB configuration file:
+When starting a container with a simulated 10GB snapshot but only executing a command that reads a 10KB configuration file:
 * **Lazy-Load Disabled**: 10GB downloaded.
 * **Lazy-Load Enabled**: ~14KB downloaded (small metadata files + the 10KB file). **99.99% bandwidth savings**.
 

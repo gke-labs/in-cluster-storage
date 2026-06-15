@@ -32,8 +32,8 @@ func TestLazyLoaderInitialization(t *testing.T) {
 
 	d := &agentFSDriver{
 		lazyLoader: lazyLoader{
-			pending:     make(map[string]*pb.FileMetadata),
-			downloading: make(map[string]chan struct{}),
+			pending:            make(map[string]*pb.FileMetadata),
+			downloadOperations: make(map[string]*downloadOperation),
 		},
 		fanotifyFd: -1,
 	}
@@ -47,12 +47,12 @@ func TestLazyLoaderInitialization(t *testing.T) {
 	}
 }
 
-func TestLazyLoaderCoordination(t *testing.T) {
-	// Test that multiple goroutines requesting the same file coordinate and only one downloads it
+func TestLazyLoaderCoordinationWithDownloadOperation(t *testing.T) {
+	// Test that multiple goroutines requesting the same file coordinate using the downloadOperation type
 	d := &agentFSDriver{
 		lazyLoader: lazyLoader{
-			pending:     make(map[string]*pb.FileMetadata),
-			downloading: make(map[string]chan struct{}),
+			pending:            make(map[string]*pb.FileMetadata),
+			downloadOperations: make(map[string]*downloadOperation),
 		},
 		fanotifyFd: -1,
 	}
@@ -68,51 +68,48 @@ func TestLazyLoaderCoordination(t *testing.T) {
 	d.lazyLoader.pending[testPath] = meta
 	d.lazyLoader.Unlock()
 
-	// Track how many times download is executed
 	var downloadCount int
 	var mu sync.Mutex
-
-	mockDownload := func() error {
-		mu.Lock()
-		downloadCount++
-		mu.Unlock()
-		time.Sleep(100 * time.Millisecond) // simulate download time
-		return nil
-	}
 
 	var wg sync.WaitGroup
 	numRequests := 5
 
 	for i := 0; i < numRequests; i++ {
 		wg.Add(1)
-		go func() {
+		go func(id int) {
 			defer wg.Done()
 
-			// Simulate the coordination phase inside handleFanotifyEvent
 			d.lazyLoader.Lock()
-			ch, downloading := d.lazyLoader.downloading[testPath]
-			if !downloading {
-				ch = make(chan struct{})
-				d.lazyLoader.downloading[testPath] = ch
-				d.lazyLoader.Unlock()
+			currentOp, found := d.lazyLoader.downloadOperations[testPath]
+			var isInitiator bool
+			if !found {
+				currentOp = newDownloadOperation(testPath, meta, d)
+				d.lazyLoader.downloadOperations[testPath] = currentOp
+				isInitiator = true
+			}
+			d.lazyLoader.Unlock()
 
-				// Perform download
-				err := mockDownload()
-				if err == nil {
-					d.lazyLoader.Lock()
-					delete(d.lazyLoader.pending, testPath)
-					d.lazyLoader.Unlock()
-				}
+			if isInitiator {
+				mu.Lock()
+				downloadCount++
+				mu.Unlock()
 
-				close(ch)
+				time.Sleep(50 * time.Millisecond)
+
+				currentOp.Lock()
+				currentOp.done = true
+				currentOp.Unlock()
+
+				close(currentOp.waitCh)
+
 				d.lazyLoader.Lock()
-				delete(d.lazyLoader.downloading, testPath)
+				delete(d.lazyLoader.pending, testPath)
+				delete(d.lazyLoader.downloadOperations, testPath)
 				d.lazyLoader.Unlock()
 			} else {
-				d.lazyLoader.Unlock()
-				<-ch
+				<-currentOp.waitCh
 			}
-		}()
+		}(i)
 	}
 
 	wg.Wait()
@@ -122,7 +119,7 @@ func TestLazyLoaderCoordination(t *testing.T) {
 	mu.Unlock()
 
 	if count != 1 {
-		t.Errorf("expected download to be executed exactly once, got %d times", count)
+		t.Errorf("expected only one initiator download, got %d", count)
 	}
 
 	d.lazyLoader.Lock()
@@ -130,6 +127,6 @@ func TestLazyLoaderCoordination(t *testing.T) {
 	d.lazyLoader.Unlock()
 
 	if stillPending {
-		t.Errorf("expected file to be removed from pending list")
+		t.Errorf("expected file to be removed from pending")
 	}
 }
