@@ -466,18 +466,17 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 }
 
 func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath string) error {
-	start := time.Now()
-	defer func() {
-		klog.Infof("[PERFORMANCE] pullSnapshot for volume %s took %v (EROFS: %t)", volumeID, time.Since(start), d.enableEROFS)
-	}()
-
 	conn, err := d.getControllerConn()
 	if err != nil {
 		return err
 	}
 
 	client := pb.NewAgentFSControllerClient(conn)
-	resp, err := client.GetLatestSnapshot(ctx, &pb.GetLatestSnapshotRequest{VolumeId: volumeID})
+	resp, err := client.GetLatestSnapshot(ctx, &pb.GetLatestSnapshotRequest{
+		VolumeId:          volumeID,
+		WantErofs:         d.enableEROFS,
+		LazyLoadThreshold: *lazyLoadThreshold,
+	})
 	if err != nil {
 		return err
 	}
@@ -487,35 +486,51 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 		return nil
 	}
 
-	var stagePath string
 	if d.enableEROFS {
-		volumeDir := filepath.Dir(sourcePath)
-		stagePath = filepath.Join(volumeDir, "erofs-stage")
-		if err := os.MkdirAll(stagePath, 0755); err != nil {
-			return fmt.Errorf("failed to create erofs staging dir %s: %v", stagePath, err)
+		if resp.Snapshot.ErofsSha256 == "" {
+			return fmt.Errorf("controller did not return an EROFS SHA256 for volume %s", volumeID)
 		}
+		volumeDir := filepath.Dir(sourcePath)
+		imagePath := filepath.Join(volumeDir, "erofs.img")
+
+		klog.Infof("Downloading server-compiled EROFS image blob %s to %s", resp.Snapshot.ErofsSha256, imagePath)
+		if err := d.downloadBlob(ctx, client, resp.Snapshot.ErofsSha256, imagePath); err != nil {
+			return fmt.Errorf("failed to download EROFS image blob %s: %v", resp.Snapshot.ErofsSha256, err)
+		}
+
+		// Mount EROFS image on sourcePath
+		klog.Infof("Loop mounting server-compiled EROFS image %s onto %s", imagePath, sourcePath)
+		cmdMount := exec.Command("mount", "-t", "erofs", "-o", "loop", imagePath, sourcePath)
+		if out, err := cmdMount.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to mount EROFS image onto %s: %v, output: %s", sourcePath, err, string(out))
+		}
+
+		// Register pending files
+		for _, file := range resp.Snapshot.Files {
+			if *lazyLoadThreshold >= 0 && file.Size >= *lazyLoadThreshold {
+				mountedFile := filepath.Join(sourcePath, file.Path)
+				d.lazyLoader.pendingMu.Lock()
+				d.lazyLoader.pending[mountedFile] = file
+				d.lazyLoader.pendingMu.Unlock()
+			}
+		}
+
+		return nil
 	}
 
 	for _, file := range resp.Snapshot.Files {
-		var targetFile string
-		if d.enableEROFS {
-			targetFile = filepath.Join(stagePath, file.Path)
-		} else {
-			targetFile = filepath.Join(sourcePath, file.Path)
-		}
+		targetFile := filepath.Join(sourcePath, file.Path)
 
 		// Ensure directory exists
 		if err := os.MkdirAll(filepath.Dir(targetFile), 0755); err != nil {
 			return err
 		}
 
-		// In non-EROFS mode only: Check if file exists and has correct sha256
-		if !d.enableEROFS {
-			if _, err := os.Stat(targetFile); err == nil {
-				sha, _ := calculateSHA256(targetFile)
-				if sha == file.Sha256 {
-					continue
-				}
+		// Check if file exists and has correct sha256
+		if _, err := os.Stat(targetFile); err == nil {
+			sha, _ := calculateSHA256(targetFile)
+			if sha == file.Sha256 {
+				continue
 			}
 		}
 
@@ -559,30 +574,6 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 		}
 		if err := os.Chtimes(targetFile, file.ModTime.AsTime(), file.ModTime.AsTime()); err != nil {
 			klog.Warningf("failed to set times for %s: %v", targetFile, err)
-		}
-	}
-
-	if d.enableEROFS {
-		volumeDir := filepath.Dir(sourcePath)
-		imagePath := filepath.Join(volumeDir, "erofs.img")
-
-		// Compile staging directory to EROFS image
-		klog.Infof("Compiling EROFS image: %s from %s", imagePath, stagePath)
-		cmd := exec.Command("mkfs.erofs", imagePath, stagePath)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to build EROFS image: %v, output: %s", err, string(out))
-		}
-
-		// Clean up staging directory
-		if err := os.RemoveAll(stagePath); err != nil {
-			klog.Warningf("failed to clean up EROFS staging dir %s: %v", stagePath, err)
-		}
-
-		// Mount EROFS image on sourcePath
-		klog.Infof("Loop mounting EROFS image %s onto %s", imagePath, sourcePath)
-		cmdMount := exec.Command("mount", "-t", "erofs", "-o", "loop", imagePath, sourcePath)
-		if out, err := cmdMount.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to mount EROFS image onto %s: %v, output: %s", sourcePath, err, string(out))
 		}
 	}
 

@@ -16,7 +16,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v3.21.12
-// source: agentfs.proto
+// source: proto/agentfs.proto
 
 package v1alpha1
 
@@ -37,15 +37,17 @@ const (
 )
 
 type GetLatestSnapshotRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId          string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	WantErofs         bool                   `protobuf:"varint,2,opt,name=want_erofs,json=wantErofs,proto3" json:"want_erofs,omitempty"`
+	LazyLoadThreshold int64                  `protobuf:"varint,3,opt,name=lazy_load_threshold,json=lazyLoadThreshold,proto3" json:"lazy_load_threshold,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *GetLatestSnapshotRequest) Reset() {
 	*x = GetLatestSnapshotRequest{}
-	mi := &file_agentfs_proto_msgTypes[0]
+	mi := &file_proto_agentfs_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -57,7 +59,7 @@ func (x *GetLatestSnapshotRequest) String() string {
 func (*GetLatestSnapshotRequest) ProtoMessage() {}
 
 func (x *GetLatestSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[0]
+	mi := &file_proto_agentfs_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -70,7 +72,7 @@ func (x *GetLatestSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLatestSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*GetLatestSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{0}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *GetLatestSnapshotRequest) GetVolumeId() string {
@@ -78,6 +80,20 @@ func (x *GetLatestSnapshotRequest) GetVolumeId() string {
 		return x.VolumeId
 	}
 	return ""
+}
+
+func (x *GetLatestSnapshotRequest) GetWantErofs() bool {
+	if x != nil {
+		return x.WantErofs
+	}
+	return false
+}
+
+func (x *GetLatestSnapshotRequest) GetLazyLoadThreshold() int64 {
+	if x != nil {
+		return x.LazyLoadThreshold
+	}
+	return 0
 }
 
 type GetLatestSnapshotResponse struct {
@@ -89,7 +105,7 @@ type GetLatestSnapshotResponse struct {
 
 func (x *GetLatestSnapshotResponse) Reset() {
 	*x = GetLatestSnapshotResponse{}
-	mi := &file_agentfs_proto_msgTypes[1]
+	mi := &file_proto_agentfs_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -101,7 +117,7 @@ func (x *GetLatestSnapshotResponse) String() string {
 func (*GetLatestSnapshotResponse) ProtoMessage() {}
 
 func (x *GetLatestSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[1]
+	mi := &file_proto_agentfs_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -114,7 +130,7 @@ func (x *GetLatestSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLatestSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*GetLatestSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{1}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *GetLatestSnapshotResponse) GetSnapshot() *SnapshotMetadata {
@@ -134,7 +150,7 @@ type UploadSnapshotRequest struct {
 
 func (x *UploadSnapshotRequest) Reset() {
 	*x = UploadSnapshotRequest{}
-	mi := &file_agentfs_proto_msgTypes[2]
+	mi := &file_proto_agentfs_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -146,7 +162,7 @@ func (x *UploadSnapshotRequest) String() string {
 func (*UploadSnapshotRequest) ProtoMessage() {}
 
 func (x *UploadSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[2]
+	mi := &file_proto_agentfs_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -159,7 +175,7 @@ func (x *UploadSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*UploadSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{2}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *UploadSnapshotRequest) GetVolumeId() string {
@@ -185,7 +201,7 @@ type UploadSnapshotResponse struct {
 
 func (x *UploadSnapshotResponse) Reset() {
 	*x = UploadSnapshotResponse{}
-	mi := &file_agentfs_proto_msgTypes[3]
+	mi := &file_proto_agentfs_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -197,7 +213,7 @@ func (x *UploadSnapshotResponse) String() string {
 func (*UploadSnapshotResponse) ProtoMessage() {}
 
 func (x *UploadSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[3]
+	mi := &file_proto_agentfs_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -210,7 +226,7 @@ func (x *UploadSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*UploadSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{3}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *UploadSnapshotResponse) GetSuccess() bool {
@@ -223,13 +239,14 @@ func (x *UploadSnapshotResponse) GetSuccess() bool {
 type SnapshotMetadata struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Files         []*FileMetadata        `protobuf:"bytes,1,rep,name=files,proto3" json:"files,omitempty"`
+	ErofsSha256   string                 `protobuf:"bytes,2,opt,name=erofs_sha256,json=erofsSha256,proto3" json:"erofs_sha256,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SnapshotMetadata) Reset() {
 	*x = SnapshotMetadata{}
-	mi := &file_agentfs_proto_msgTypes[4]
+	mi := &file_proto_agentfs_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -241,7 +258,7 @@ func (x *SnapshotMetadata) String() string {
 func (*SnapshotMetadata) ProtoMessage() {}
 
 func (x *SnapshotMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[4]
+	mi := &file_proto_agentfs_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -254,7 +271,7 @@ func (x *SnapshotMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotMetadata.ProtoReflect.Descriptor instead.
 func (*SnapshotMetadata) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{4}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *SnapshotMetadata) GetFiles() []*FileMetadata {
@@ -262,6 +279,13 @@ func (x *SnapshotMetadata) GetFiles() []*FileMetadata {
 		return x.Files
 	}
 	return nil
+}
+
+func (x *SnapshotMetadata) GetErofsSha256() string {
+	if x != nil {
+		return x.ErofsSha256
+	}
+	return ""
 }
 
 type FileMetadata struct {
@@ -277,7 +301,7 @@ type FileMetadata struct {
 
 func (x *FileMetadata) Reset() {
 	*x = FileMetadata{}
-	mi := &file_agentfs_proto_msgTypes[5]
+	mi := &file_proto_agentfs_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -289,7 +313,7 @@ func (x *FileMetadata) String() string {
 func (*FileMetadata) ProtoMessage() {}
 
 func (x *FileMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[5]
+	mi := &file_proto_agentfs_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -302,7 +326,7 @@ func (x *FileMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileMetadata.ProtoReflect.Descriptor instead.
 func (*FileMetadata) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{5}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *FileMetadata) GetPath() string {
@@ -353,7 +377,7 @@ type UploadBlobRequest struct {
 
 func (x *UploadBlobRequest) Reset() {
 	*x = UploadBlobRequest{}
-	mi := &file_agentfs_proto_msgTypes[6]
+	mi := &file_proto_agentfs_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -365,7 +389,7 @@ func (x *UploadBlobRequest) String() string {
 func (*UploadBlobRequest) ProtoMessage() {}
 
 func (x *UploadBlobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[6]
+	mi := &file_proto_agentfs_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -378,7 +402,7 @@ func (x *UploadBlobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadBlobRequest.ProtoReflect.Descriptor instead.
 func (*UploadBlobRequest) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{6}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *UploadBlobRequest) GetData() isUploadBlobRequest_Data {
@@ -431,7 +455,7 @@ type UploadBlobResponse struct {
 
 func (x *UploadBlobResponse) Reset() {
 	*x = UploadBlobResponse{}
-	mi := &file_agentfs_proto_msgTypes[7]
+	mi := &file_proto_agentfs_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -443,7 +467,7 @@ func (x *UploadBlobResponse) String() string {
 func (*UploadBlobResponse) ProtoMessage() {}
 
 func (x *UploadBlobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[7]
+	mi := &file_proto_agentfs_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -456,7 +480,7 @@ func (x *UploadBlobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadBlobResponse.ProtoReflect.Descriptor instead.
 func (*UploadBlobResponse) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{7}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *UploadBlobResponse) GetSuccess() bool {
@@ -475,7 +499,7 @@ type DownloadBlobRequest struct {
 
 func (x *DownloadBlobRequest) Reset() {
 	*x = DownloadBlobRequest{}
-	mi := &file_agentfs_proto_msgTypes[8]
+	mi := &file_proto_agentfs_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -487,7 +511,7 @@ func (x *DownloadBlobRequest) String() string {
 func (*DownloadBlobRequest) ProtoMessage() {}
 
 func (x *DownloadBlobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[8]
+	mi := &file_proto_agentfs_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -500,7 +524,7 @@ func (x *DownloadBlobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DownloadBlobRequest.ProtoReflect.Descriptor instead.
 func (*DownloadBlobRequest) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{8}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *DownloadBlobRequest) GetSha256() string {
@@ -519,7 +543,7 @@ type DownloadBlobResponse struct {
 
 func (x *DownloadBlobResponse) Reset() {
 	*x = DownloadBlobResponse{}
-	mi := &file_agentfs_proto_msgTypes[9]
+	mi := &file_proto_agentfs_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -531,7 +555,7 @@ func (x *DownloadBlobResponse) String() string {
 func (*DownloadBlobResponse) ProtoMessage() {}
 
 func (x *DownloadBlobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[9]
+	mi := &file_proto_agentfs_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -544,7 +568,7 @@ func (x *DownloadBlobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DownloadBlobResponse.ProtoReflect.Descriptor instead.
 func (*DownloadBlobResponse) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{9}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *DownloadBlobResponse) GetContent() []byte {
@@ -563,7 +587,7 @@ type HasBlobRequest struct {
 
 func (x *HasBlobRequest) Reset() {
 	*x = HasBlobRequest{}
-	mi := &file_agentfs_proto_msgTypes[10]
+	mi := &file_proto_agentfs_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -575,7 +599,7 @@ func (x *HasBlobRequest) String() string {
 func (*HasBlobRequest) ProtoMessage() {}
 
 func (x *HasBlobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[10]
+	mi := &file_proto_agentfs_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -588,7 +612,7 @@ func (x *HasBlobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HasBlobRequest.ProtoReflect.Descriptor instead.
 func (*HasBlobRequest) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{10}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *HasBlobRequest) GetSha256() string {
@@ -607,7 +631,7 @@ type HasBlobResponse struct {
 
 func (x *HasBlobResponse) Reset() {
 	*x = HasBlobResponse{}
-	mi := &file_agentfs_proto_msgTypes[11]
+	mi := &file_proto_agentfs_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -619,7 +643,7 @@ func (x *HasBlobResponse) String() string {
 func (*HasBlobResponse) ProtoMessage() {}
 
 func (x *HasBlobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agentfs_proto_msgTypes[11]
+	mi := &file_proto_agentfs_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -632,7 +656,7 @@ func (x *HasBlobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HasBlobResponse.ProtoReflect.Descriptor instead.
 func (*HasBlobResponse) Descriptor() ([]byte, []int) {
-	return file_agentfs_proto_rawDescGZIP(), []int{11}
+	return file_proto_agentfs_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *HasBlobResponse) GetExists() bool {
@@ -642,22 +666,26 @@ func (x *HasBlobResponse) GetExists() bool {
 	return false
 }
 
-var File_agentfs_proto protoreflect.FileDescriptor
+var File_proto_agentfs_proto protoreflect.FileDescriptor
 
-const file_agentfs_proto_rawDesc = "" +
+const file_proto_agentfs_proto_rawDesc = "" +
 	"\n" +
-	"\ragentfs.proto\x12\x10agentfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"7\n" +
+	"\x13proto/agentfs.proto\x12\x10agentfs.v1alpha1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x86\x01\n" +
 	"\x18GetLatestSnapshotRequest\x12\x1b\n" +
-	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"[\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
+	"\n" +
+	"want_erofs\x18\x02 \x01(\bR\twantErofs\x12.\n" +
+	"\x13lazy_load_threshold\x18\x03 \x01(\x03R\x11lazyLoadThreshold\"[\n" +
 	"\x19GetLatestSnapshotResponse\x12>\n" +
 	"\bsnapshot\x18\x01 \x01(\v2\".agentfs.v1alpha1.SnapshotMetadataR\bsnapshot\"t\n" +
 	"\x15UploadSnapshotRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12>\n" +
 	"\bsnapshot\x18\x02 \x01(\v2\".agentfs.v1alpha1.SnapshotMetadataR\bsnapshot\"2\n" +
 	"\x16UploadSnapshotResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess\"H\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\"k\n" +
 	"\x10SnapshotMetadata\x124\n" +
-	"\x05files\x18\x01 \x03(\v2\x1e.agentfs.v1alpha1.FileMetadataR\x05files\"\x99\x01\n" +
+	"\x05files\x18\x01 \x03(\v2\x1e.agentfs.v1alpha1.FileMetadataR\x05files\x12!\n" +
+	"\ferofs_sha256\x18\x02 \x01(\tR\verofsSha256\"\x99\x01\n" +
 	"\fFileMetadata\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\rR\x04mode\x12\x12\n" +
@@ -684,22 +712,22 @@ const file_agentfs_proto_rawDesc = "" +
 	"\n" +
 	"UploadBlob\x12#.agentfs.v1alpha1.UploadBlobRequest\x1a$.agentfs.v1alpha1.UploadBlobResponse(\x01\x12_\n" +
 	"\fDownloadBlob\x12%.agentfs.v1alpha1.DownloadBlobRequest\x1a&.agentfs.v1alpha1.DownloadBlobResponse0\x01\x12N\n" +
-	"\aHasBlob\x12 .agentfs.v1alpha1.HasBlobRequest\x1a!.agentfs.v1alpha1.HasBlobResponseBQZOgithub.com/gke-labs/generation-ai/experiments/agentfs/pkg/api/v1alpha1;v1alpha1b\x06proto3"
+	"\aHasBlob\x12 .agentfs.v1alpha1.HasBlobRequest\x1a!.agentfs.v1alpha1.HasBlobResponseBBZ@github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
-	file_agentfs_proto_rawDescOnce sync.Once
-	file_agentfs_proto_rawDescData []byte
+	file_proto_agentfs_proto_rawDescOnce sync.Once
+	file_proto_agentfs_proto_rawDescData []byte
 )
 
-func file_agentfs_proto_rawDescGZIP() []byte {
-	file_agentfs_proto_rawDescOnce.Do(func() {
-		file_agentfs_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_agentfs_proto_rawDesc), len(file_agentfs_proto_rawDesc)))
+func file_proto_agentfs_proto_rawDescGZIP() []byte {
+	file_proto_agentfs_proto_rawDescOnce.Do(func() {
+		file_proto_agentfs_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_agentfs_proto_rawDesc), len(file_proto_agentfs_proto_rawDesc)))
 	})
-	return file_agentfs_proto_rawDescData
+	return file_proto_agentfs_proto_rawDescData
 }
 
-var file_agentfs_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
-var file_agentfs_proto_goTypes = []any{
+var file_proto_agentfs_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_proto_agentfs_proto_goTypes = []any{
 	(*GetLatestSnapshotRequest)(nil),  // 0: agentfs.v1alpha1.GetLatestSnapshotRequest
 	(*GetLatestSnapshotResponse)(nil), // 1: agentfs.v1alpha1.GetLatestSnapshotResponse
 	(*UploadSnapshotRequest)(nil),     // 2: agentfs.v1alpha1.UploadSnapshotRequest
@@ -714,7 +742,7 @@ var file_agentfs_proto_goTypes = []any{
 	(*HasBlobResponse)(nil),           // 11: agentfs.v1alpha1.HasBlobResponse
 	(*timestamppb.Timestamp)(nil),     // 12: google.protobuf.Timestamp
 }
-var file_agentfs_proto_depIdxs = []int32{
+var file_proto_agentfs_proto_depIdxs = []int32{
 	4,  // 0: agentfs.v1alpha1.GetLatestSnapshotResponse.snapshot:type_name -> agentfs.v1alpha1.SnapshotMetadata
 	4,  // 1: agentfs.v1alpha1.UploadSnapshotRequest.snapshot:type_name -> agentfs.v1alpha1.SnapshotMetadata
 	5,  // 2: agentfs.v1alpha1.SnapshotMetadata.files:type_name -> agentfs.v1alpha1.FileMetadata
@@ -736,12 +764,12 @@ var file_agentfs_proto_depIdxs = []int32{
 	0,  // [0:4] is the sub-list for field type_name
 }
 
-func init() { file_agentfs_proto_init() }
-func file_agentfs_proto_init() {
-	if File_agentfs_proto != nil {
+func init() { file_proto_agentfs_proto_init() }
+func file_proto_agentfs_proto_init() {
+	if File_proto_agentfs_proto != nil {
 		return
 	}
-	file_agentfs_proto_msgTypes[6].OneofWrappers = []any{
+	file_proto_agentfs_proto_msgTypes[6].OneofWrappers = []any{
 		(*UploadBlobRequest_Sha256)(nil),
 		(*UploadBlobRequest_Content)(nil),
 	}
@@ -749,17 +777,17 @@ func file_agentfs_proto_init() {
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agentfs_proto_rawDesc), len(file_agentfs_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agentfs_proto_rawDesc), len(file_proto_agentfs_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_agentfs_proto_goTypes,
-		DependencyIndexes: file_agentfs_proto_depIdxs,
-		MessageInfos:      file_agentfs_proto_msgTypes,
+		GoTypes:           file_proto_agentfs_proto_goTypes,
+		DependencyIndexes: file_proto_agentfs_proto_depIdxs,
+		MessageInfos:      file_proto_agentfs_proto_msgTypes,
 	}.Build()
-	File_agentfs_proto = out.File
-	file_agentfs_proto_goTypes = nil
-	file_agentfs_proto_depIdxs = nil
+	File_proto_agentfs_proto = out.File
+	file_proto_agentfs_proto_goTypes = nil
+	file_proto_agentfs_proto_depIdxs = nil
 }

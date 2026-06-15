@@ -16,7 +16,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.1
 // - protoc             v3.21.12
-// source: agentfs.proto
+// source: proto/agentfs.proto
 
 package v1alpha1
 
@@ -280,5 +280,5 @@ var AgentFSController_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 	},
-	Metadata: "agentfs.proto",
+	Metadata: "proto/agentfs.proto",
 }
