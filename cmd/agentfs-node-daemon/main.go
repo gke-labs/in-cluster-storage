@@ -28,9 +28,11 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1"
+	unix "golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -42,6 +44,7 @@ var (
 	nodeID            = flag.String("nodeid", "", "node id")
 	storagePath       = flag.String("storage-path", "/var/lib/agentfs", "Base path for storage")
 	controllerAddress = flag.String("controller-address", "agentfs-controller:50051", "AgentFS Controller address")
+	lazyLoadThreshold = flag.Int64("lazy-load-threshold", -1, "Threshold in bytes. Files larger than or equal to this will be lazy loaded. Set to -1 to disable.")
 )
 
 func main() {
@@ -76,6 +79,18 @@ func main() {
 	server := grpc.NewServer()
 	driver := &agentFSDriver{
 		nodeID: *nodeID,
+		lazyLoader: lazyLoader{
+			pending:     make(map[string]*pb.FileMetadata),
+			downloading: make(map[string]chan struct{}),
+		},
+		fanotifyFd: -1,
+	}
+
+	if *lazyLoadThreshold >= 0 {
+		if err := driver.startLazyLoader(context.Background()); err != nil {
+			klog.Warningf("Failed to initialize lazy loader: %v. Falling back to non-lazy-load mode (all files will be pre-downloaded).", err)
+			*lazyLoadThreshold = -1
+		}
 	}
 
 	csi.RegisterIdentityServer(server, driver)
@@ -99,6 +114,12 @@ func parseEndpoint(endpoint string) (string, string, error) {
 	return scheme, addr, nil
 }
 
+type lazyLoader struct {
+	sync.Mutex
+	pending     map[string]*pb.FileMetadata // absolute path on disk -> metadata
+	downloading map[string]chan struct{}
+}
+
 type agentFSDriver struct {
 	csi.UnimplementedIdentityServer
 	csi.UnimplementedNodeServer
@@ -107,6 +128,9 @@ type agentFSDriver struct {
 
 	// volumeMappings maps K8s volume ID to logical volume ID (if provided in volumeContext)
 	volumeMappings sync.Map
+
+	lazyLoader lazyLoader
+	fanotifyFd int
 }
 
 func (d *agentFSDriver) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
@@ -233,6 +257,20 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 	if err := d.pushSnapshot(ctx, logicalVolumeID, volumeDir); err != nil {
 		klog.Errorf("failed to push snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
 	} else {
+		// Clean up lazyLoader pending entries for this volume
+		d.lazyLoader.Lock()
+		for path := range d.lazyLoader.pending {
+			if strings.HasPrefix(path, volumeDir) {
+				delete(d.lazyLoader.pending, path)
+			}
+		}
+		for path := range d.lazyLoader.downloading {
+			if strings.HasPrefix(path, volumeDir) {
+				delete(d.lazyLoader.downloading, path)
+			}
+		}
+		d.lazyLoader.Unlock()
+
 		if err := os.RemoveAll(volumeDir); err != nil {
 			klog.Errorf("failed to cleanup source path %s: %v", volumeDir, err)
 		}
@@ -273,6 +311,34 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 			if sha == file.Sha256 {
 				continue
 			}
+		}
+
+		// Check if we should lazy load this file
+		if *lazyLoadThreshold >= 0 && file.Size >= *lazyLoadThreshold {
+			klog.Infof("Registering lazy load placeholder for %s (size %d)", targetFile, file.Size)
+
+			// Create a sparse file of the original size so metadata (like size) is correct
+			f, err := os.OpenFile(targetFile, os.O_CREATE|os.O_WRONLY, os.FileMode(file.Mode))
+			if err != nil {
+				return fmt.Errorf("failed to create placeholder for %s: %v", targetFile, err)
+			}
+			if err := f.Truncate(file.Size); err != nil {
+				f.Close()
+				return fmt.Errorf("failed to truncate placeholder for %s: %v", targetFile, err)
+			}
+			f.Close()
+
+			// Set mod time so metadata matches
+			if err := os.Chtimes(targetFile, file.ModTime.AsTime(), file.ModTime.AsTime()); err != nil {
+				klog.Warningf("failed to set times for placeholder %s: %v", targetFile, err)
+			}
+
+			// Register in lazyLoader
+			d.lazyLoader.Lock()
+			d.lazyLoader.pending[targetFile] = file
+			d.lazyLoader.Unlock()
+
+			continue
 		}
 
 		// Download blob
@@ -492,4 +558,180 @@ func isNotMountPoint(path string) (bool, error) {
 	}
 
 	return stat.Sys().(*syscall.Stat_t).Dev == parentStat.Sys().(*syscall.Stat_t).Dev, nil
+}
+
+func (d *agentFSDriver) startLazyLoader(ctx context.Context) error {
+	if *lazyLoadThreshold < 0 {
+		return nil
+	}
+
+	fd, err := unix.FanotifyInit(uint(unix.FAN_CLASS_PRE_CONTENT|unix.FAN_CLOEXEC), uint(unix.O_RDONLY))
+	if err != nil {
+		return fmt.Errorf("failed to initialize fanotify (is CAP_SYS_ADMIN missing?): %v", err)
+	}
+	d.fanotifyFd = fd
+
+	// Mark storagePath with FAN_MARK_MOUNT to watch all filesystem events on that mount
+	err = unix.FanotifyMark(fd, uint(unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT), uint64(unix.FAN_OPEN_PERM), unix.AT_FDCWD, *storagePath)
+	if err != nil {
+		unix.Close(fd)
+		d.fanotifyFd = -1
+		return fmt.Errorf("failed to mark fanotify on %s: %v", *storagePath, err)
+	}
+
+	klog.Infof("Successfully initialized fanotify lazy loader on %s with threshold %d bytes", *storagePath, *lazyLoadThreshold)
+
+	go d.fanotifyLoop(ctx)
+	return nil
+}
+
+func (d *agentFSDriver) fanotifyLoop(ctx context.Context) {
+	buf := make([]byte, 4096)
+	myPid := int32(os.Getpid())
+
+	for {
+		n, err := unix.Read(d.fanotifyFd, buf)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			klog.Errorf("fanotify read error: %v", err)
+			return
+		}
+
+		var offset int
+		sizeofMetadata := int(unsafe.Sizeof(unix.FanotifyEventMetadata{}))
+		for offset+sizeofMetadata <= n {
+			metadata := (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[offset]))
+			eventLen := int(metadata.Event_len)
+
+			if eventLen < sizeofMetadata {
+				break
+			}
+
+			if metadata.Mask&uint64(unix.FAN_OPEN_PERM) != 0 {
+				eventFd := int(metadata.Fd)
+
+				// Skip if event caused by our own daemon process to avoid deadlock
+				if metadata.Pid == myPid {
+					d.sendFanotifyResponse(eventFd, unix.FAN_ALLOW)
+					unix.Close(eventFd)
+				} else {
+					// Handle the event concurrently to allow other processes to open files in parallel
+					go d.handleFanotifyEvent(metadata.Pid, eventFd)
+				}
+			} else {
+				if metadata.Fd != int32(unix.FAN_NOFD) {
+					unix.Close(int(metadata.Fd))
+				}
+			}
+			offset += eventLen
+		}
+	}
+}
+
+func (d *agentFSDriver) handleFanotifyEvent(pid int32, eventFd int) {
+	defer unix.Close(eventFd)
+
+	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", eventFd))
+	if err != nil {
+		klog.Warningf("failed to resolve path for event fd %d: %v", eventFd, err)
+		d.sendFanotifyResponse(eventFd, unix.FAN_ALLOW)
+		return
+	}
+
+	// Check if path is in our pending list
+	d.lazyLoader.Lock()
+	meta, exists := d.lazyLoader.pending[path]
+	d.lazyLoader.Unlock()
+
+	if !exists {
+		// Not a pending lazy-loaded file, allow immediately
+		d.sendFanotifyResponse(eventFd, unix.FAN_ALLOW)
+		return
+	}
+
+	klog.Infof("Lazy loading file requested by PID %d: %s", pid, path)
+
+	// Coordinate download
+	d.lazyLoader.Lock()
+	ch, downloading := d.lazyLoader.downloading[path]
+	if !downloading {
+		ch = make(chan struct{})
+		d.lazyLoader.downloading[path] = ch
+		d.lazyLoader.Unlock()
+
+		// Download the file!
+		err := d.lazyDownloadFile(path, meta)
+		if err != nil {
+			klog.Errorf("Failed to lazy download file %s: %v", path, err)
+			d.sendFanotifyResponse(eventFd, unix.FAN_DENY)
+		} else {
+			// Success! Remove from pending list
+			d.lazyLoader.Lock()
+			delete(d.lazyLoader.pending, path)
+			d.lazyLoader.Unlock()
+
+			d.sendFanotifyResponse(eventFd, unix.FAN_ALLOW)
+		}
+
+		// Signal other waiters
+		close(ch)
+		d.lazyLoader.Lock()
+		delete(d.lazyLoader.downloading, path)
+		d.lazyLoader.Unlock()
+	} else {
+		d.lazyLoader.Unlock()
+		// Wait for the download to complete
+		<-ch
+
+		// Check if it was successfully removed from pending (meaning download succeeded)
+		d.lazyLoader.Lock()
+		_, stillPending := d.lazyLoader.pending[path]
+		d.lazyLoader.Unlock()
+
+		if stillPending {
+			d.sendFanotifyResponse(eventFd, unix.FAN_DENY)
+		} else {
+			d.sendFanotifyResponse(eventFd, unix.FAN_ALLOW)
+		}
+	}
+}
+
+func (d *agentFSDriver) sendFanotifyResponse(fd int, response uint32) {
+	resp := unix.FanotifyResponse{
+		Fd:       int32(fd),
+		Response: response,
+	}
+	var buf [8]byte // sizeof(FanotifyResponse) is 8 bytes
+	*(*unix.FanotifyResponse)(unsafe.Pointer(&buf[0])) = resp
+	if _, err := unix.Write(d.fanotifyFd, buf[:]); err != nil {
+		klog.Errorf("failed to write fanotify response: %v", err)
+	}
+}
+
+func (d *agentFSDriver) lazyDownloadFile(path string, meta *pb.FileMetadata) error {
+	ctx := context.Background()
+	conn, err := grpc.Dial(*controllerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	client := pb.NewAgentFSControllerClient(conn)
+
+	// Download blob
+	if err := d.downloadBlob(ctx, client, meta.Sha256, path); err != nil {
+		return fmt.Errorf("failed to download blob %s: %v", meta.Sha256, err)
+	}
+
+	// Set mode and mod time
+	if err := os.Chmod(path, os.FileMode(meta.Mode)); err != nil {
+		klog.Warningf("failed to set mode for %s: %v", path, err)
+	}
+	if err := os.Chtimes(path, meta.ModTime.AsTime(), meta.ModTime.AsTime()); err != nil {
+		klog.Warningf("failed to set times for %s: %v", path, err)
+	}
+
+	return nil
 }
