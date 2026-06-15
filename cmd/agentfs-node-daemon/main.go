@@ -28,6 +28,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -85,6 +86,7 @@ func main() {
 		lazyLoader: lazyLoader{
 			pending:            make(map[string]*pb.FileMetadata),
 			downloadOperations: make(map[string]*downloadOperation),
+			mounts:             make(map[string]string),
 		},
 		fanotifyFd:            -1,
 		rootContextCancelFunc: cancel,
@@ -171,6 +173,9 @@ type lazyLoader struct {
 
 	downloadMu         sync.Mutex
 	downloadOperations map[string]*downloadOperation
+
+	mountsMu sync.RWMutex
+	mounts   map[string]string // targetPath -> volumeDir
 }
 
 type agentFSDriver struct {
@@ -314,6 +319,80 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		return nil, fmt.Errorf("failed to mount overlayfs to %s: %v", targetPath, err)
 	}
 
+	var fanotifyActive bool
+	if d.fanotifyFd >= 0 {
+		err = unix.FanotifyMark(d.fanotifyFd, uint(unix.FAN_MARK_ADD|unix.FAN_MARK_FILESYSTEM), uint64(unix.FAN_OPEN_PERM), unix.AT_FDCWD, targetPath)
+		if err != nil {
+			klog.Errorf("failed to mark fanotify on targetPath %s: %v", targetPath, err)
+		} else {
+			klog.Infof("Successfully marked fanotify on targetPath %s. Running self-test...", targetPath)
+
+			// 1. Create a temporary self-test file metadata
+			testFileRel := ".fanotify-self-test.txt"
+			testFileLower := filepath.Join(lowerPath, testFileRel)
+			testFileMerged := filepath.Join(targetPath, testFileRel)
+
+			// Create dummy file
+			if err := os.WriteFile(testFileLower, []byte("self-test"), 0644); err == nil {
+				d.lazyLoader.pendingMu.Lock()
+				d.lazyLoader.pending[testFileLower] = &pb.FileMetadata{
+					Path:   testFileRel,
+					Size:   9,
+					Sha256: "self-test-sha",
+				}
+				d.lazyLoader.pendingMu.Unlock()
+
+				d.lazyLoader.mountsMu.Lock()
+				d.lazyLoader.mounts[targetPath] = volumeDir
+				d.lazyLoader.mountsMu.Unlock()
+
+				// 2. Attempt to open the merged file
+				go func() {
+					f, err := os.Open(testFileMerged)
+					if err == nil {
+						f.Close()
+					}
+				}()
+
+				// 3. Wait up to 100ms for fanotify to intercept and remove the file from pending
+				success := false
+				for i := 0; i < 10; i++ {
+					time.Sleep(10 * time.Millisecond)
+					d.lazyLoader.pendingMu.RLock()
+					_, pending := d.lazyLoader.pending[testFileLower]
+					d.lazyLoader.pendingMu.RUnlock()
+					if !pending {
+						success = true
+						break
+					}
+				}
+
+				if success {
+					klog.Infof("Fanotify self-test passed for %s!", targetPath)
+					fanotifyActive = true
+				} else {
+					klog.Warningf("Fanotify self-test failed (no events received) on %s. Falling back to full pre-download.", targetPath)
+					d.lazyLoader.mountsMu.Lock()
+					delete(d.lazyLoader.mounts, targetPath)
+					d.lazyLoader.mountsMu.Unlock()
+
+					d.lazyLoader.pendingMu.Lock()
+					delete(d.lazyLoader.pending, testFileLower)
+					d.lazyLoader.pendingMu.Unlock()
+
+					if removeErr := unix.FanotifyMark(d.fanotifyFd, uint(unix.FAN_MARK_REMOVE|unix.FAN_MARK_FILESYSTEM), uint64(unix.FAN_OPEN_PERM), unix.AT_FDCWD, targetPath); removeErr != nil {
+						klog.Warningf("failed to remove fanotify mark: %v", removeErr)
+					}
+				}
+				os.Remove(testFileLower)
+			}
+		}
+	}
+
+	if !fanotifyActive {
+		d.downloadAllPending(ctx, volumeDir)
+	}
+
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -327,6 +406,11 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 
 	targetPath := req.GetTargetPath()
 	klog.Infof("Unpublishing volume %s (logical: %s) from %s", k8sVolumeID, logicalVolumeID, targetPath)
+
+	// Clean up lazyLoader mounts mapping
+	d.lazyLoader.mountsMu.Lock()
+	delete(d.lazyLoader.mounts, targetPath)
+	d.lazyLoader.mountsMu.Unlock()
 
 	// Try to unmount the target path. Ignore if not a mount point.
 	if err := syscall.Unmount(targetPath, 0); err != nil {
@@ -657,17 +741,7 @@ func (d *agentFSDriver) startLazyLoader(ctx context.Context) error {
 	}
 	d.fanotifyFd = fd
 
-	// Mark storagePath with FAN_MARK_MOUNT to watch all filesystem events on that mount
-	err = unix.FanotifyMark(fd, uint(unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT), uint64(unix.FAN_OPEN_PERM), unix.AT_FDCWD, *storagePath)
-	if err != nil {
-		if closeErr := unix.Close(fd); closeErr != nil {
-			klog.Errorf("failed to close fanotify fd during recovery: %v", closeErr)
-		}
-		d.fanotifyFd = -1
-		return fmt.Errorf("failed to mark fanotify on %s: %v", *storagePath, err)
-	}
-
-	klog.Infof("Successfully initialized fanotify lazy loader on %s with threshold %d bytes", *storagePath, *lazyLoadThreshold)
+	klog.Infof("Successfully initialized fanotify lazy loader with threshold %d bytes", *lazyLoadThreshold)
 
 	go func() {
 		if err := d.fanotifyLoop(ctx); err != nil {
@@ -758,9 +832,30 @@ func (d *agentFSDriver) handleFanotifyEvent(ctx context.Context, pid int32, even
 		return
 	}
 
+	// Since we watch the OverlayFS mount directly, 'path' will be a path under the merged mount
+	// (e.g. /var/lib/kubelet/pods/.../mount/test.txt). We map this back to its underlying 'lower'
+	// file path (e.g. /var/lib/agentfs/<volumeID>/lower/test.txt) where we write the actual data.
+	var matchedTarget, matchedVolDir string
+	d.lazyLoader.mountsMu.RLock()
+	for target, volDir := range d.lazyLoader.mounts {
+		if strings.HasPrefix(path, target) {
+			if len(target) > len(matchedTarget) {
+				matchedTarget = target
+				matchedVolDir = volDir
+			}
+		}
+	}
+	d.lazyLoader.mountsMu.RUnlock()
+
+	targetFile := path
+	if matchedTarget != "" {
+		relPath := strings.TrimPrefix(path[len(matchedTarget):], "/")
+		targetFile = filepath.Join(matchedVolDir, "lower", relPath)
+	}
+
 	// Check if path is in our pending list
 	d.lazyLoader.pendingMu.RLock()
-	meta, exists := d.lazyLoader.pending[path]
+	meta, exists := d.lazyLoader.pending[targetFile]
 	d.lazyLoader.pendingMu.RUnlock()
 
 	if !exists {
@@ -770,33 +865,33 @@ func (d *agentFSDriver) handleFanotifyEvent(ctx context.Context, pid int32, even
 	}
 
 	d.lazyLoader.downloadMu.Lock()
-	op, found := d.lazyLoader.downloadOperations[path]
+	op, found := d.lazyLoader.downloadOperations[targetFile]
 	var isInitiator bool
 	if !found {
-		op = newDownloadOperation(path, meta, d)
-		d.lazyLoader.downloadOperations[path] = op
+		op = newDownloadOperation(targetFile, meta, d)
+		d.lazyLoader.downloadOperations[targetFile] = op
 		isInitiator = true
 	}
 	d.lazyLoader.downloadMu.Unlock()
 
-	klog.Infof("Lazy loading file requested by PID %d: %s (initiator: %t)", pid, path, isInitiator)
+	klog.Infof("Lazy loading file requested by PID %d: %s (resolves to %s) (initiator: %t)", pid, path, targetFile, isInitiator)
 
 	if isInitiator {
 		err := op.Download(ctx)
 		if err != nil {
-			klog.Errorf("Failed to lazy download file %s: %v", path, err)
+			klog.Errorf("Failed to lazy download file %s: %v", targetFile, err)
 			d.sendFanotifyResponse(eventFd, unix.FAN_DENY)
 		} else {
 			// Success! Remove from pending list
 			d.lazyLoader.pendingMu.Lock()
-			delete(d.lazyLoader.pending, path)
+			delete(d.lazyLoader.pending, targetFile)
 			d.lazyLoader.pendingMu.Unlock()
 
 			d.sendFanotifyResponse(eventFd, unix.FAN_ALLOW)
 		}
 
 		d.lazyLoader.downloadMu.Lock()
-		delete(d.lazyLoader.downloadOperations, path)
+		delete(d.lazyLoader.downloadOperations, targetFile)
 		d.lazyLoader.downloadMu.Unlock()
 	} else {
 		// Wait for the download to complete, then fallthrough to evaluate success status
@@ -833,6 +928,10 @@ func (d *agentFSDriver) sendFanotifyResponse(fd int, response uint32) {
 }
 
 func (d *agentFSDriver) lazyDownloadFile(ctx context.Context, path string, meta *pb.FileMetadata) error {
+	if meta.Sha256 == "self-test-sha" {
+		return nil // succeed immediately for the fanotify self-test
+	}
+
 	conn, err := d.getControllerConn()
 	if err != nil {
 		return err
@@ -854,4 +953,36 @@ func (d *agentFSDriver) lazyDownloadFile(ctx context.Context, path string, meta 
 	}
 
 	return nil
+}
+
+func (d *agentFSDriver) downloadAllPending(ctx context.Context, volumeDir string) {
+	d.lazyLoader.pendingMu.Lock()
+	var toDownload []string
+	for path := range d.lazyLoader.pending {
+		if strings.HasPrefix(path, volumeDir) {
+			toDownload = append(toDownload, path)
+		}
+	}
+	d.lazyLoader.pendingMu.Unlock()
+
+	if len(toDownload) == 0 {
+		return
+	}
+
+	klog.Infof("Downloading %d files due to fanotify fallback for %s", len(toDownload), volumeDir)
+	for _, path := range toDownload {
+		d.lazyLoader.pendingMu.RLock()
+		meta, exists := d.lazyLoader.pending[path]
+		d.lazyLoader.pendingMu.RUnlock()
+
+		if exists {
+			if err := d.lazyDownloadFile(ctx, path, meta); err != nil {
+				klog.Errorf("Fallback download failed for %s: %v", path, err)
+			} else {
+				d.lazyLoader.pendingMu.Lock()
+				delete(d.lazyLoader.pending, path)
+				d.lazyLoader.pendingMu.Unlock()
+			}
+		}
+	}
 }
