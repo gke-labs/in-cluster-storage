@@ -56,6 +56,7 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "namespace: kube-agentfs-system", "namespace: default")
 	manifest = strings.ReplaceAll(manifest, "image: agentfs-controller:latest", "image: agentfs-controller:e2e\n          imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "image: agentfs-node-daemon:latest", "image: agentfs-node-daemon:e2e\n          imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, `"--controller-address=agentfs-controller:50051"`, `"--controller-address=agentfs-controller:50051"`+"\n            - \"--lazy-load-threshold=1\"")
 
 	// Apply manifests
 	h.KubectlApplyContent("agentfs", manifest)
