@@ -18,11 +18,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1"
@@ -40,6 +42,40 @@ type server struct {
 	pb.UnimplementedAgentFSControllerServer
 }
 
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+
+	if _, err = io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+
+	return out.Close()
+}
+
+func calculateSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
 func (s *server) GetLatestSnapshot(ctx context.Context, req *pb.GetLatestSnapshotRequest) (*pb.GetLatestSnapshotResponse, error) {
 	volumeID := req.GetVolumeId()
 	snapshotPath := filepath.Join(*dataPath, "snapshots", volumeID, "latest.pb")
@@ -55,6 +91,87 @@ func (s *server) GetLatestSnapshot(ctx context.Context, req *pb.GetLatestSnapsho
 	snapshot := &pb.SnapshotMetadata{}
 	if err := proto.Unmarshal(data, snapshot); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal snapshot: %v", err)
+	}
+
+	if req.GetWantErofs() && len(snapshot.Files) > 0 {
+		stageDir, err := os.MkdirTemp("", "erofs-stage-")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create staging directory: %v", err)
+		}
+		defer os.RemoveAll(stageDir)
+
+		for _, file := range snapshot.Files {
+			targetFile := filepath.Join(stageDir, file.Path)
+			if err := os.MkdirAll(filepath.Dir(targetFile), 0755); err != nil {
+				return nil, fmt.Errorf("failed to create target file dir: %v", err)
+			}
+
+			if req.GetLazyLoadThreshold() >= 0 && file.Size >= req.GetLazyLoadThreshold() {
+				// Create sparse placeholder
+				f, err := os.OpenFile(targetFile, os.O_CREATE|os.O_WRONLY, os.FileMode(file.Mode))
+				if err != nil {
+					return nil, fmt.Errorf("failed to create placeholder for %s: %v", file.Path, err)
+				}
+				if err := f.Truncate(file.Size); err != nil {
+					_ = f.Close()
+					return nil, fmt.Errorf("failed to truncate placeholder for %s: %v", file.Path, err)
+				}
+				if err := f.Close(); err != nil {
+					return nil, fmt.Errorf("failed to close placeholder for %s: %v", file.Path, err)
+				}
+			} else {
+				// Copy fully downloaded file
+				blobPath := filepath.Join(*dataPath, "blobs", file.Sha256)
+				if err := copyFile(blobPath, targetFile, os.FileMode(file.Mode)); err != nil {
+					return nil, fmt.Errorf("failed to copy blob for %s: %v", file.Path, err)
+				}
+			}
+
+			// Restore mod time
+			if err := os.Chtimes(targetFile, file.ModTime.AsTime(), file.ModTime.AsTime()); err != nil {
+				klog.Warningf("failed to set times for %s: %v", file.Path, err)
+			}
+		}
+
+		// Compile staging directory to EROFS image
+		tmpDir := filepath.Join(*dataPath, "tmp")
+		if err := os.MkdirAll(tmpDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create temp directory %s: %v", tmpDir, err)
+		}
+		imgFile, err := os.CreateTemp(tmpDir, "erofs-img-")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp erofs img: %v", err)
+		}
+		imgPath := imgFile.Name()
+		if err := imgFile.Close(); err != nil {
+			os.Remove(imgPath)
+			return nil, fmt.Errorf("failed to close temp erofs img: %v", err)
+		}
+		defer os.Remove(imgPath)
+
+		cmd := exec.Command("mkfs.erofs", imgPath, stageDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("failed to build EROFS: %v, output: %s", err, string(out))
+		}
+
+		// Compute the SHA256 of the EROFS image
+		erofsSha, err := calculateSHA256(imgPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to calculate erofs SHA256: %v", err)
+		}
+
+		// Save the EROFS image as a normal blob
+		blobPath := filepath.Join(*dataPath, "blobs", erofsSha)
+		if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
+			return nil, fmt.Errorf("failed to create blobs directory: %v", err)
+		}
+
+		// Move/Rename
+		if err := os.Rename(imgPath, blobPath); err != nil {
+			return nil, fmt.Errorf("failed to rename erofs image to blobs path %s: %v", blobPath, err)
+		}
+
+		snapshot.ErofsSha256 = erofsSha
 	}
 
 	return &pb.GetLatestSnapshotResponse{Snapshot: snapshot}, nil

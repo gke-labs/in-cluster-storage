@@ -30,6 +30,8 @@ service AgentFSController {
 
 message GetLatestSnapshotRequest {
   string volume_id = 1;
+  bool want_erofs = 2;
+  int64 lazy_load_threshold = 3;
 }
 
 message GetLatestSnapshotResponse {
@@ -47,6 +49,7 @@ message UploadSnapshotResponse {
 
 message SnapshotMetadata {
   repeated FileMetadata files = 1;
+  string erofs_sha256 = 2;
 }
 
 message FileMetadata {

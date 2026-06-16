@@ -56,7 +56,13 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "namespace: kube-agentfs-system", "namespace: default")
 	manifest = strings.ReplaceAll(manifest, "image: agentfs-controller:latest", "image: agentfs-controller:e2e\n          imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "image: agentfs-node-daemon:latest", "image: agentfs-node-daemon:e2e\n          imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, `"--controller-address=agentfs-controller:50051"`, `"--controller-address=agentfs-controller:50051"`+"\n            - \"--lazy-load-threshold=1\"")
+
+	erofsFlag := ""
+	if os.Getenv("ENABLE_EROFS") != "false" {
+		t.Logf("Enabling EROFS mode for e2e tests (default)!")
+		erofsFlag = "\n            - \"--enable-erofs=true\""
+	}
+	manifest = strings.ReplaceAll(manifest, `"--controller-address=agentfs-controller:50051"`, `"--controller-address=agentfs-controller:50051"`+"\n            - \"--lazy-load-threshold=1\""+erofsFlag)
 
 	// Apply manifests
 	h.KubectlApplyContent("agentfs", manifest)
@@ -99,6 +105,7 @@ spec:
 `, pod1Name, volumeID)
 
 	t.Logf("Creating Pod 1")
+	startPod1 := time.Now()
 	h.KubectlApplyContent(pod1Name, pod1Yaml)
 	if err := h.WaitForPodReady(pod1Name, "default", 1*time.Minute); err != nil {
 		t.Logf("Pod YAML:\n%s\n", h.GetPodYaml("app="+pod1Name, "default"))
@@ -106,6 +113,7 @@ spec:
 		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=agentfs-node-daemon", "default"))
 		t.Fatalf("Test Pod 1 failed to start: %v", err)
 	}
+	t.Logf("[PERFORMANCE] Pod 1 startup took %v", time.Since(startPod1))
 
 	t.Logf("Pod 1 is ready, waiting a few seconds")
 	time.Sleep(5 * time.Second)
@@ -139,11 +147,13 @@ spec:
 `, pod2Name, volumeID)
 
 	t.Logf("Creating Pod 2")
+	startPod2 := time.Now()
 	h.KubectlApplyContent(pod2Name, pod2Yaml)
 	if err := h.WaitForPodReady(pod2Name, "default", 1*time.Minute); err != nil {
 		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=agentfs-node-daemon", "default"))
 		t.Fatalf("Test Pod 2 failed to start: %v", err)
 	}
+	t.Logf("[PERFORMANCE] Pod 2 startup took %v", time.Since(startPod2))
 
 	t.Logf("Pod 2 is ready, verifying content")
 	time.Sleep(5 * time.Second)
@@ -224,10 +234,12 @@ spec:
 `, pod4Name, incVolumeID)
 
 	t.Logf("Creating Pod 4 (Incremental initial state)")
+	startPod4 := time.Now()
 	h.KubectlApplyContent(pod4Name, pod4Yaml)
 	if err := h.WaitForPodReady(pod4Name, "default", 1*time.Minute); err != nil {
 		t.Fatalf("Test Pod 4 failed to start: %v", err)
 	}
+	t.Logf("[PERFORMANCE] Pod 4 startup took %v", time.Since(startPod4))
 
 	time.Sleep(5 * time.Second)
 	t.Logf("Deleting Pod 4 to trigger snapshot push")
@@ -286,10 +298,12 @@ spec:
 `, pod5Name, incVolumeID)
 
 	t.Logf("Creating Pod 5 (modifying volume)")
+	startPod5 := time.Now()
 	h.KubectlApplyContent(pod5Name, pod5Yaml)
 	if err := h.WaitForPodReady(pod5Name, "default", 1*time.Minute); err != nil {
 		t.Fatalf("Test Pod 5 failed to start: %v", err)
 	}
+	t.Logf("[PERFORMANCE] Pod 5 startup took %v", time.Since(startPod5))
 
 	time.Sleep(5 * time.Second)
 	logs5 := h.GetPodLogsByName(pod5Name, "default")
