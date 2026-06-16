@@ -134,7 +134,11 @@ func (s *server) GetLatestSnapshot(ctx context.Context, req *pb.GetLatestSnapsho
 		}
 
 		// Compile staging directory to EROFS image
-		imgFile, err := os.CreateTemp("", "erofs-img-")
+		tmpDir := filepath.Join(*dataPath, "tmp")
+		if err := os.MkdirAll(tmpDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create temp directory %s: %v", tmpDir, err)
+		}
+		imgFile, err := os.CreateTemp(tmpDir, "erofs-img-")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create temp erofs img: %v", err)
 		}
