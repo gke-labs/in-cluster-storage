@@ -419,10 +419,9 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 	// Try to unmount the target path. Ignore if not a mount point.
 	if err := syscall.Unmount(targetPath, 0); err != nil {
 		if err != syscall.EINVAL {
-			klog.Warningf("Failed to unmount %s: %v", targetPath, err)
-		} else {
-			klog.Infof("Volume %s not mounted at %s (or already unmounted)", k8sVolumeID, targetPath)
+			return nil, fmt.Errorf("failed to unmount target path %s: %v", targetPath, err)
 		}
+		klog.Infof("Volume %s not mounted at %s (or already unmounted)", k8sVolumeID, targetPath)
 	}
 
 	// Try to unmount the lower path if we are in EROFS mode
@@ -430,7 +429,7 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 		lowerPath := filepath.Join(*storagePath, k8sVolumeID, "lower")
 		if err := syscall.Unmount(lowerPath, 0); err != nil {
 			if err != syscall.EINVAL {
-				klog.Warningf("Failed to unmount lower EROFS mount %s: %v", lowerPath, err)
+				return nil, fmt.Errorf("failed to unmount lower EROFS mount %s: %v", lowerPath, err)
 			}
 		}
 	}

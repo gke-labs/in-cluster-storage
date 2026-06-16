@@ -53,12 +53,13 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
 	if _, err = io.Copy(out, in); err != nil {
+		_ = out.Close()
 		return err
 	}
-	return nil
+
+	return out.Close()
 }
 
 func calculateSHA256(path string) (string, error) {
@@ -161,12 +162,9 @@ func (s *server) GetLatestSnapshot(ctx context.Context, req *pb.GetLatestSnapsho
 			return nil, fmt.Errorf("failed to create blobs directory: %v", err)
 		}
 
-		// Move or copy
+		// Move/Rename
 		if err := os.Rename(imgPath, blobPath); err != nil {
-			// fallback to copy if Rename fails
-			if err := copyFile(imgPath, blobPath, 0644); err != nil {
-				return nil, fmt.Errorf("failed to copy erofs image to blobs: %v", err)
-			}
+			return nil, fmt.Errorf("failed to rename erofs image to blobs path %s: %v", blobPath, err)
 		}
 
 		snapshot.ErofsSha256 = erofsSha

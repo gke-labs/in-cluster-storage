@@ -58,8 +58,8 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "image: agentfs-node-daemon:latest", "image: agentfs-node-daemon:e2e\n          imagePullPolicy: Never")
 
 	erofsFlag := ""
-	if os.Getenv("ENABLE_EROFS") == "true" {
-		t.Logf("Enabling EROFS mode for e2e tests!")
+	if os.Getenv("ENABLE_EROFS") != "false" {
+		t.Logf("Enabling EROFS mode for e2e tests (default)!")
 		erofsFlag = "\n            - \"--enable-erofs=true\""
 	}
 	manifest = strings.ReplaceAll(manifest, `"--controller-address=agentfs-controller:50051"`, `"--controller-address=agentfs-controller:50051"`+"\n            - \"--lazy-load-threshold=1\""+erofsFlag)
