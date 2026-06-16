@@ -20,17 +20,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"unicode/utf8"
 )
 
 const (
-	SuperMagic   = 0xE0F5E1E2
-	SuperOffset  = 1024
-	SuperSize    = 128
-	SlotSize     = 32
-	BlockSize4K  = 4096
+	SuperMagic  = 0xE0F5E1E2
+	SuperOffset = 1024
+	SuperSize   = 128
+	SlotSize    = 32
+	BlockSize4K = 4096
 )
 
 const (
@@ -118,23 +121,6 @@ type Entry struct {
 	UID     uint32
 	GID     uint32
 	Mtime   uint64
-}
-
-// writeNode is used internally by the EROFS compiler/writer to represent the file tree.
-type writeNode struct {
-	name        string
-	isDir       bool
-	content     []byte
-	mode        uint16
-	uid         uint32
-	gid         uint32
-	mtime       uint64
-	nid         uint64
-	children    map[string]*writeNode
-	parent      *writeNode
-	inodeOffset int64
-	dataOffset  int64
-	dataLen     uint64
 }
 
 // ReadSuperblock parses the EROFS superblock from the given ReaderAt.
@@ -306,43 +292,32 @@ func (inode *Inode) ReadInlineData(r io.ReaderAt, sb *Superblock) ([]byte, error
 	return buf, nil
 }
 
-// ReadData retrieves the entire data payload for the given inode.
-func (inode *Inode) ReadData(r io.ReaderAt, sb *Superblock) ([]byte, error) {
+// DataReader returns an io.Reader to stream file data, avoiding full in-memory buffering.
+func (inode *Inode) DataReader(r io.ReaderAt, sb *Superblock) (io.Reader, error) {
 	blockSize := uint64(sb.BlockSize())
 
 	if inode.DataLayout == DatalayoutFlatPlain {
 		totalBlocks := (inode.Size + blockSize - 1) / blockSize
 		if totalBlocks == 0 {
-			return nil, nil
+			return bytes.NewReader(nil), nil
 		}
 
 		if uint64(inode.RawBlkaddr)+totalBlocks > uint64(sb.Blocks) {
 			return nil, fmt.Errorf("block address out of bounds: raw_blkaddr %d, totalBlocks %d, image total blocks %d", inode.RawBlkaddr, totalBlocks, sb.Blocks)
 		}
 
-		buf := make([]byte, inode.Size)
-		startOffset := int64(inode.RawBlkaddr) * int64(blockSize)
-		_, err := r.ReadAt(buf, startOffset)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read plain data block: %w", err)
-		}
-		return buf, nil
+		return io.NewSectionReader(r, int64(inode.RawBlkaddr)*int64(blockSize), int64(inode.Size)), nil
 
 	} else if inode.DataLayout == DatalayoutFlatInline {
 		numBlocks := inode.Size / blockSize
 		tailSize := inode.Size % blockSize
 
-		var data []byte
+		var readers []io.Reader
 		if numBlocks > 0 {
 			if uint64(inode.RawBlkaddr)+numBlocks > uint64(sb.Blocks) {
 				return nil, fmt.Errorf("block address out of bounds: raw_blkaddr %d, blocks %d, image total blocks %d", inode.RawBlkaddr, numBlocks, sb.Blocks)
 			}
-			data = make([]byte, numBlocks*blockSize)
-			startOffset := int64(inode.RawBlkaddr) * int64(blockSize)
-			_, err := r.ReadAt(data, startOffset)
-			if err != nil && err != io.EOF {
-				return nil, fmt.Errorf("failed to read inline base blocks: %w", err)
-			}
+			readers = append(readers, io.NewSectionReader(r, int64(inode.RawBlkaddr)*int64(blockSize), int64(numBlocks*blockSize)))
 		}
 
 		if tailSize > 0 {
@@ -350,12 +325,25 @@ func (inode *Inode) ReadData(r io.ReaderAt, sb *Superblock) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			data = append(data, tail...)
+			readers = append(readers, bytes.NewReader(tail))
 		}
-		return data, nil
+
+		if len(readers) == 0 {
+			return bytes.NewReader(nil), nil
+		}
+		return io.MultiReader(readers...), nil
 	}
 
 	return nil, fmt.Errorf("unsupported EROFS data layout: %d", inode.DataLayout)
+}
+
+// ReadData retrieves the entire data payload for the given inode by fully reading its DataReader.
+func (inode *Inode) ReadData(r io.ReaderAt, sb *Superblock) ([]byte, error) {
+	reader, err := inode.DataReader(r, sb)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(reader)
 }
 
 // ParseDirectoryBlock parses directory entries from a block buffer.
@@ -545,13 +533,13 @@ func NewReader(r io.ReaderAt) (*Reader, error) {
 	return &Reader{r: r, sb: sb}, nil
 }
 
-// ReadFileContent returns the full file content of a regular/symlink file.
-func (reader *Reader) ReadFileContent(nid uint64) ([]byte, error) {
+// ReadFileContent returns an io.Reader to stream the content of a regular/symlink file.
+func (reader *Reader) ReadFileContent(nid uint64) (io.Reader, error) {
 	inode, err := ReadInode(reader.r, reader.sb, nid)
 	if err != nil {
 		return nil, err
 	}
-	return inode.ReadData(reader.r, reader.sb)
+	return inode.DataReader(reader.r, reader.sb)
 }
 
 // ListDirectory lists all directory entries.
@@ -630,12 +618,272 @@ func BuildDirectoryBlock(dirents []Dirent, size int) ([]byte, error) {
 	return buf, nil
 }
 
-// (n *writeNode) MarshalCompact constructs the 32-byte compact inode layout.
-func (n *writeNode) MarshalCompact() []byte {
+// Node represents a node in the virtual filesystem to be written.
+type Node interface {
+	Name() string
+	IsDir() bool
+	Mode() uint16
+	UID() uint32
+	GID() uint32
+	Mtime() uint64
+	Size() uint64
+	// Open returns an io.ReadCloser to read the file/symlink content.
+	// For directories, it is not used.
+	Open() (io.ReadCloser, error)
+	// Children returns an iterator over the child nodes of a directory.
+	// For non-directories, it is not used.
+	Children() (iter.Seq[Node], error)
+}
+
+// memoryNode implements the Node interface for virtual in-memory trees.
+type memoryNode struct {
+	name     string
+	isDir    bool
+	mode     uint16
+	uid      uint32
+	gid      uint32
+	mtime    uint64
+	content  []byte
+	children map[string]*memoryNode
+}
+
+func (m *memoryNode) Name() string  { return m.name }
+func (m *memoryNode) IsDir() bool   { return m.isDir }
+func (m *memoryNode) Mode() uint16  { return m.mode }
+func (m *memoryNode) UID() uint32   { return m.uid }
+func (m *memoryNode) GID() uint32   { return m.gid }
+func (m *memoryNode) Mtime() uint64 { return m.mtime }
+func (m *memoryNode) Size() uint64  { return uint64(len(m.content)) }
+
+func (m *memoryNode) Open() (io.ReadCloser, error) {
+	if m.isDir {
+		return nil, errors.New("cannot open directory")
+	}
+	return io.NopCloser(bytes.NewReader(m.content)), nil
+}
+
+func (m *memoryNode) Children() (iter.Seq[Node], error) {
+	if !m.isDir {
+		return nil, errors.New("not a directory")
+	}
+	return func(yield func(Node) bool) {
+		var keys []string
+		for k := range m.children {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if !yield(m.children[k]) {
+				return
+			}
+		}
+	}, nil
+}
+
+// fileSystemNode implements the Node interface for physical host directories.
+type fileSystemNode struct {
+	name string
+	path string
+}
+
+// NewFileSystemNode instantiates a local directory-backed EROFS compiler Node.
+func NewFileSystemNode(name string, path string) Node {
+	return &fileSystemNode{name: name, path: path}
+}
+
+func (f *fileSystemNode) Name() string {
+	return f.name
+}
+
+func (f *fileSystemNode) IsDir() bool {
+	st, err := os.Lstat(f.path)
+	if err != nil {
+		return false
+	}
+	return st.IsDir()
+}
+
+func (f *fileSystemNode) Mode() uint16 {
+	st, err := os.Lstat(f.path)
+	if err != nil {
+		return 0
+	}
+	m := uint32(st.Mode())
+	var mode uint16 = uint16(m & 0777)
+	if st.IsDir() {
+		mode |= S_IFDIR
+	} else if (m & uint32(os.ModeSymlink)) != 0 {
+		mode |= S_IFLNK
+	} else {
+		mode |= S_IFREG
+	}
+	return mode
+}
+
+func (f *fileSystemNode) UID() uint32 {
+	return 0
+}
+
+func (f *fileSystemNode) GID() uint32 {
+	return 0
+}
+
+func (f *fileSystemNode) Mtime() uint64 {
+	st, err := os.Lstat(f.path)
+	if err != nil {
+		return 0
+	}
+	return uint64(st.ModTime().Unix())
+}
+
+func (f *fileSystemNode) Size() uint64 {
+	st, err := os.Lstat(f.path)
+	if err != nil {
+		return 0
+	}
+	if (f.Mode() & S_IFMT) == S_IFLNK {
+		target, err := os.Readlink(f.path)
+		if err != nil {
+			return 0
+		}
+		return uint64(len(target))
+	}
+	return uint64(st.Size())
+}
+
+func (f *fileSystemNode) Open() (io.ReadCloser, error) {
+	mode := f.Mode()
+	if (mode & S_IFMT) == S_IFLNK {
+		target, err := os.Readlink(f.path)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(strings.NewReader(target)), nil
+	}
+	return os.Open(f.path)
+}
+
+func (f *fileSystemNode) Children() (iter.Seq[Node], error) {
+	if !f.IsDir() {
+		return nil, errors.New("not a directory")
+	}
+	return func(yield func(Node) bool) {
+		entries, err := os.ReadDir(f.path)
+		if err != nil {
+			return
+		}
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			childPath := filepath.Join(f.path, name)
+			childNode := &fileSystemNode{
+				name: name,
+				path: childPath,
+			}
+			if !yield(childNode) {
+				return
+			}
+		}
+	}, nil
+}
+
+// BuildTree constructs an in-memory Node hierarchy from a sequence of Entries.
+func BuildTree(entries iter.Seq[Entry]) (Node, error) {
+	root := &memoryNode{
+		name:     "",
+		isDir:    true,
+		mode:     S_IFDIR | 0755,
+		children: make(map[string]*memoryNode),
+	}
+
+	for entry := range entries {
+		if entry.Path == "" || entry.Path == "." {
+			continue
+		}
+		parts := splitPath(entry.Path)
+		curr := root
+		for i, part := range parts {
+			if i == len(parts)-1 {
+				node := &memoryNode{
+					name:    part,
+					isDir:   entry.IsDir,
+					content: entry.Content,
+					mode:    entry.Mode,
+					uid:     entry.UID,
+					gid:     entry.GID,
+					mtime:   entry.Mtime,
+				}
+				if entry.IsDir {
+					node.mode |= S_IFDIR
+					node.children = make(map[string]*memoryNode)
+				} else if entry.Mode&S_IFMT == 0 {
+					node.mode |= S_IFREG
+				}
+				curr.children[part] = node
+			} else {
+				next, ok := curr.children[part]
+				if !ok {
+					next = &memoryNode{
+						name:     part,
+						isDir:    true,
+						mode:     S_IFDIR | 0755,
+						children: make(map[string]*memoryNode),
+					}
+					curr.children[part] = next
+				}
+				curr = next
+			}
+		}
+	}
+	return root, nil
+}
+
+// splitPath splits a file path into its constituents.
+func splitPath(p string) []string {
+	var parts []string
+	for _, part := range strings.Split(p, "/") {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return parts
+}
+
+// nodeInfo represents the lightweight layout metadata collected during Pass 1.
+type nodeInfo struct {
+	node       Node
+	nid        uint64
+	parentNID  uint64
+	name       string
+	isDir      bool
+	mode       uint16
+	uid        uint32
+	gid        uint32
+	mtime      uint64
+	size       uint64
+	dataLen    uint64
+	dataOffset int64
+	dirData    []byte
+}
+
+type writerAtWrapper struct {
+	w   io.WriterAt
+	off int64
+}
+
+func (wrapper *writerAtWrapper) Write(p []byte) (int, error) {
+	n, err := wrapper.w.WriteAt(p, wrapper.off)
+	wrapper.off += int64(n)
+	return n, err
+}
+
+// marshalCompactNode constructs the 32-byte compact inode layout.
+func marshalCompactNode(n *nodeInfo) []byte {
 	buf := make([]byte, SlotSize)
 
-	// Format = (version << 0) | (dataLayout << 1)
-	// Compact version = 0, Flat plain layout = 0 -> Format = 0
 	var format uint16 = 0
 	binary.LittleEndian.PutUint16(buf[0:2], format)
 	binary.LittleEndian.PutUint16(buf[2:4], 0) // xattr_icount
@@ -657,125 +905,120 @@ func (n *writeNode) MarshalCompact() []byte {
 	return buf
 }
 
-// splitPath splits a file path into its constituents.
-func splitPath(p string) []string {
-	var parts []string
-	for _, part := range strings.Split(p, "/") {
-		if part != "" {
-			parts = append(parts, part)
-		}
-	}
-	return parts
-}
+// WriteImage compiles a Node hierarchy into a valid, block-aligned EROFS filesystem image.
+// Writes directly to w at exact offsets, avoiding any full disk image or file buffering in memory.
+func WriteImage(w io.WriterAt, root Node) error {
+	var nodes []*nodeInfo
 
-// WriteImage compiles a set of virtual files/directories into a valid EROFS filesystem image.
-func WriteImage(w io.Writer, entries []Entry) error {
-	root := &writeNode{
-		name:     "",
-		isDir:    true,
-		mode:     S_IFDIR | 0755,
-		children: make(map[string]*writeNode),
-	}
-	root.parent = root
-
-	for _, entry := range entries {
-		if entry.Path == "" || entry.Path == "." {
-			continue
+	// Recursively collect metadata of the nodes
+	var visit func(n Node, parentNID uint64, name string) (*nodeInfo, error)
+	visit = func(n Node, parentNID uint64, name string) (*nodeInfo, error) {
+		nid := uint64(len(nodes))
+		info := &nodeInfo{
+			node:      n,
+			nid:       nid,
+			parentNID: parentNID,
+			name:      name,
+			isDir:     n.IsDir(),
+			mode:      n.Mode(),
+			uid:       n.UID(),
+			gid:       n.GID(),
+			mtime:     n.Mtime(),
+			size:      n.Size(),
 		}
-		parts := splitPath(entry.Path)
-		curr := root
-		for i, part := range parts {
-			if i == len(parts)-1 {
-				node := &writeNode{
-					name:    part,
-					isDir:   entry.IsDir,
-					content: entry.Content,
-					mode:    entry.Mode,
-					uid:     entry.UID,
-					gid:     entry.GID,
-					mtime:   entry.Mtime,
+		if info.isDir {
+			info.mode |= S_IFDIR
+		} else if info.mode&S_IFMT == 0 {
+			info.mode |= S_IFREG
+		}
+
+		nodes = append(nodes, info)
+
+		if info.isDir {
+			childSeq, err := n.Children()
+			if err != nil {
+				return nil, err
+			}
+			var children []Node
+			if childSeq != nil {
+				for child := range childSeq {
+					children = append(children, child)
 				}
-				if entry.IsDir {
-					node.mode |= S_IFDIR
-					node.children = make(map[string]*writeNode)
-				} else if entry.Mode&S_IFMT == 0 {
-					node.mode |= S_IFREG
+			}
+			sort.Slice(children, func(i, j int) bool {
+				return children[i].Name() < children[j].Name()
+			})
+
+			for _, child := range children {
+				_, err := visit(child, nid, child.Name())
+				if err != nil {
+					return nil, err
 				}
-				node.parent = curr
-				curr.children[part] = node
-			} else {
-				next, ok := curr.children[part]
-				if !ok {
-					next = &writeNode{
-						name:     part,
-						isDir:    true,
-						mode:     S_IFDIR | 0755,
-						children: make(map[string]*writeNode),
-						parent:   curr,
-					}
-					curr.children[part] = next
-				}
-				curr = next
 			}
 		}
+		return info, nil
 	}
 
-	var nodes []*writeNode
-	var collect func(n *writeNode)
-	collect = func(n *writeNode) {
-		nodes = append(nodes, n)
-		var keys []string
-		for k := range n.children {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			collect(n.children[k])
-		}
-	}
-	collect(root)
-
-	// Assign NIDs
-	for i, n := range nodes {
-		n.nid = uint64(i)
+	_, err := visit(root, 0, "")
+	if err != nil {
+		return err
 	}
 
 	blockSize := int64(BlockSize4K)
+
 	for _, n := range nodes {
 		if n.isDir {
 			var dirents []Dirent
-			var keys []string
-			for k := range n.children {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-
 			dirents = append(dirents, Dirent{NID: n.nid, Name: ".", FileType: FTDir})
-			dirents = append(dirents, Dirent{NID: n.parent.nid, Name: "..", FileType: FTDir})
+			dirents = append(dirents, Dirent{NID: n.parentNID, Name: "..", FileType: FTDir})
 
-			for _, k := range keys {
-				child := n.children[k]
+			childSeq, err := n.node.Children()
+			if err != nil {
+				return err
+			}
+			var children []Node
+			if childSeq != nil {
+				for child := range childSeq {
+					children = append(children, child)
+				}
+			}
+			sort.Slice(children, func(i, j int) bool {
+				return children[i].Name() < children[j].Name()
+			})
+
+			for _, child := range children {
+				var childInfo *nodeInfo
+				for _, info := range nodes {
+					if info.parentNID == n.nid && info.name == child.Name() {
+						childInfo = info
+						break
+					}
+				}
+				if childInfo == nil {
+					return fmt.Errorf("child node info not found for name %s under parent NID %d", child.Name(), n.nid)
+				}
+
 				var ft uint8 = FTRegFile
-				if child.isDir {
+				if childInfo.isDir {
 					ft = FTDir
-				} else if (child.mode & S_IFMT) == S_IFLNK {
+				} else if (childInfo.mode & S_IFMT) == S_IFLNK {
 					ft = FTSymlink
 				}
-				dirents = append(dirents, Dirent{NID: child.nid, Name: child.name, FileType: ft})
+				dirents = append(dirents, Dirent{NID: childInfo.nid, Name: childInfo.name, FileType: ft})
 			}
 
 			dirBlock, err := BuildDirectoryBlock(dirents, int(blockSize))
 			if err != nil {
 				return err
 			}
-			n.content = dirBlock
+			n.dirData = dirBlock
+			n.size = uint64(len(dirBlock))
 			n.dataLen = uint64(len(dirBlock))
 		} else {
-			n.dataLen = uint64(len(n.content))
+			n.dataLen = n.size
 		}
 	}
 
-	// Blocks allocation
 	inodesBytes := int64(len(nodes) * SlotSize)
 	inodesBlocks := (inodesBytes + blockSize - 1) / blockSize
 
@@ -799,50 +1042,67 @@ func WriteImage(w io.Writer, entries []Entry) error {
 	totalBlocks := uint32(currentBlock)
 
 	sb := &Superblock{
-		Magic:           SuperMagic,
-		Blkszbits:       12, // 4096 bytes
-		RootNID:         uint16(root.nid),
-		Inodes:          uint64(len(nodes)),
-		Blocks:          totalBlocks,
-		MetaBlkaddr:     uint32(metaBlkaddr),
-		FeatureIncompat: 0,
+		Magic:       SuperMagic,
+		Blkszbits:   12,
+		RootNID:     uint16(nodes[0].nid),
+		Inodes:      uint64(len(nodes)),
+		Blocks:      totalBlocks,
+		MetaBlkaddr: uint32(metaBlkaddr),
 	}
 
-	block0 := make([]byte, blockSize)
 	sbBuf := make([]byte, SuperSize)
 	binary.LittleEndian.PutUint32(sbBuf[0:4], sb.Magic)
 	binary.LittleEndian.PutUint16(sbBuf[14:16], sb.RootNID)
 	binary.LittleEndian.PutUint64(sbBuf[16:24], sb.Inodes)
 	binary.LittleEndian.PutUint32(sbBuf[36:40], sb.Blocks)
 	binary.LittleEndian.PutUint32(sbBuf[40:44], sb.MetaBlkaddr)
-	copy(block0[SuperOffset:SuperOffset+SuperSize], sbBuf)
 
-	if _, err := w.Write(block0); err != nil {
-		return err
+	if _, err := w.WriteAt(sbBuf, SuperOffset); err != nil {
+		return fmt.Errorf("failed to write superblock: %w", err)
 	}
 
-	inodeBuf := make([]byte, inodesBlocks*blockSize)
-	for i, n := range nodes {
-		copy(inodeBuf[i*SlotSize:(i+1)*SlotSize], n.MarshalCompact())
-	}
-	if _, err := w.Write(inodeBuf); err != nil {
-		return err
+	for _, n := range nodes {
+		inodeOffset := sb.InodeOffset(n.nid)
+		inodeBuf := marshalCompactNode(n)
+		if _, err := w.WriteAt(inodeBuf, inodeOffset); err != nil {
+			return fmt.Errorf("failed to write inode for NID %d: %w", n.nid, err)
+		}
 	}
 
 	for _, n := range nodes {
 		if n.isDir && n.dataLen > 0 {
-			if _, err := w.Write(n.content); err != nil {
-				return err
+			if _, err := w.WriteAt(n.dirData, n.dataOffset); err != nil {
+				return fmt.Errorf("failed to write directory block for NID %d: %w", n.nid, err)
 			}
 		}
 	}
 
 	for _, n := range nodes {
 		if !n.isDir && n.dataLen > 0 {
-			fileBlock := make([]byte, ((n.dataLen+uint64(blockSize)-1)/uint64(blockSize))*uint64(blockSize))
-			copy(fileBlock, n.content)
-			if _, err := w.Write(fileBlock); err != nil {
-				return err
+			rc, err := n.node.Open()
+			if err != nil {
+				return fmt.Errorf("failed to open file %s for streaming: %w", n.name, err)
+			}
+			wrapper := &writerAtWrapper{
+				w:   w,
+				off: n.dataOffset,
+			}
+			written, err := io.Copy(wrapper, rc)
+			rc.Close()
+			if err != nil {
+				return fmt.Errorf("failed to stream file content for %s: %w", n.name, err)
+			}
+			if uint64(written) != n.dataLen {
+				return fmt.Errorf("file size mismatch for %s: wrote %d, expected %d", n.name, written, n.dataLen)
+			}
+
+			tail := n.dataLen % uint64(blockSize)
+			if tail > 0 {
+				padSize := blockSize - int64(tail)
+				pad := make([]byte, padSize)
+				if _, err := w.WriteAt(pad, n.dataOffset+int64(n.dataLen)); err != nil {
+					return fmt.Errorf("failed to write padding for %s: %w", n.name, err)
+				}
 			}
 		}
 	}
