@@ -37,26 +37,113 @@ func (m *memoryWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
-func TestErofsSuccess(t *testing.T) {
-	// 1. Define a set of files and directories using Entry
-	entries := []Entry{
-		{Path: "hello.txt", IsDir: false, Content: []byte("Hello, EROFS!"), Mode: 0644},
-		{Path: "foo/bar.txt", IsDir: false, Content: []byte("Nested file content."), Mode: 0644},
-		{Path: "foo/baz", IsDir: true, Mode: 0755},
-		{Path: "foo/baz/deep.txt", IsDir: false, Content: []byte("Deeply nested file."), Mode: 0644},
-		{Path: "sym_link", IsDir: false, Content: []byte("hello.txt"), Mode: S_IFLNK | 0777},
-	}
+// compareTrees recursively compares a Node tree with a compiled EROFS filesystem Reader,
+// ensuring count, name, type, and file contents match exactly without hardcoded offsets.
+func compareTrees(t *testing.T, expected Node, reader *Reader, nid uint64) {
+	if expected.IsDir() {
+		expectedChildren, err := expected.Children()
+		if err != nil {
+			t.Fatalf("failed to get expected children: %v", err)
+		}
+		actualChildren, err := reader.ListDirectory(nid)
+		if err != nil {
+			t.Fatalf("failed to list actual directory at NID %d: %v", nid, err)
+		}
 
-	// Helper to yield entries for BuildTree
-	entrySeq := func(yield func(Entry) bool) {
-		for _, e := range entries {
-			if !yield(e) {
-				return
+		// Filter out "." and ".." from actualChildren
+		var actualFiltered []Dirent
+		for _, de := range actualChildren {
+			if de.Name != "." && de.Name != ".." {
+				actualFiltered = append(actualFiltered, de)
 			}
 		}
+
+		if len(expectedChildren) != len(actualFiltered) {
+			t.Fatalf("directory children count mismatch under %s: expected %d, got %d", expected.Name(), len(expectedChildren), len(actualFiltered))
+		}
+
+		for i, ec := range expectedChildren {
+			ac := actualFiltered[i]
+			if ec.Name() != ac.Name {
+				t.Fatalf("child name mismatch under %s at index %d: expected %s, got %s", expected.Name(), i, ec.Name(), ac.Name)
+			}
+
+			// Validate file type
+			var expectedFileType uint8
+			if ec.IsDir() {
+				expectedFileType = FTDir
+			} else if (ec.Mode() & S_IFMT) == S_IFLNK {
+				expectedFileType = FTSymlink
+			} else {
+				expectedFileType = FTRegFile
+			}
+
+			if ac.FileType != expectedFileType {
+				t.Errorf("file type mismatch for %s: expected %d, got %d", ec.Name(), expectedFileType, ac.FileType)
+			}
+
+			// Recurse into children
+			compareTrees(t, ec, reader, ac.NID)
+		}
+	} else {
+		// Verify file/symlink content
+		rc, err := expected.Open()
+		if err != nil {
+			t.Fatalf("failed to open expected file content for %s: %v", expected.Name(), err)
+		}
+		defer rc.Close()
+		expectedBytes, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatalf("failed to read expected file content for %s: %v", expected.Name(), err)
+		}
+
+		r, err := reader.ReadFileContent(nid)
+		if err != nil {
+			t.Fatalf("failed to read actual file content at NID %d: %v", nid, err)
+		}
+		actualBytes, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("failed to read actual streamed content: %v", err)
+		}
+
+		if !bytes.Equal(expectedBytes, actualBytes) {
+			t.Errorf("content mismatch for %s: expected %q, got %q", expected.Name(), string(expectedBytes), string(actualBytes))
+		}
+	}
+}
+
+func TestErofsSuccess(t *testing.T) {
+	// 1. Define paths, directories, contents and modes to BuildTree
+	paths := []string{
+		"hello.txt",
+		"foo/bar.txt",
+		"foo/baz",
+		"foo/baz/deep.txt",
+		"sym_link",
+	}
+	isDirs := []bool{
+		false,
+		false,
+		true,
+		false,
+		false,
+	}
+	contents := [][]byte{
+		[]byte("Hello, EROFS!"),
+		[]byte("Nested file content."),
+		nil,
+		[]byte("Deeply nested file."),
+		[]byte("hello.txt"),
+	}
+	modes := []uint16{
+		0644,
+		0644,
+		0755,
+		0644,
+		S_IFLNK | 0777,
 	}
 
-	rootNode, err := BuildTree(entrySeq)
+	rootNode, err := BuildTree(paths, isDirs, contents, modes)
 	if err != nil {
 		t.Fatalf("failed to build virtual tree: %v", err)
 	}
@@ -77,133 +164,45 @@ func TestErofsSuccess(t *testing.T) {
 		t.Errorf("Fsck failed on valid image: %v", err)
 	}
 
-	// 4. Use Reader to navigate and verify file contents
+	// 4. Use Reader to navigate and recursively verify with expected tree
 	reader, err := NewReader(readerAt)
 	if err != nil {
 		t.Fatalf("failed to create Reader: %v", err)
 	}
 
-	// List root directory
-	rootDirents, err := reader.ListDirectory(reader.sb.GetRootNID())
+	compareTrees(t, rootNode, reader, reader.sb.GetRootNID())
+}
+
+func createMinimalImage(t *testing.T) []byte {
+	root, err := BuildTree(
+		[]string{"file.txt"},
+		[]bool{false},
+		[][]byte{[]byte("test data")},
+		[]uint16{0644},
+	)
 	if err != nil {
-		t.Fatalf("failed to list root directory: %v", err)
+		t.Fatalf("failed to build minimal tree: %v", err)
 	}
 
-	foundHello := false
-	foundFoo := false
-	foundSym := false
-	for _, de := range rootDirents {
-		if de.Name == "hello.txt" {
-			foundHello = true
-			if de.FileType != FTRegFile {
-				t.Errorf("expected FTRegFile for hello.txt, got %d", de.FileType)
-			}
-			// Verify content
-			r, err := reader.ReadFileContent(de.NID)
-			if err != nil {
-				t.Fatalf("failed to read hello.txt: %v", err)
-			}
-			content, err := io.ReadAll(r)
-			if err != nil {
-				t.Fatalf("failed to read streamed hello.txt content: %v", err)
-			}
-			if string(content) != "Hello, EROFS!" {
-				t.Errorf("unexpected content for hello.txt: %q", string(content))
-			}
-		} else if de.Name == "foo" {
-			foundFoo = true
-			if de.FileType != FTDir {
-				t.Errorf("expected FTDir for foo, got %d", de.FileType)
-			}
-			// List foo directory
-			fooDirents, err := reader.ListDirectory(de.NID)
-			if err != nil {
-				t.Fatalf("failed to list foo directory: %v", err)
-			}
-			foundBar := false
-			foundBaz := false
-			for _, fde := range fooDirents {
-				if fde.Name == "bar.txt" {
-					foundBar = true
-					r, err := reader.ReadFileContent(fde.NID)
-					if err != nil {
-						t.Fatalf("failed to read bar.txt: %v", err)
-					}
-					content, err := io.ReadAll(r)
-					if err != nil {
-						t.Fatalf("failed to read streamed bar.txt content: %v", err)
-					}
-					if string(content) != "Nested file content." {
-						t.Errorf("unexpected content for bar.txt: %q", string(content))
-					}
-				} else if fde.Name == "baz" {
-					foundBaz = true
-					bazDirents, err := reader.ListDirectory(fde.NID)
-					if err != nil {
-						t.Fatalf("failed to list baz directory: %v", err)
-					}
-					foundDeep := false
-					for _, bde := range bazDirents {
-						if bde.Name == "deep.txt" {
-							foundDeep = true
-							r, err := reader.ReadFileContent(bde.NID)
-							if err != nil {
-								t.Fatalf("failed to read deep.txt: %v", err)
-							}
-							content, err := io.ReadAll(r)
-							if err != nil {
-								t.Fatalf("failed to read streamed deep.txt content: %v", err)
-							}
-							if string(content) != "Deeply nested file." {
-								t.Errorf("unexpected content for deep.txt: %q", string(content))
-							}
-						}
-					}
-					if !foundDeep {
-						t.Error("deep.txt not found under foo/baz")
-					}
-				}
-			}
-			if !foundBar {
-				t.Error("bar.txt not found under foo")
-			}
-			if !foundBaz {
-				t.Error("baz not found under foo")
-			}
-		} else if de.Name == "sym_link" {
-			foundSym = true
-			if de.FileType != FTSymlink {
-				t.Errorf("expected FTSymlink for sym_link, got %d", de.FileType)
-			}
-			r, err := reader.ReadFileContent(de.NID)
-			if err != nil {
-				t.Fatalf("failed to read sym_link content: %v", err)
-			}
-			content, err := io.ReadAll(r)
-			if err != nil {
-				t.Fatalf("failed to read streamed sym_link content: %v", err)
-			}
-			if string(content) != "hello.txt" {
-				t.Errorf("unexpected sym_link target: %q", string(content))
-			}
-		}
+	mw := &memoryWriterAt{}
+	err = WriteImage(mw, root)
+	if err != nil {
+		t.Fatalf("failed to write image: %v", err)
 	}
 
-	if !foundHello {
-		t.Error("hello.txt not found in root")
-	}
-	if !foundFoo {
-		t.Error("foo directory not found in root")
-	}
-	if !foundSym {
-		t.Error("sym_link not found in root")
-	}
+	return mw.buf
 }
 
 func TestErofsFsckFailures(t *testing.T) {
 	t.Run("Invalid Superblock Magic", func(t *testing.T) {
-		corruptData := make([]byte, 2048)
-		err := Fsck(bytes.NewReader(corruptData))
+		img := createMinimalImage(t)
+		// Corrupt SuperMagic at SuperOffset (1024)
+		img[SuperOffset] = 0xAA
+		img[SuperOffset+1] = 0xBB
+		img[SuperOffset+2] = 0xCC
+		img[SuperOffset+3] = 0xDD
+
+		err := Fsck(bytes.NewReader(img))
 		if err == nil {
 			t.Error("expected Fsck to fail with invalid superblock magic")
 		}
@@ -215,7 +214,7 @@ func TestErofsFsckFailures(t *testing.T) {
 		}
 		_, err := BuildDirectoryBlock(dirents, BlockSize4K)
 		if err == nil {
-			t.Error("expected BuildDirectoryBlock to fail or Fsck to catch null bytes")
+			t.Error("expected BuildDirectoryBlock to fail with null bytes")
 		}
 	})
 
@@ -225,22 +224,17 @@ func TestErofsFsckFailures(t *testing.T) {
 		}
 		_, err := BuildDirectoryBlock(dirents, BlockSize4K)
 		if err == nil {
-			t.Error("expected BuildDirectoryBlock to fail or Fsck to catch path separator")
+			t.Error("expected BuildDirectoryBlock to fail with path separator")
 		}
 	})
 
 	t.Run("Cycle Detection", func(t *testing.T) {
-		entries := []Entry{
-			{Path: "dir1", IsDir: true, Mode: 0755},
-		}
-		entrySeq := func(yield func(Entry) bool) {
-			for _, e := range entries {
-				if !yield(e) {
-					return
-				}
-			}
-		}
-		root, err := BuildTree(entrySeq)
+		root, err := BuildTree(
+			[]string{"dir1"},
+			[]bool{true},
+			[][]byte{nil},
+			[]uint16{0755},
+		)
 		if err != nil {
 			t.Fatalf("failed to build virtual tree: %v", err)
 		}
@@ -336,87 +330,6 @@ func TestErofsPhysicalDirectory(t *testing.T) {
 		t.Fatalf("failed to create reader: %v", err)
 	}
 
-	rootDirents, err := reader.ListDirectory(reader.sb.GetRootNID())
-	if err != nil {
-		t.Fatalf("failed to list root dirents: %v", err)
-	}
-
-	foundFile1 := false
-	foundSubdir := false
-	foundLink1 := false
-
-	for _, de := range rootDirents {
-		if de.Name == "file1.txt" {
-			foundFile1 = true
-			if de.FileType != FTRegFile {
-				t.Errorf("expected FTRegFile for file1.txt, got %d", de.FileType)
-			}
-			r, err := reader.ReadFileContent(de.NID)
-			if err != nil {
-				t.Fatalf("failed to read file1: %v", err)
-			}
-			content, err := io.ReadAll(r)
-			if err != nil {
-				t.Fatalf("failed to read streamed file1 content: %v", err)
-			}
-			if string(content) != "Physical file 1 content." {
-				t.Errorf("unexpected content for file1.txt: %q", string(content))
-			}
-		} else if de.Name == "subdir" {
-			foundSubdir = true
-			if de.FileType != FTDir {
-				t.Errorf("expected FTDir for subdir, got %d", de.FileType)
-			}
-			subDirents, err := reader.ListDirectory(de.NID)
-			if err != nil {
-				t.Fatalf("failed to list subdir: %v", err)
-			}
-			foundFile2 := false
-			for _, sde := range subDirents {
-				if sde.Name == "file2.txt" {
-					foundFile2 = true
-					r, err := reader.ReadFileContent(sde.NID)
-					if err != nil {
-						t.Fatalf("failed to read file2: %v", err)
-					}
-					content, err := io.ReadAll(r)
-					if err != nil {
-						t.Fatalf("failed to read streamed file2 content: %v", err)
-					}
-					if string(content) != "Physical file 2 content inside subdir." {
-						t.Errorf("unexpected content for file2.txt: %q", string(content))
-					}
-				}
-			}
-			if !foundFile2 {
-				t.Error("file2.txt not found in subdir")
-			}
-		} else if de.Name == "link1" {
-			foundLink1 = true
-			if de.FileType != FTSymlink {
-				t.Errorf("expected FTSymlink for link1, got %d", de.FileType)
-			}
-			r, err := reader.ReadFileContent(de.NID)
-			if err != nil {
-				t.Fatalf("failed to read link1: %v", err)
-			}
-			content, err := io.ReadAll(r)
-			if err != nil {
-				t.Fatalf("failed to read streamed link1 content: %v", err)
-			}
-			if string(content) != "file1.txt" {
-				t.Errorf("unexpected target for link1: %q", string(content))
-			}
-		}
-	}
-
-	if !foundFile1 {
-		t.Error("file1.txt not found in EROFS image root")
-	}
-	if !foundSubdir {
-		t.Error("subdir not found in EROFS image root")
-	}
-	if !foundLink1 {
-		t.Error("link1 symlink not found in EROFS image root")
-	}
+	// Recursively validate compiled EROFS tree against the physical fileSystemNode tree input!
+	compareTrees(t, fsNode, reader, reader.sb.GetRootNID())
 }

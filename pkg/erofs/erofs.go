@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"iter"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,10 +28,15 @@ import (
 )
 
 const (
-	SuperMagic  = 0xE0F5E1E2
+	// SuperMagic is the unique magic number identifying an EROFS filesystem (0xE0F5E1E2).
+	SuperMagic = 0xE0F5E1E2
+	// SuperOffset is the byte offset of the superblock from the beginning of the image (1024 bytes).
 	SuperOffset = 1024
-	SuperSize   = 128
-	SlotSize    = 32
+	// SuperSize is the standard size of the EROFS superblock on-disk representation (128 bytes).
+	SuperSize = 128
+	// SlotSize is the unit slot size used to align and address inodes (32 bytes).
+	SlotSize = 32
+	// BlockSize4K is the default filesystem page and block alignment size (4096 bytes).
 	BlockSize4K = 4096
 )
 
@@ -110,17 +114,6 @@ type Dirent struct {
 	NID      uint64
 	Name     string
 	FileType uint8
-}
-
-// Entry represents a file or directory for writing an image.
-type Entry struct {
-	Path    string // relative path, e.g. "hello.txt", "sub/world.txt"
-	IsDir   bool
-	Content []byte // file content or symlink target path
-	Mode    uint16 // permissions / mode
-	UID     uint32
-	GID     uint32
-	Mtime   uint64
 }
 
 // ReadSuperblock parses the EROFS superblock from the given ReaderAt.
@@ -630,9 +623,9 @@ type Node interface {
 	// Open returns an io.ReadCloser to read the file/symlink content.
 	// For directories, it is not used.
 	Open() (io.ReadCloser, error)
-	// Children returns an iterator over the child nodes of a directory.
+	// Children returns a sorted slice of child nodes of a directory.
 	// For non-directories, it is not used.
-	Children() (iter.Seq[Node], error)
+	Children() ([]Node, error)
 }
 
 // memoryNode implements the Node interface for virtual in-memory trees.
@@ -644,7 +637,7 @@ type memoryNode struct {
 	gid      uint32
 	mtime    uint64
 	content  []byte
-	children map[string]*memoryNode
+	children []Node
 }
 
 func (m *memoryNode) Name() string  { return m.name }
@@ -654,6 +647,12 @@ func (m *memoryNode) UID() uint32   { return m.uid }
 func (m *memoryNode) GID() uint32   { return m.gid }
 func (m *memoryNode) Mtime() uint64 { return m.mtime }
 func (m *memoryNode) Size() uint64  { return uint64(len(m.content)) }
+func (m *memoryNode) Children() ([]Node, error) {
+	if !m.isDir {
+		return nil, errors.New("not a directory")
+	}
+	return m.children, nil
+}
 
 func (m *memoryNode) Open() (io.ReadCloser, error) {
 	if m.isDir {
@@ -662,175 +661,176 @@ func (m *memoryNode) Open() (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(m.content)), nil
 }
 
-func (m *memoryNode) Children() (iter.Seq[Node], error) {
-	if !m.isDir {
-		return nil, errors.New("not a directory")
-	}
-	return func(yield func(Node) bool) {
-		var keys []string
-		for k := range m.children {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if !yield(m.children[k]) {
-				return
-			}
-		}
-	}, nil
-}
-
 // fileSystemNode implements the Node interface for physical host directories.
 type fileSystemNode struct {
-	name string
-	path string
+	name   string
+	path   string
+	isDir  bool
+	mode   uint16
+	mtime  uint64
+	size   uint64
+	target string
 }
 
-// NewFileSystemNode instantiates a local directory-backed EROFS compiler Node.
-func NewFileSystemNode(name string, path string) Node {
-	return &fileSystemNode{name: name, path: path}
-}
-
-func (f *fileSystemNode) Name() string {
-	return f.name
-}
-
-func (f *fileSystemNode) IsDir() bool {
-	st, err := os.Lstat(f.path)
+// newFileSystemNode instantiates and caches file system information, calling Lstat exactly once.
+func newFileSystemNode(name string, path string) (Node, error) {
+	st, err := os.Lstat(path)
 	if err != nil {
-		return false
-	}
-	return st.IsDir()
-}
-
-func (f *fileSystemNode) Mode() uint16 {
-	st, err := os.Lstat(f.path)
-	if err != nil {
-		return 0
+		return nil, err
 	}
 	m := uint32(st.Mode())
 	var mode uint16 = uint16(m & 0777)
-	if st.IsDir() {
+	isDir := st.IsDir()
+	if isDir {
 		mode |= S_IFDIR
 	} else if (m & uint32(os.ModeSymlink)) != 0 {
 		mode |= S_IFLNK
 	} else {
 		mode |= S_IFREG
 	}
-	return mode
-}
 
-func (f *fileSystemNode) UID() uint32 {
-	return 0
-}
-
-func (f *fileSystemNode) GID() uint32 {
-	return 0
-}
-
-func (f *fileSystemNode) Mtime() uint64 {
-	st, err := os.Lstat(f.path)
-	if err != nil {
-		return 0
+	node := &fileSystemNode{
+		name:  name,
+		path:  path,
+		isDir: isDir,
+		mode:  mode,
+		mtime: uint64(st.ModTime().Unix()),
+		size:  uint64(st.Size()),
 	}
-	return uint64(st.ModTime().Unix())
-}
 
-func (f *fileSystemNode) Size() uint64 {
-	st, err := os.Lstat(f.path)
-	if err != nil {
-		return 0
-	}
-	if (f.Mode() & S_IFMT) == S_IFLNK {
-		target, err := os.Readlink(f.path)
-		if err != nil {
-			return 0
-		}
-		return uint64(len(target))
-	}
-	return uint64(st.Size())
-}
-
-func (f *fileSystemNode) Open() (io.ReadCloser, error) {
-	mode := f.Mode()
 	if (mode & S_IFMT) == S_IFLNK {
-		target, err := os.Readlink(f.path)
+		target, err := os.Readlink(path)
 		if err != nil {
 			return nil, err
 		}
-		return io.NopCloser(strings.NewReader(target)), nil
+		node.target = target
+		node.size = uint64(len(target))
+	}
+
+	return node, nil
+}
+
+// NewFileSystemNode instantiates a local directory-backed EROFS compiler Node.
+func NewFileSystemNode(name string, path string) Node {
+	n, err := newFileSystemNode(name, path)
+	if err != nil {
+		return nil
+	}
+	return n
+}
+
+func (f *fileSystemNode) Name() string  { return f.name }
+func (f *fileSystemNode) IsDir() bool   { return f.isDir }
+func (f *fileSystemNode) Mode() uint16  { return f.mode }
+func (f *fileSystemNode) UID() uint32   { return 0 }
+func (f *fileSystemNode) GID() uint32   { return 0 }
+func (f *fileSystemNode) Mtime() uint64 { return f.mtime }
+func (f *fileSystemNode) Size() uint64  { return f.size }
+
+func (f *fileSystemNode) Open() (io.ReadCloser, error) {
+	if (f.mode & S_IFMT) == S_IFLNK {
+		return io.NopCloser(strings.NewReader(f.target)), nil
 	}
 	return os.Open(f.path)
 }
 
-func (f *fileSystemNode) Children() (iter.Seq[Node], error) {
-	if !f.IsDir() {
+func (f *fileSystemNode) Children() ([]Node, error) {
+	if !f.isDir {
 		return nil, errors.New("not a directory")
 	}
-	return func(yield func(Node) bool) {
-		entries, err := os.ReadDir(f.path)
+	entries, err := os.ReadDir(f.path)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+
+	var children []Node
+	for _, name := range names {
+		childNode, err := newFileSystemNode(name, filepath.Join(f.path, name))
 		if err != nil {
-			return
+			return nil, err
 		}
-		var names []string
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			childPath := filepath.Join(f.path, name)
-			childNode := &fileSystemNode{
-				name: name,
-				path: childPath,
-			}
-			if !yield(childNode) {
-				return
-			}
-		}
-	}, nil
+		children = append(children, childNode)
+	}
+	return children, nil
 }
 
-// BuildTree constructs an in-memory Node hierarchy from a sequence of Entries.
-func BuildTree(entries iter.Seq[Entry]) (Node, error) {
-	root := &memoryNode{
+type treeBuilderNode struct {
+	name     string
+	isDir    bool
+	mode     uint16
+	uid      uint32
+	gid      uint32
+	mtime    uint64
+	content  []byte
+	children map[string]*treeBuilderNode
+}
+
+func convertToMemoryNode(b *treeBuilderNode) *memoryNode {
+	m := &memoryNode{
+		name:    b.name,
+		isDir:   b.isDir,
+		mode:    b.mode,
+		uid:     b.uid,
+		gid:     b.gid,
+		mtime:   b.mtime,
+		content: b.content,
+	}
+	if b.isDir {
+		var keys []string
+		for k := range b.children {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			m.children = append(m.children, convertToMemoryNode(b.children[k]))
+		}
+	}
+	return m
+}
+
+// BuildTree constructs an in-memory Node hierarchy from a sequence of virtual nodes.
+func BuildTree(paths []string, isDirs []bool, contents [][]byte, modes []uint16) (Node, error) {
+	root := &treeBuilderNode{
 		name:     "",
 		isDir:    true,
 		mode:     S_IFDIR | 0755,
-		children: make(map[string]*memoryNode),
+		children: make(map[string]*treeBuilderNode),
 	}
 
-	for entry := range entries {
-		if entry.Path == "" || entry.Path == "." {
+	for idx, path := range paths {
+		if path == "" || path == "." {
 			continue
 		}
-		parts := splitPath(entry.Path)
+		parts := splitPath(path)
 		curr := root
 		for i, part := range parts {
 			if i == len(parts)-1 {
-				node := &memoryNode{
+				node := &treeBuilderNode{
 					name:    part,
-					isDir:   entry.IsDir,
-					content: entry.Content,
-					mode:    entry.Mode,
-					uid:     entry.UID,
-					gid:     entry.GID,
-					mtime:   entry.Mtime,
+					isDir:   isDirs[idx],
+					content: contents[idx],
+					mode:    modes[idx],
 				}
-				if entry.IsDir {
+				if isDirs[idx] {
 					node.mode |= S_IFDIR
-					node.children = make(map[string]*memoryNode)
-				} else if entry.Mode&S_IFMT == 0 {
+					node.children = make(map[string]*treeBuilderNode)
+				} else if modes[idx]&S_IFMT == 0 {
 					node.mode |= S_IFREG
 				}
 				curr.children[part] = node
 			} else {
 				next, ok := curr.children[part]
 				if !ok {
-					next = &memoryNode{
+					next = &treeBuilderNode{
 						name:     part,
 						isDir:    true,
 						mode:     S_IFDIR | 0755,
-						children: make(map[string]*memoryNode),
+						children: make(map[string]*treeBuilderNode),
 					}
 					curr.children[part] = next
 				}
@@ -838,7 +838,7 @@ func BuildTree(entries iter.Seq[Entry]) (Node, error) {
 			}
 		}
 	}
-	return root, nil
+	return convertToMemoryNode(root), nil
 }
 
 // splitPath splits a file path into its constituents.
@@ -935,19 +935,10 @@ func WriteImage(w io.WriterAt, root Node) error {
 		nodes = append(nodes, info)
 
 		if info.isDir {
-			childSeq, err := n.Children()
+			children, err := n.Children()
 			if err != nil {
 				return nil, err
 			}
-			var children []Node
-			if childSeq != nil {
-				for child := range childSeq {
-					children = append(children, child)
-				}
-			}
-			sort.Slice(children, func(i, j int) bool {
-				return children[i].Name() < children[j].Name()
-			})
 
 			for _, child := range children {
 				_, err := visit(child, nid, child.Name())
@@ -972,19 +963,10 @@ func WriteImage(w io.WriterAt, root Node) error {
 			dirents = append(dirents, Dirent{NID: n.nid, Name: ".", FileType: FTDir})
 			dirents = append(dirents, Dirent{NID: n.parentNID, Name: "..", FileType: FTDir})
 
-			childSeq, err := n.node.Children()
+			children, err := n.node.Children()
 			if err != nil {
 				return err
 			}
-			var children []Node
-			if childSeq != nil {
-				for child := range childSeq {
-					children = append(children, child)
-				}
-			}
-			sort.Slice(children, func(i, j int) bool {
-				return children[i].Name() < children[j].Name()
-			})
 
 			for _, child := range children {
 				var childInfo *nodeInfo
