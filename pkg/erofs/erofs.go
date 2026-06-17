@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -62,6 +63,83 @@ const (
 	S_IFDIR = 0040000
 	S_IFLNK = 0120000
 )
+
+type ErrorCode int
+
+const (
+	ErrUnknown ErrorCode = iota
+	ErrInvalidSuperblock
+	ErrInvalidInode
+	ErrInvalidDirectoryBlock
+	ErrPathTraversal
+	ErrCycleDetected
+	ErrMaxDepthExceeded
+)
+
+type ErofsError struct {
+	Code    ErrorCode
+	Message string
+	Err     error
+}
+
+func (e *ErofsError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %v", e.Message, e.Err)
+	}
+	return e.Message
+}
+
+func (e *ErofsError) Unwrap() error {
+	return e.Err
+}
+
+func IsInvalidSuperblockError(err error) bool {
+	var erofsErr *ErofsError
+	if errors.As(err, &erofsErr) {
+		return erofsErr.Code == ErrInvalidSuperblock
+	}
+	return false
+}
+
+func IsInvalidInodeError(err error) bool {
+	var erofsErr *ErofsError
+	if errors.As(err, &erofsErr) {
+		return erofsErr.Code == ErrInvalidInode
+	}
+	return false
+}
+
+func IsInvalidDirectoryBlockError(err error) bool {
+	var erofsErr *ErofsError
+	if errors.As(err, &erofsErr) {
+		return erofsErr.Code == ErrInvalidDirectoryBlock
+	}
+	return false
+}
+
+func IsPathTraversalError(err error) bool {
+	var erofsErr *ErofsError
+	if errors.As(err, &erofsErr) {
+		return erofsErr.Code == ErrPathTraversal
+	}
+	return false
+}
+
+func IsCycleDetectedError(err error) bool {
+	var erofsErr *ErofsError
+	if errors.As(err, &erofsErr) {
+		return erofsErr.Code == ErrCycleDetected
+	}
+	return false
+}
+
+func IsMaxDepthExceededError(err error) bool {
+	var erofsErr *ErofsError
+	if errors.As(err, &erofsErr) {
+		return erofsErr.Code == ErrMaxDepthExceeded
+	}
+	return false
+}
 
 // Superblock represents the EROFS superblock.
 type Superblock struct {
@@ -116,24 +194,38 @@ type Dirent struct {
 	FileType uint8
 }
 
-// ReadSuperblock parses the EROFS superblock from the given ReaderAt.
+// ReadSuperblock parses and thoroughly verifies the EROFS superblock from the given ReaderAt.
 func ReadSuperblock(r io.ReaderAt) (*Superblock, error) {
 	buf := make([]byte, SuperSize)
 	n, err := r.ReadAt(buf, SuperOffset)
 	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("failed to read superblock: %w", err)
+		return nil, &ErofsError{Code: ErrInvalidSuperblock, Message: "failed to read superblock", Err: err}
 	}
 	if n < SuperSize {
-		return nil, fmt.Errorf("truncated superblock, read only %d bytes", n)
+		return nil, &ErofsError{Code: ErrInvalidSuperblock, Message: fmt.Sprintf("truncated superblock, read only %d bytes", n)}
 	}
 
 	sb := &Superblock{}
 	sb.Magic = binary.LittleEndian.Uint32(buf[0:4])
 	if sb.Magic != SuperMagic {
-		return nil, fmt.Errorf("invalid EROFS magic: got 0x%x, expected 0x%x", sb.Magic, SuperMagic)
+		return nil, &ErofsError{Code: ErrInvalidSuperblock, Message: fmt.Sprintf("invalid EROFS magic: got 0x%x, expected 0x%x", sb.Magic, SuperMagic)}
 	}
 
 	sb.Checksum = binary.LittleEndian.Uint32(buf[4:8])
+	if sb.Checksum != 0 {
+		// Zero out the checksum field to compute the expected CRC32
+		checksumBuf := make([]byte, SuperSize)
+		copy(checksumBuf, buf)
+		checksumBuf[4] = 0
+		checksumBuf[5] = 0
+		checksumBuf[6] = 0
+		checksumBuf[7] = 0
+		expectedSum := crc32.ChecksumIEEE(checksumBuf)
+		if sb.Checksum != expectedSum {
+			return nil, &ErofsError{Code: ErrInvalidSuperblock, Message: fmt.Sprintf("superblock checksum mismatch: got 0x%x, expected 0x%x", sb.Checksum, expectedSum)}
+		}
+	}
+
 	sb.FeatureCompat = binary.LittleEndian.Uint32(buf[8:12])
 	sb.Blkszbits = buf[12]
 	sb.SbExtslots = buf[13]
@@ -143,6 +235,21 @@ func ReadSuperblock(r io.ReaderAt) (*Superblock, error) {
 	sb.BuildTimeNsec = binary.LittleEndian.Uint32(buf[32:36])
 	sb.Blocks = binary.LittleEndian.Uint32(buf[36:40])
 	sb.MetaBlkaddr = binary.LittleEndian.Uint32(buf[40:44])
+
+	// Verify superblock fields
+	if sb.Blkszbits != 12 { // 12 bits = 4096 bytes (the only standard/supported block size)
+		return nil, &ErofsError{Code: ErrInvalidSuperblock, Message: fmt.Sprintf("unsupported block size bits %d (expected 12)", sb.Blkszbits)}
+	}
+	if sb.Blocks == 0 {
+		return nil, &ErofsError{Code: ErrInvalidSuperblock, Message: "invalid superblock: zero blocks count"}
+	}
+	if sb.Inodes == 0 {
+		return nil, &ErofsError{Code: ErrInvalidSuperblock, Message: "invalid superblock: zero inodes count"}
+	}
+	if sb.MetaBlkaddr == 0 {
+		return nil, &ErofsError{Code: ErrInvalidSuperblock, Message: "invalid superblock: zero meta block address"}
+	}
+
 	sb.XattrBlkaddr = binary.LittleEndian.Uint32(buf[44:48])
 	copy(sb.UUID[:], buf[48:64])
 	copy(sb.VolumeName[:], buf[64:80])
@@ -345,7 +452,7 @@ func ParseDirectoryBlock(buf []byte) ([]Dirent, error) {
 		return nil, nil
 	}
 	if len(buf) < 12 {
-		return nil, fmt.Errorf("directory block too small: %d bytes", len(buf))
+		return nil, &ErofsError{Code: ErrInvalidDirectoryBlock, Message: fmt.Sprintf("directory block too small: %d bytes", len(buf))}
 	}
 
 	firstNameoff := binary.LittleEndian.Uint16(buf[8:10])
@@ -353,12 +460,12 @@ func ParseDirectoryBlock(buf []byte) ([]Dirent, error) {
 		return nil, nil
 	}
 	if firstNameoff%12 != 0 {
-		return nil, fmt.Errorf("invalid directory block structure: first nameoff %d is not a multiple of 12", firstNameoff)
+		return nil, &ErofsError{Code: ErrInvalidDirectoryBlock, Message: fmt.Sprintf("invalid directory block structure: first nameoff %d is not a multiple of 12", firstNameoff)}
 	}
 
 	entryCount := int(firstNameoff / 12)
 	if entryCount*12 > len(buf) {
-		return nil, fmt.Errorf("invalid directory layout: entryCount %d overflows block size %d", entryCount, len(buf))
+		return nil, &ErofsError{Code: ErrInvalidDirectoryBlock, Message: fmt.Sprintf("invalid directory layout: entryCount %d overflows block size %d", entryCount, len(buf))}
 	}
 
 	dirents := make([]Dirent, 0, entryCount)
@@ -370,14 +477,14 @@ func ParseDirectoryBlock(buf []byte) ([]Dirent, error) {
 		reserved := buf[offset+11]
 
 		if reserved != 0 {
-			return nil, fmt.Errorf("invalid directory entry: reserved byte is non-zero")
+			return nil, &ErofsError{Code: ErrInvalidDirectoryBlock, Message: "invalid directory entry: reserved byte is non-zero"}
 		}
 
 		var nameLen int
 		if i < entryCount-1 {
 			nextNameoff := binary.LittleEndian.Uint16(buf[offset+12+8 : offset+12+10])
 			if nextNameoff < nameoff {
-				return nil, fmt.Errorf("invalid directory layout: non-monotonic nameoff values")
+				return nil, &ErofsError{Code: ErrInvalidDirectoryBlock, Message: "invalid directory layout: non-monotonic nameoff values"}
 			}
 			nameLen = int(nextNameoff - nameoff)
 		} else {
@@ -385,7 +492,7 @@ func ParseDirectoryBlock(buf []byte) ([]Dirent, error) {
 		}
 
 		if int(nameoff)+nameLen > len(buf) {
-			return nil, fmt.Errorf("directory filename bounds exceeded: nameoff %d, len %d, block size %d", nameoff, nameLen, len(buf))
+			return nil, &ErofsError{Code: ErrInvalidDirectoryBlock, Message: fmt.Sprintf("directory filename bounds exceeded: nameoff %d, len %d, block size %d", nameoff, nameLen, len(buf))}
 		}
 
 		nameBytes := buf[nameoff : int(nameoff)+nameLen]
@@ -397,16 +504,16 @@ func ParseDirectoryBlock(buf []byte) ([]Dirent, error) {
 		name := string(nameBytes)
 
 		if bytes.Contains(nameBytes, []byte{0}) {
-			return nil, fmt.Errorf("malicious directory entry: filename contains null byte")
+			return nil, &ErofsError{Code: ErrPathTraversal, Message: "malicious directory entry: filename contains null byte"}
 		}
 		if bytes.Contains(nameBytes, []byte{'/'}) {
-			return nil, fmt.Errorf("malicious directory entry: filename contains path separator")
+			return nil, &ErofsError{Code: ErrPathTraversal, Message: "malicious directory entry: filename contains path separator"}
 		}
 		if !utf8.ValidString(name) {
-			return nil, fmt.Errorf("invalid directory entry: filename is not valid UTF-8")
+			return nil, &ErofsError{Code: ErrPathTraversal, Message: "invalid directory entry: filename is not valid UTF-8"}
 		}
 		if name == "" {
-			return nil, fmt.Errorf("invalid directory entry: empty filename")
+			return nil, &ErofsError{Code: ErrPathTraversal, Message: "invalid directory entry: empty filename"}
 		}
 
 		dirents = append(dirents, Dirent{
@@ -427,41 +534,48 @@ func Fsck(r io.ReaderAt) error {
 	}
 
 	visited := make(map[uint64]bool)
+	activeStack := make(map[uint64]bool)
 	maxDepth := 100
 	totalInodesParsed := 0
 
 	var traverse func(nid uint64, depth int) error
 	traverse = func(nid uint64, depth int) error {
 		if depth > maxDepth {
-			return fmt.Errorf("directory depth limit exceeded (max %d)", maxDepth)
+			return &ErofsError{Code: ErrMaxDepthExceeded, Message: fmt.Sprintf("directory depth limit exceeded (max %d)", maxDepth)}
 		}
 
+		if activeStack[nid] {
+			return &ErofsError{Code: ErrCycleDetected, Message: fmt.Sprintf("malicious loop detected at NID %d", nid)}
+		}
 		if visited[nid] {
 			return nil
 		}
 		visited[nid] = true
+		activeStack[nid] = true
+		defer func() { activeStack[nid] = false }()
+
 		totalInodesParsed++
 
 		if sb.Inodes > 0 && uint64(totalInodesParsed) > sb.Inodes+100 {
-			return fmt.Errorf("parsed more inodes (%d) than declared in superblock (%d)", totalInodesParsed, sb.Inodes)
+			return &ErofsError{Code: ErrInvalidInode, Message: fmt.Sprintf("parsed more inodes (%d) than declared in superblock (%d)", totalInodesParsed, sb.Inodes)}
 		}
 
 		inode, err := ReadInode(r, sb, nid)
 		if err != nil {
-			return fmt.Errorf("failed to read inode for NID %d: %w", nid, err)
+			return &ErofsError{Code: ErrInvalidInode, Message: fmt.Sprintf("failed to read inode for NID %d", nid), Err: err}
 		}
 
 		if inode.Version > 1 {
-			return fmt.Errorf("invalid inode version %d for NID %d", inode.Version, nid)
+			return &ErofsError{Code: ErrInvalidInode, Message: fmt.Sprintf("invalid inode version %d for NID %d", inode.Version, nid)}
 		}
 		if inode.DataLayout != DatalayoutFlatPlain && inode.DataLayout != DatalayoutFlatInline {
-			return fmt.Errorf("unsupported data layout %d for NID %d", inode.DataLayout, nid)
+			return &ErofsError{Code: ErrInvalidInode, Message: fmt.Sprintf("unsupported data layout %d for NID %d", inode.DataLayout, nid)}
 		}
 
 		if (inode.Mode & S_IFMT) == S_IFDIR {
 			data, err := inode.ReadData(r, sb)
 			if err != nil {
-				return fmt.Errorf("corrupt directory data for NID %d: %w", nid, err)
+				return &ErofsError{Code: ErrInvalidDirectoryBlock, Message: fmt.Sprintf("corrupt directory data for NID %d", nid), Err: err}
 			}
 
 			blockSize := int(sb.BlockSize())
@@ -474,7 +588,7 @@ func Fsck(r io.ReaderAt) error {
 					blockBuf := data[offset:end]
 					dirents, err := ParseDirectoryBlock(blockBuf)
 					if err != nil {
-						return fmt.Errorf("corrupt directory block at offset %d for NID %d: %w", offset, nid, err)
+						return err
 					}
 
 					for _, de := range dirents {
@@ -483,7 +597,7 @@ func Fsck(r io.ReaderAt) error {
 						}
 
 						if err := traverse(de.NID, depth+1); err != nil {
-							return fmt.Errorf("error in path %q: %w", de.Name, err)
+							return err
 						}
 					}
 				}
@@ -491,12 +605,12 @@ func Fsck(r io.ReaderAt) error {
 		} else if (inode.Mode & S_IFMT) == S_IFREG {
 			_, err := inode.ReadData(r, sb)
 			if err != nil {
-				return fmt.Errorf("corrupt regular file data for NID %d: %w", nid, err)
+				return &ErofsError{Code: ErrInvalidInode, Message: fmt.Sprintf("corrupt regular file data for NID %d", nid), Err: err}
 			}
 		} else if (inode.Mode & S_IFMT) == S_IFLNK {
 			_, err := inode.ReadData(r, sb)
 			if err != nil {
-				return fmt.Errorf("corrupt symlink data for NID %d: %w", nid, err)
+				return &ErofsError{Code: ErrInvalidInode, Message: fmt.Sprintf("corrupt symlink data for NID %d", nid), Err: err}
 			}
 		}
 
@@ -1034,10 +1148,16 @@ func WriteImage(w io.WriterAt, root Node) error {
 
 	sbBuf := make([]byte, SuperSize)
 	binary.LittleEndian.PutUint32(sbBuf[0:4], sb.Magic)
+	// sbBuf[4:8] is the Checksum field, kept zero during CRC computation
+	sbBuf[12] = sb.Blkszbits
 	binary.LittleEndian.PutUint16(sbBuf[14:16], sb.RootNID)
 	binary.LittleEndian.PutUint64(sbBuf[16:24], sb.Inodes)
 	binary.LittleEndian.PutUint32(sbBuf[36:40], sb.Blocks)
 	binary.LittleEndian.PutUint32(sbBuf[40:44], sb.MetaBlkaddr)
+
+	// Compute superblock checksum
+	sb.Checksum = crc32.ChecksumIEEE(sbBuf)
+	binary.LittleEndian.PutUint32(sbBuf[4:8], sb.Checksum)
 
 	if _, err := w.WriteAt(sbBuf, SuperOffset); err != nil {
 		return fmt.Errorf("failed to write superblock: %w", err)

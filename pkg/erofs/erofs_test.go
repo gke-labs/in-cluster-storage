@@ -50,6 +50,34 @@ func compareTrees(t *testing.T, expected Node, reader *Reader, nid uint64) {
 			t.Fatalf("failed to list actual directory at NID %d: %v", nid, err)
 		}
 
+		// Verify that "." and ".." are present in actualChildren
+		foundDot := false
+		foundDotDot := false
+		for _, de := range actualChildren {
+			if de.Name == "." {
+				foundDot = true
+				if de.FileType != FTDir {
+					t.Errorf("expected FTDir for '.', got %d", de.FileType)
+				}
+				if de.NID != nid {
+					t.Errorf("expected '.' to point to self NID %d, got %d", nid, de.NID)
+				}
+			}
+			if de.Name == ".." {
+				foundDotDot = true
+				if de.FileType != FTDir {
+					t.Errorf("expected FTDir for '..', got %d", de.FileType)
+				}
+			}
+		}
+
+		if !foundDot {
+			t.Errorf("directory at NID %d does not contain '.' entry", nid)
+		}
+		if !foundDotDot {
+			t.Errorf("directory at NID %d does not contain '..' entry", nid)
+		}
+
 		// Filter out "." and ".." from actualChildren
 		var actualFiltered []Dirent
 		for _, de := range actualChildren {
@@ -205,26 +233,91 @@ func TestErofsFsckFailures(t *testing.T) {
 		err := Fsck(bytes.NewReader(img))
 		if err == nil {
 			t.Error("expected Fsck to fail with invalid superblock magic")
+		} else if !IsInvalidSuperblockError(err) {
+			t.Errorf("expected ErrInvalidSuperblock error, got %v", err)
 		}
 	})
 
-	t.Run("Directory Entry Null Byte", func(t *testing.T) {
-		dirents := []Dirent{
-			{NID: 1, Name: "bad\x00file", FileType: FTRegFile},
-		}
-		_, err := BuildDirectoryBlock(dirents, BlockSize4K)
+	t.Run("Superblock Checksum Verification", func(t *testing.T) {
+		img := createMinimalImage(t)
+		// Corrupt checksum byte at index SuperOffset + 4
+		img[SuperOffset+4] ^= 0xFF
+
+		err := Fsck(bytes.NewReader(img))
 		if err == nil {
-			t.Error("expected BuildDirectoryBlock to fail with null bytes")
+			t.Error("expected Fsck to fail with invalid superblock checksum")
+		} else if !IsInvalidSuperblockError(err) {
+			t.Errorf("expected ErrInvalidSuperblock error, got %v", err)
 		}
 	})
 
-	t.Run("Directory Entry Path Separator", func(t *testing.T) {
-		dirents := []Dirent{
-			{NID: 1, Name: "bad/file", FileType: FTRegFile},
+	t.Run("Directory Entry Null Byte Injection", func(t *testing.T) {
+		root, err := BuildTree(
+			[]string{"magicnullpath", "zz_lastfile"},
+			[]bool{false, false},
+			[][]byte{[]byte("test bytes"), []byte("more bytes")},
+			[]uint16{0644, 0644},
+		)
+		if err != nil {
+			t.Fatalf("failed to build tree: %v", err)
 		}
-		_, err := BuildDirectoryBlock(dirents, BlockSize4K)
+		mw := &memoryWriterAt{}
+		if err := WriteImage(mw, root); err != nil {
+			t.Fatalf("failed to compile image: %v", err)
+		}
+		img := mw.buf
+
+		// Find the index of "magicnullpath" filename on-disk
+		idx := bytes.Index(img, []byte("magicnullpath"))
+		if idx == -1 {
+			t.Fatalf("could not find filename string inside compiled image")
+		}
+
+		// Corrupt a character to null byte
+		corruptImg := make([]byte, len(img))
+		copy(corruptImg, img)
+		corruptImg[idx+5] = 0 // "magic\x00ullpath"
+
+		err = Fsck(bytes.NewReader(corruptImg))
 		if err == nil {
-			t.Error("expected BuildDirectoryBlock to fail with path separator")
+			t.Error("expected Fsck to fail when null byte is injected in a directory entry filename")
+		} else if !IsPathTraversalError(err) {
+			t.Errorf("expected ErrPathTraversal, got %v", err)
+		}
+	})
+
+	t.Run("Directory Entry Slash Injection", func(t *testing.T) {
+		root, err := BuildTree(
+			[]string{"magicslashpath"},
+			[]bool{false},
+			[][]byte{[]byte("test bytes")},
+			[]uint16{0644},
+		)
+		if err != nil {
+			t.Fatalf("failed to build tree: %v", err)
+		}
+		mw := &memoryWriterAt{}
+		if err := WriteImage(mw, root); err != nil {
+			t.Fatalf("failed to compile image: %v", err)
+		}
+		img := mw.buf
+
+		// Find the index of "magicslashpath" filename on-disk
+		idx := bytes.Index(img, []byte("magicslashpath"))
+		if idx == -1 {
+			t.Fatalf("could not find filename string inside compiled image")
+		}
+
+		// Corrupt a character to a slash separator
+		corruptImg := make([]byte, len(img))
+		copy(corruptImg, img)
+		corruptImg[idx+5] = '/' // "magic/lashpath"
+
+		err = Fsck(bytes.NewReader(corruptImg))
+		if err == nil {
+			t.Error("expected Fsck to fail when slash separator is injected in a directory entry filename")
+		} else if !IsPathTraversalError(err) {
+			t.Errorf("expected ErrPathTraversal, got %v", err)
 		}
 	})
 
@@ -274,8 +367,10 @@ func TestErofsFsckFailures(t *testing.T) {
 		copy(imageBytes[dataOffset:dataOffset+BlockSize4K], block)
 
 		err = Fsck(bytes.NewReader(imageBytes))
-		if err != nil {
-			t.Errorf("Fsck failed on cyclic image: %v", err)
+		if err == nil {
+			t.Error("expected Fsck to return an error when a cycle is detected")
+		} else if !IsCycleDetectedError(err) {
+			t.Errorf("expected ErrCycleDetected, got %v", err)
 		}
 	})
 }
