@@ -206,6 +206,16 @@ spec:
 		t.Fatalf("Expected content %q, got %q", expected, out)
 	}
 
+	// Verify CAS Socket is present in Pod 3
+	t.Logf("Verifying CAS socket inside Pod 3...")
+	casOut, err := h.RunInPod(pod3Name, "default", "ls", "-la", "/data/.in-cluster-storage/api")
+	if err != nil {
+		t.Fatalf("Failed to find CAS socket inside Pod 3: %v\nOutput: %s", err, casOut)
+	}
+	if !strings.Contains(casOut, "api") {
+		t.Fatalf("Expected CAS socket 'api' to exist, got: %s", casOut)
+	}
+
 	h.DeletePod(pod3Name, "default")
 
 	// Step 4: Verify Incremental Snapshot & Deletion/Whiteout behavior
