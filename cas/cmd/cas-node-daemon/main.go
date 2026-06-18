@@ -29,8 +29,8 @@ import (
 	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	pb "github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/cas/pkg/cas"
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/klog/v2"
@@ -39,7 +39,7 @@ import (
 var (
 	endpoint          = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
 	nodeID            = flag.String("nodeid", "", "node id")
-	storagePath       = flag.String("storage-path", "/var/lib/cas", "Base path for storage")
+	storagePath       = flag.String("storage-path", "/var/cache/cas", "Base path for storage")
 	controllerAddress = flag.String("controller-address", "agentfs-controller:50051", "AgentFS Controller address")
 )
 
@@ -129,27 +129,52 @@ func (d *controllerDownloader) DownloadBlob(ctx context.Context, sha string, des
 		return err
 	}
 
-	f, err := os.Create(destPath)
-	if err != nil {
-		return err
+	// Create a temporary file in the destination directory to ensure atomic rename
+	destDir := filepath.Dir(destPath)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %v", err)
 	}
-	defer f.Close()
 
-	buffer := make([]byte, 1024*1024)
+	tempFile, err := os.CreateTemp(destDir, "blob-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %v", err)
+	}
+	tempPath := tempFile.Name()
+
+	// Ensure cleanup of temp file if function exits with error
+	success := false
+	defer func() {
+		if !success {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
 	for {
 		resp, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return err
+			_ = tempFile.Close()
+			return fmt.Errorf("error receiving chunk: %v", err)
 		}
-		// Write in chunks
-		if _, err := f.Write(resp.Content); err != nil {
-			return err
+		if _, err := tempFile.Write(resp.Content); err != nil {
+			_ = tempFile.Close()
+			return fmt.Errorf("error writing to temporary file: %v", err)
 		}
-		_ = buffer
 	}
+
+	// Be careful to check for errors when calling close, which is a common mistake
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary file: %v", err)
+	}
+
+	// Atomically rename to destination path
+	if err := os.Rename(tempPath, destPath); err != nil {
+		return fmt.Errorf("failed to rename temporary file to destination path: %v", err)
+	}
+
+	success = true
 	return nil
 }
 
@@ -245,7 +270,19 @@ func (d *casCSIDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubli
 	}
 
 	casSocketPath := filepath.Join(casDir, "api")
-	_ = os.Remove(casSocketPath)
+	if err := os.Remove(casSocketPath); err != nil && !os.IsNotExist(err) {
+		klog.Errorf("Failed to remove existing socket %s: %v", casSocketPath, err)
+		return nil, fmt.Errorf("failed to remove existing socket %s: %v", casSocketPath, err)
+	}
+
+	// Double-check that there is no existing casServer at targetPath
+	d.casServersMu.Lock()
+	if existingSrv, exists := d.casServers[targetPath]; exists {
+		klog.Warningf("Unexpected existing CAS server at targetPath %s, stopping it", targetPath)
+		existingSrv.Stop()
+		delete(d.casServers, targetPath)
+	}
+	d.casServersMu.Unlock()
 
 	klog.Infof("Starting CAS server on %s", casSocketPath)
 	casSrv, err := cas.StartServer(casSocketPath, *storagePath, d.downloader)
@@ -268,9 +305,12 @@ func (d *casCSIDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnp
 
 	// Stop and remove the CAS server
 	d.casServersMu.Lock()
-	if srv, exists := d.casServers[targetPath]; exists {
+	srv, exists := d.casServers[targetPath]
+	if exists {
 		srv.Stop()
 		delete(d.casServers, targetPath)
+	} else {
+		klog.Warningf("Unexpected: CAS server for %s does not exist in casServers map during unpublish", targetPath)
 	}
 	d.casServersMu.Unlock()
 

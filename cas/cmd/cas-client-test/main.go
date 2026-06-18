@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -33,7 +34,13 @@ func main() {
 	socketPath := os.Args[1]
 	sha := os.Args[2]
 
-	client := cas.NewClient(socketPath)
+	client, err := cas.NewClient(socketPath)
+	if err != nil {
+		fmt.Printf("Error creating CAS client: %v\n", err)
+		os.Exit(1)
+	}
+	defer client.Close()
+
 	file, size, err := client.RequestBlob(sha)
 	if err != nil {
 		fmt.Printf("Error requesting blob: %v\n", err)
@@ -41,11 +48,16 @@ func main() {
 	}
 	defer file.Close()
 
-	fmt.Printf("SUCCESS size=%d\n", size)
-	content, err := io.ReadAll(file)
+	hasher := sha256.New()
+	tee := io.TeeReader(file, hasher)
+
+	content, err := io.ReadAll(tee)
 	if err != nil {
 		fmt.Printf("Error reading file: %v\n", err)
 		os.Exit(1)
 	}
+
+	computedSha := fmt.Sprintf("%x", hasher.Sum(nil))
+	fmt.Printf("SUCCESS size=%d sha256=%s\n", size, computedSha)
 	fmt.Print(string(content))
 }

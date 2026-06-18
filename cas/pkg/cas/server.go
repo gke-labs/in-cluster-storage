@@ -69,6 +69,12 @@ func StartServer(socketPath, storageDir string, downloader BlobDownloader) (*Ser
 		return nil, fmt.Errorf("failed to get current working directory: %v", err)
 	}
 
+	// Workaround for the 108-character sockaddr_un limit on Linux:
+	// If the absolute path to the socket is longer than 108 characters (common in Kubelet mount paths),
+	// net.Listen("unix", absolutePath) will fail with EINVAL (invalid argument).
+	// To bypass this limit, we change the working directory (os.Chdir) to the socket's parent directory,
+	// and call net.Listen on the relative filename. We protect this process-wide Chdir with a global mutex
+	// and restore the working directory immediately afterward.
 	if err := os.Chdir(parentDir); err != nil {
 		return nil, fmt.Errorf("failed to change directory to %s: %v", parentDir, err)
 	}
@@ -163,48 +169,55 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		sha := strings.ToLower(strings.TrimSpace(parts[1]))
-		if !isValidSHA256(sha) {
-			s.sendError(unixConn, "invalid sha256 format")
+		shaStr := strings.TrimSpace(parts[1])
+		blobID, err := ParseBlobID(shaStr)
+		if err != nil {
+			s.sendError(unixConn, fmt.Sprintf("invalid blob id: %v", err))
 			continue
 		}
 
-		s.handleGet(unixConn, sha)
+		s.handleGet(unixConn, blobID)
 	}
 }
 
-func (s *Server) handleGet(conn *net.UnixConn, sha string) {
+func (s *Server) handleGet(conn *net.UnixConn, blobID BlobID) {
 	blobsDir := filepath.Join(s.storageDir, "blobs")
 	if err := os.MkdirAll(blobsDir, 0755); err != nil {
 		s.sendError(conn, fmt.Sprintf("failed to create blobs directory: %v", err))
 		return
 	}
 
-	blobPath := filepath.Join(blobsDir, sha)
+	blobPath := filepath.Join(blobsDir, string(blobID))
 
-	// Check if the file exists
-	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
-		klog.Infof("CAS server: blob %s not found locally, downloading...", sha)
-		ctx := context.Background()
-		if err := s.downloader.DownloadBlob(ctx, sha, blobPath); err != nil {
-			klog.Errorf("CAS server: failed to download blob %s: %v", sha, err)
-			s.sendError(conn, fmt.Sprintf("failed to download blob: %v", err))
-			return
-		}
-	}
-
-	// Open the file
+	// Open the file first, which avoids TOCTOU (time-of-check to time-of-use) races.
 	file, err := os.Open(blobPath)
 	if err != nil {
-		klog.Errorf("CAS server: failed to open blob %s: %v", sha, err)
-		s.sendError(conn, fmt.Sprintf("failed to open blob: %v", err))
-		return
+		if os.IsNotExist(err) {
+			klog.Infof("CAS server: blob %s not found locally, downloading...", blobID)
+			ctx := context.Background()
+			if dlErr := s.downloader.DownloadBlob(ctx, string(blobID), blobPath); dlErr != nil {
+				klog.Errorf("CAS server: failed to download blob %s: %v", blobID, dlErr)
+				s.sendError(conn, fmt.Sprintf("failed to download blob: %v", dlErr))
+				return
+			}
+			// Try opening again after downloading
+			file, err = os.Open(blobPath)
+			if err != nil {
+				klog.Errorf("CAS server: failed to open blob %s after download: %v", blobID, err)
+				s.sendError(conn, fmt.Sprintf("failed to open blob after download: %v", err))
+				return
+			}
+		} else {
+			klog.Errorf("CAS server: failed to open blob %s: %v", blobID, err)
+			s.sendError(conn, fmt.Sprintf("failed to open blob: %v", err))
+			return
+		}
 	}
 	defer file.Close()
 
 	fi, err := file.Stat()
 	if err != nil {
-		klog.Errorf("CAS server: failed to stat blob %s: %v", sha, err)
+		klog.Errorf("CAS server: failed to stat blob %s: %v", blobID, err)
 		s.sendError(conn, fmt.Sprintf("failed to stat blob: %v", err))
 		return
 	}
@@ -239,16 +252,20 @@ func (s *Server) Stop() {
 	_ = os.Remove(s.socketPath)
 }
 
-// isValidSHA256 returns true if s is a 64-char hex SHA-256 hash.
-func isValidSHA256(s string) bool {
+// BlobID represents a validated, normalized (lowercase) 64-char hex SHA-256 blob identifier.
+type BlobID string
+
+// ParseBlobID validates s as a 64-char hex SHA-256 hash and returns it as a normalized BlobID.
+func ParseBlobID(s string) (BlobID, error) {
+	s = strings.TrimSpace(s)
 	if len(s) != 64 {
-		return false
+		return "", fmt.Errorf("invalid blob ID length %d (expected 64 characters)", len(s))
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-			return false
+			return "", fmt.Errorf("invalid character %q in blob ID", c)
 		}
 	}
-	return true
+	return BlobID(strings.ToLower(s)), nil
 }

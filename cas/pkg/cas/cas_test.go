@@ -18,21 +18,31 @@ package cas
 
 import "testing"
 
-func TestIsValidSHA256(t *testing.T) {
+func TestParseBlobID(t *testing.T) {
 	tests := []struct {
-		sha   string
-		valid bool
+		sha      string
+		valid    bool
+		expected string
 	}{
-		{"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", true},
-		{"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", true},
-		{"short", false},
-		{"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg", false}, // non-hex character 'g'
+		{"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", true, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+		{"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", true, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+		{"short", false, ""},
+		{"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg", false, ""}, // non-hex character 'g'
 	}
 
 	for _, tc := range tests {
-		got := isValidSHA256(tc.sha)
-		if got != tc.valid {
-			t.Errorf("isValidSHA256(%q) = %t; want %t", tc.sha, got, tc.valid)
+		blobID, err := ParseBlobID(tc.sha)
+		if tc.valid {
+			if err != nil {
+				t.Errorf("ParseBlobID(%q) returned unexpected error: %v", tc.sha, err)
+			}
+			if string(blobID) != tc.expected {
+				t.Errorf("ParseBlobID(%q) = %q; want %q", tc.sha, blobID, tc.expected)
+			}
+		} else {
+			if err == nil {
+				t.Errorf("ParseBlobID(%q) expected error, but got none", tc.sha)
+			}
 		}
 	}
 }
