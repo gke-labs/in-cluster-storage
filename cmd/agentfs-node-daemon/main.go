@@ -34,7 +34,6 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1"
-	"github.com/gke-labs/in-cluster-storage/pkg/cas"
 	unix "golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -94,7 +93,6 @@ func main() {
 		},
 		fanotifyFd:            -1,
 		rootContextCancelFunc: cancel,
-		casServers:            make(map[string]*cas.Server),
 	}
 	defer driver.closeControllerConn()
 
@@ -202,10 +200,6 @@ type agentFSDriver struct {
 	// Controller connection cache
 	controllerConn     *grpc.ClientConn
 	controllerConnLock sync.Mutex
-
-	// CAS servers map
-	casServersMu sync.Mutex
-	casServers   map[string]*cas.Server
 }
 
 func (d *agentFSDriver) getControllerConn() (*grpc.ClientConn, error) {
@@ -231,16 +225,6 @@ func (d *agentFSDriver) closeControllerConn() {
 		d.controllerConn.Close()
 		d.controllerConn = nil
 	}
-}
-
-// DownloadBlob downloads a blob from the controller to a target path on the node.
-func (d *agentFSDriver) DownloadBlob(ctx context.Context, sha string, destPath string) error {
-	conn, err := d.getControllerConn()
-	if err != nil {
-		return err
-	}
-	client := pb.NewAgentFSControllerClient(conn)
-	return d.downloadBlob(ctx, client, sha, destPath)
 }
 
 func (d *agentFSDriver) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
@@ -413,30 +397,6 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		d.downloadAllPending(ctx, volumeDir)
 	}
 
-	// Start CAS server for this volume under targetPath/.in-cluster-storage/api
-	casDir := filepath.Join(targetPath, ".in-cluster-storage")
-	if err := os.MkdirAll(casDir, 0777); err != nil {
-		return nil, fmt.Errorf("failed to create CAS socket directory: %v", err)
-	}
-	if err := os.Chmod(casDir, 0777); err != nil {
-		klog.Warningf("failed to chmod CAS socket directory %s: %v", casDir, err)
-	}
-
-	casSocketPath := filepath.Join(casDir, "api")
-	_ = os.Remove(casSocketPath)
-
-	casSrv, err := cas.StartServer(casSocketPath, *storagePath, d)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start CAS server at %s: %v", casSocketPath, err)
-	}
-
-	d.casServersMu.Lock()
-	if d.casServers == nil {
-		d.casServers = make(map[string]*cas.Server)
-	}
-	d.casServers[targetPath] = casSrv
-	d.casServersMu.Unlock()
-
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -455,16 +415,6 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 	d.lazyLoader.mountsMu.Lock()
 	delete(d.lazyLoader.mounts, targetPath)
 	d.lazyLoader.mountsMu.Unlock()
-
-	// Stop CAS server if active
-	d.casServersMu.Lock()
-	if d.casServers != nil {
-		if casSrv, exists := d.casServers[targetPath]; exists {
-			casSrv.Stop()
-			delete(d.casServers, targetPath)
-		}
-	}
-	d.casServersMu.Unlock()
 
 	// Try to unmount the target path. Ignore if not a mount point.
 	if err := syscall.Unmount(targetPath, 0); err != nil {

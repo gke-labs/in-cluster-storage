@@ -25,15 +25,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 
 	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 )
-
-var shaRegex = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 
 // BlobDownloader interface abstracts the downloading of a blob from a remote/controller.
 type BlobDownloader interface {
@@ -54,16 +51,39 @@ type Server struct {
 	conns   map[net.Conn]struct{}
 }
 
+var chdirMu sync.Mutex
+
 // StartServer starts listening on the specified socketPath.
 func StartServer(socketPath, storageDir string, downloader BlobDownloader) (*Server, error) {
 	// Ensure the parent directory of socket exists
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0777); err != nil {
+	parentDir := filepath.Dir(socketPath)
+	if err := os.MkdirAll(parentDir, 0777); err != nil {
 		return nil, fmt.Errorf("failed to create directory for socket: %v", err)
 	}
 
-	listener, err := net.Listen("unix", socketPath)
+	chdirMu.Lock()
+	defer chdirMu.Unlock()
+
+	oldWD, err := os.Getwd()
 	if err != nil {
-		return nil, fmt.Errorf("failed to listen on unix socket %s: %v", socketPath, err)
+		return nil, fmt.Errorf("failed to get current working directory: %v", err)
+	}
+
+	if err := os.Chdir(parentDir); err != nil {
+		return nil, fmt.Errorf("failed to change directory to %s: %v", parentDir, err)
+	}
+
+	// Listen on relative socket name to bypass the 108-character limit
+	socketName := filepath.Base(socketPath)
+	listener, err := net.Listen("unix", socketName)
+
+	// Restore working directory immediately
+	if chdirErr := os.Chdir(oldWD); chdirErr != nil {
+		klog.Warningf("failed to restore working directory to %s: %v", oldWD, chdirErr)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on unix socket %s (relative %s): %v", socketPath, socketName, err)
 	}
 
 	// Make the socket writeable for any user in the container
@@ -144,7 +164,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 
 		sha := strings.ToLower(strings.TrimSpace(parts[1]))
-		if !shaRegex.MatchString(sha) {
+		if !isValidSHA256(sha) {
 			s.sendError(unixConn, "invalid sha256 format")
 			continue
 		}
@@ -154,7 +174,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 func (s *Server) handleGet(conn *net.UnixConn, sha string) {
-	// Check/Create the node-wide central blobs cache directory
 	blobsDir := filepath.Join(s.storageDir, "blobs")
 	if err := os.MkdirAll(blobsDir, 0755); err != nil {
 		s.sendError(conn, fmt.Sprintf("failed to create blobs directory: %v", err))
@@ -166,7 +185,7 @@ func (s *Server) handleGet(conn *net.UnixConn, sha string) {
 	// Check if the file exists
 	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
 		klog.Infof("CAS server: blob %s not found locally, downloading...", sha)
-		ctx := context.Background() // Or we can use a context with timeout
+		ctx := context.Background()
 		if err := s.downloader.DownloadBlob(ctx, sha, blobPath); err != nil {
 			klog.Errorf("CAS server: failed to download blob %s: %v", sha, err)
 			s.sendError(conn, fmt.Sprintf("failed to download blob: %v", err))
@@ -218,4 +237,18 @@ func (s *Server) Stop() {
 
 	s.wg.Wait()
 	_ = os.Remove(s.socketPath)
+}
+
+// isValidSHA256 returns true if s is a 64-char hex SHA-256 hash.
+func isValidSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }

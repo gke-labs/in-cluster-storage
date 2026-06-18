@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -41,10 +42,14 @@ func TestE2E(t *testing.T) {
 	// Build images
 	h.DockerBuild("agentfs-controller:e2e", filepath.Join(experimentRoot, "images/agentfs-controller/Dockerfile"), experimentRoot)
 	h.DockerBuild("agentfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/agentfs-node-daemon/Dockerfile"), experimentRoot)
+	h.DockerBuild("cas-node-daemon:e2e", filepath.Join(experimentRoot, "images/cas-node-daemon/Dockerfile"), experimentRoot)
+	h.DockerBuild("cas-client-test:e2e", filepath.Join(experimentRoot, "images/cas-client-test/Dockerfile"), experimentRoot)
 
 	// Load images into Kind
 	h.KindLoad("agentfs-controller:e2e")
 	h.KindLoad("agentfs-node-daemon:e2e")
+	h.KindLoad("cas-node-daemon:e2e")
+	h.KindLoad("cas-client-test:e2e")
 
 	// Read manifest and replace placeholders
 	manifestPath := filepath.Join(experimentRoot, "k8s/manifest.yaml")
@@ -77,6 +82,104 @@ func TestE2E(t *testing.T) {
 	if err := h.WaitForDaemonSet("agentfs-node-daemon", "default", 2*time.Minute); err != nil {
 		t.Logf("Events:\n%s\n", h.GetEvents("default"))
 		t.Fatalf("AgentFS Node Daemon failed to start: %v", err)
+	}
+
+	// Deploy and wait for CAS CSI driver
+	t.Logf("Deploying CAS CSI driver")
+	casManifest := `
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: cas.labs.gke.io
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+  volumeLifecycleModes:
+    - Ephemeral
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cas-node-daemon
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: cas-node-daemon
+  template:
+    metadata:
+      labels:
+        app: cas-node-daemon
+    spec:
+      hostPID: true
+      containers:
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+          args:
+            - "--v=5"
+            - "--csi-address=$(ADDRESS)"
+            - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: DRIVER_REG_SOCK_PATH
+              value: /var/lib/kubelet/plugins/cas.labs.gke.io/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: cas-node-daemon
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+          image: cas-node-daemon:e2e
+          imagePullPolicy: Never
+          args:
+            - "--v=5"
+            - "--endpoint=unix:///csi/csi.sock"
+            - "--nodeid=$(NODE_ID)"
+            - "--storage-path=/var/lib/cas"
+            - "--controller-address=agentfs-controller:50051"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: "Bidirectional"
+            - name: storage-dir
+              mountPath: /var/lib/cas
+              mountPropagation: "Bidirectional"
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/cas.labs.gke.io/
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: storage-dir
+          hostPath:
+            path: /var/lib/cas
+            type: DirectoryOrCreate
+`
+	h.KubectlApplyContent("cas-driver", casManifest)
+
+	if err := h.WaitForDaemonSet("cas-node-daemon", "default", 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Logf("CAS Node Daemon Logs:\n%s\n", h.GetPodLogs("app=cas-node-daemon", "default"))
+		t.Fatalf("CAS Node Daemon failed to start: %v", err)
 	}
 
 	// Step 1: Run a test Pod that writes a file
@@ -206,17 +309,80 @@ spec:
 		t.Fatalf("Expected content %q, got %q", expected, out)
 	}
 
-	// Verify CAS Socket is present in Pod 3
-	t.Logf("Verifying CAS socket inside Pod 3...")
-	casOut, err := h.RunInPod(pod3Name, "default", "ls", "-la", "/data/.in-cluster-storage/api")
-	if err != nil {
-		t.Fatalf("Failed to find CAS socket inside Pod 3: %v\nOutput: %s", err, casOut)
+	h.DeletePod(pod3Name, "default")
+
+	// CAS CSI Driver E2E Test
+	t.Logf("[CAS TEST] Getting snapshot metadata to find SHA256 of 'test.txt'...")
+	snapInfo := getLatestSnapshot(t, h, volumeID)
+	var testFileSha string
+	for _, file := range snapInfo.Files {
+		if file.Path == "test.txt" {
+			testFileSha = file.Sha256
+			break
+		}
 	}
-	if !strings.Contains(casOut, "api") {
-		t.Fatalf("Expected CAS socket 'api' to exist, got: %s", casOut)
+	if testFileSha == "" {
+		t.Fatalf("[CAS TEST] Expected to find 'test.txt' in snapshot metadata")
+	}
+	t.Logf("[CAS TEST] Found test file SHA256: %s", testFileSha)
+
+	casTestPodName := "cas-test-pod"
+	casTestPodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: cas-client-test:e2e
+      imagePullPolicy: Never
+      args: ["/data/.in-cluster-storage/api", "%s"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: cas.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, casTestPodName, testFileSha, volumeID)
+
+	t.Logf("[CAS TEST] Creating CAS test pod %s...", casTestPodName)
+	h.KubectlApplyContent(casTestPodName, casTestPodYaml)
+
+	t.Logf("[CAS TEST] Waiting for CAS test pod to reach a terminal status...")
+	var finalPhase string
+	for i := 0; i < 60; i++ {
+		phase := getPodPhase(casTestPodName, "default")
+		if phase == "Succeeded" || phase == "Failed" {
+			finalPhase = phase
+			break
+		}
+		time.Sleep(1 * time.Second)
 	}
 
-	h.DeletePod(pod3Name, "default")
+	if finalPhase != "Succeeded" {
+		t.Logf("CAS Node Daemon Logs:\n%s\n", h.GetPodLogs("app=cas-node-daemon", "default"))
+		t.Logf("CAS Test Pod Logs:\n%s\n", h.GetPodLogsByName(casTestPodName, "default"))
+		t.Fatalf("[CAS TEST] CAS test pod failed to finish successfully, phase: %s", finalPhase)
+	}
+
+	t.Logf("[CAS TEST] CAS test pod finished successfully. Checking logs...")
+	casLogs := h.GetPodLogsByName(casTestPodName, "default")
+	t.Logf("[CAS TEST] CAS pod logs:\n%s", casLogs)
+
+	if !strings.Contains(casLogs, "SUCCESS") {
+		t.Fatalf("[CAS TEST] CAS test client did not print SUCCESS: %s", casLogs)
+	}
+	if !strings.Contains(casLogs, "updated agentfs") {
+		t.Fatalf("[CAS TEST] CAS test client did not successfully retrieve 'updated agentfs'")
+	}
+	t.Logf("[CAS TEST] Successfully verified Content Addressable Storage via CSI using SCM_RIGHTS!")
+
+	h.DeletePod(casTestPodName, "default")
 
 	// Step 4: Verify Incremental Snapshot & Deletion/Whiteout behavior
 	incVolumeID := "test-incremental-vol"
@@ -385,4 +551,13 @@ func getLatestSnapshot(t *testing.T, h *Harness, volumeID string) *pb.SnapshotMe
 		t.Fatalf("Failed to unmarshal snapshot: %v", err)
 	}
 	return snapshot
+}
+
+func getPodPhase(podName, namespace string) string {
+	cmd := exec.Command("kubectl", "-n", namespace, "get", "pod", podName, "-o", "jsonpath={.status.phase}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
