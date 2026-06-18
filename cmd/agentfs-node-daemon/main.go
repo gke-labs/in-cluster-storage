@@ -875,6 +875,12 @@ func (d *agentFSDriver) handleFanotifyEvent(ctx context.Context, pid int32, even
 
 	// Resolving symbolic links under /proc/self/fd is the standard, documented method for
 	// fanotify applications to map an open event file descriptor back to its full path.
+	// Note: We cannot use FAN_REPORT_FID here because:
+	// 1. Combining FAN_REPORT_FID with permission classes (FAN_CLASS_PRE_CONTENT) requires Linux 6.13+.
+	//    On older kernels (including 6.12 and below), FanotifyInit will fail with EINVAL.
+	// 2. FAN_REPORT_FID reports file handles instead of file descriptors, which do not contain
+	//    paths. Reconstructing paths from handles would be highly complex and negate efficiency benefits,
+	//    whereas reading /proc/self/fd/<fd> leverages the file descriptor already opened by the kernel.
 	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", eventFd))
 	if err != nil {
 		klog.Warningf("failed to resolve path for event fd %d: %v. Failing closed.", eventFd, err)
