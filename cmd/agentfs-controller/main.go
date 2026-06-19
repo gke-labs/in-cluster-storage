@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
@@ -180,6 +181,22 @@ func (s *server) GetLatestSnapshot(ctx context.Context, req *pb.GetLatestSnapsho
 func (s *server) UploadSnapshot(ctx context.Context, req *pb.UploadSnapshotRequest) (*pb.UploadSnapshotResponse, error) {
 	volumeID := req.GetVolumeId()
 	snapshot := req.GetSnapshot()
+
+	if len(snapshot.ErofsLayers) > 0 {
+		for _, layerSha := range snapshot.ErofsLayers {
+			blobPath := filepath.Join(*dataPath, "blobs", layerSha)
+			f, err := os.Open(blobPath)
+			if err != nil {
+				return nil, fmt.Errorf("layer blob %s does not exist or cannot be opened: %v", layerSha, err)
+			}
+			// Run fsck to verify the EROFS image
+			if err := erofs.Fsck(f); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("invalid EROFS layer image %s (fsck failed): %v", layerSha, err)
+			}
+			f.Close()
+		}
+	}
 
 	data, err := proto.Marshal(snapshot)
 	if err != nil {

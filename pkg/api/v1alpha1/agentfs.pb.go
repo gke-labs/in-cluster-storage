@@ -240,6 +240,7 @@ type SnapshotMetadata struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Files         []*FileMetadata        `protobuf:"bytes,1,rep,name=files,proto3" json:"files,omitempty"`
 	ErofsSha256   string                 `protobuf:"bytes,2,opt,name=erofs_sha256,json=erofsSha256,proto3" json:"erofs_sha256,omitempty"`
+	ErofsLayers   []string               `protobuf:"bytes,3,rep,name=erofs_layers,json=erofsLayers,proto3" json:"erofs_layers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -286,6 +287,13 @@ func (x *SnapshotMetadata) GetErofsSha256() string {
 		return x.ErofsSha256
 	}
 	return ""
+}
+
+func (x *SnapshotMetadata) GetErofsLayers() []string {
+	if x != nil {
+		return x.ErofsLayers
+	}
+	return nil
 }
 
 type FileMetadata struct {
@@ -682,10 +690,11 @@ const file_proto_agentfs_proto_rawDesc = "" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12>\n" +
 	"\bsnapshot\x18\x02 \x01(\v2\".agentfs.v1alpha1.SnapshotMetadataR\bsnapshot\"2\n" +
 	"\x16UploadSnapshotResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess\"k\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x8e\x01\n" +
 	"\x10SnapshotMetadata\x124\n" +
 	"\x05files\x18\x01 \x03(\v2\x1e.agentfs.v1alpha1.FileMetadataR\x05files\x12!\n" +
-	"\ferofs_sha256\x18\x02 \x01(\tR\verofsSha256\"\x99\x01\n" +
+	"\ferofs_sha256\x18\x02 \x01(\tR\verofsSha256\x12!\n" +
+	"\ferofs_layers\x18\x03 \x03(\tR\verofsLayers\"\x99\x01\n" +
 	"\fFileMetadata\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\rR\x04mode\x12\x12\n" +
