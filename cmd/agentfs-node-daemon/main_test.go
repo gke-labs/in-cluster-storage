@@ -17,10 +17,6 @@ limitations under the License.
 package main
 
 import (
-	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1"
@@ -83,58 +79,4 @@ func TestLazyLoaderCoordinationWithDownloadOperation(t *testing.T) {
 		t.Fatalf("expected no download operations to exist initially")
 	}
 	d.lazyLoader.downloadMu.Unlock()
-}
-
-func TestErofsLayersLowerdirOption(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "erofs-layers-test-")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	volumeDir := tempDir
-	lowerPath := filepath.Join(volumeDir, "lower")
-	_ = os.MkdirAll(lowerPath, 0755)
-
-	// Case 1: No layers yet
-	_ = &agentFSDriver{
-		enableEROFSLayers: true,
-	}
-
-	getLowerdir := func() string {
-		var layers []string
-		for i := 0; ; i++ {
-			p := filepath.Join(volumeDir, fmt.Sprintf("layer-%d", i))
-			if _, err := os.Stat(p); err != nil {
-				break
-			}
-			layers = append(layers, p)
-		}
-		if len(layers) > 0 {
-			var revLayers []string
-			for i := len(layers) - 1; i >= 0; i-- {
-				revLayers = append(revLayers, layers[i])
-			}
-			return strings.Join(revLayers, ":")
-		} else {
-			return lowerPath
-		}
-	}
-
-	opt := getLowerdir()
-	if opt != lowerPath {
-		t.Errorf("expected empty layers to fall back to %s, got: %s", lowerPath, opt)
-	}
-
-	// Case 2: Multi-layer
-	layer0 := filepath.Join(volumeDir, "layer-0")
-	layer1 := filepath.Join(volumeDir, "layer-1")
-	_ = os.MkdirAll(layer0, 0755)
-	_ = os.MkdirAll(layer1, 0755)
-
-	expected := layer1 + ":" + layer0
-	opt = getLowerdir()
-	if opt != expected {
-		t.Errorf("expected multi-layer lowerdir to be %s, got: %s", expected, opt)
-	}
 }

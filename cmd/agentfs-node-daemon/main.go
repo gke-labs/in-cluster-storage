@@ -445,7 +445,11 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 
 	volumeDir := filepath.Join(*storagePath, k8sVolumeID)
 
-	// Push snapshot to controller if EROFS layers mode is enabled (must be done before targetPath is unmounted)
+	// Push snapshot to controller if EROFS layers mode is enabled.
+	// This must be done before targetPath is unmounted because when we combine or flatten layers,
+	// we compile the entire merged targetPath (active union/view of all layers) into a single,
+	// consolidated EROFS image. If the targetPath is unmounted first, we would lose this unified
+	// view and would be unable to perform client-side layer flattening/compilation.
 	if d.enableEROFSLayers {
 		if err := d.pushErofsLayersSnapshot(ctx, logicalVolumeID, volumeDir, targetPath); err != nil {
 			klog.Errorf("failed to push EROFS layers snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
@@ -706,7 +710,12 @@ func (d *agentFSDriver) pushErofsLayersSnapshot(ctx context.Context, volumeID, v
 		return nil
 	}
 
-	// Check if we should combine/flatten layers
+	// Check if we should combine/flatten layers.
+	// This threshold (2 layers) is a performance-driven heuristic rather than a hard kernel limit.
+	// While modern Linux kernels support up to 500 stacked OverlayFS directories/layers, deeply stacked
+	// overlays can incur non-trivial file lookup latency and performance degradation. Therefore, we
+	// proactively flatten the snapshot stack down to a single combined layer as soon as we reach
+	// more than 2 layers.
 	shouldCombine := len(existingLayers) >= 2
 
 	var erofsSrcPath string
