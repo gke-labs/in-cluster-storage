@@ -50,6 +50,7 @@ message UploadSnapshotResponse {
 message SnapshotMetadata {
   repeated FileMetadata files = 1;
   string erofs_sha256 = 2;
+  repeated string erofs_layers = 3;
 }
 
 message FileMetadata {

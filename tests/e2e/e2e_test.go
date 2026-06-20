@@ -119,7 +119,7 @@ spec:
 	time.Sleep(5 * time.Second)
 
 	t.Logf("Deleting Pod 1 to trigger snapshot push")
-	h.DeletePod(pod1Name, "default")
+	h.DeletePodWithTimeout(t, pod1Name, "default", 1*time.Minute)
 	t.Logf("Pod 1 deleted")
 
 	// Step 2: Start a new Pod, read the file, and update it
@@ -165,7 +165,7 @@ spec:
 	}
 	t.Logf("Pod 2 verified, deleting")
 
-	h.DeletePod(pod2Name, "default")
+	h.DeletePodWithTimeout(t, pod2Name, "default", 1*time.Minute)
 	t.Logf("Pod 2 deleted")
 
 	// Step 3: Launch another Pod to read the file and verify the value again
@@ -206,7 +206,7 @@ spec:
 		t.Fatalf("Expected content %q, got %q", expected, out)
 	}
 
-	h.DeletePod(pod3Name, "default")
+	h.DeletePodWithTimeout(t, pod3Name, "default", 1*time.Minute)
 
 	// Step 4: Verify Incremental Snapshot & Deletion/Whiteout behavior
 	incVolumeID := "test-incremental-vol"
@@ -243,7 +243,7 @@ spec:
 
 	time.Sleep(5 * time.Second)
 	t.Logf("Deleting Pod 4 to trigger snapshot push")
-	h.DeletePod(pod4Name, "default")
+	h.DeletePodWithTimeout(t, pod4Name, "default", 1*time.Minute)
 	t.Logf("Pod 4 deleted")
 
 	// Verify snapshot has file1.txt and file2.txt
@@ -312,7 +312,7 @@ spec:
 	}
 
 	t.Logf("Deleting Pod 5 to trigger second snapshot push")
-	h.DeletePod(pod5Name, "default")
+	h.DeletePodWithTimeout(t, pod5Name, "default", 1*time.Minute)
 	t.Logf("Pod 5 deleted")
 
 	// Verify second snapshot
@@ -358,6 +358,230 @@ spec:
 	}
 
 	t.Logf("Successfully verified incremental and whiteout snapshotting behavior!")
+}
+
+func TestEROFSLayersE2E(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("Skipping EEROFS Layers E2E test; RUN_E2E not set")
+	}
+
+	h := NewHarness(t, "erofs-layers-e2e")
+	h.Setup()
+
+	gitRoot := h.GetGitRoot()
+	experimentRoot := gitRoot
+
+	// Build images
+	h.DockerBuild("agentfs-controller:e2e", filepath.Join(experimentRoot, "images/agentfs-controller/Dockerfile"), experimentRoot)
+	h.DockerBuild("agentfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/agentfs-node-daemon/Dockerfile"), experimentRoot)
+
+	// Load images into Kind
+	h.KindLoad("agentfs-controller:e2e")
+	h.KindLoad("agentfs-node-daemon:e2e")
+
+	// Read manifest and replace placeholders
+	manifestPath := filepath.Join(experimentRoot, "k8s/manifest.yaml")
+	b, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read manifest: %v", err)
+	}
+	manifest := string(b)
+	manifest = strings.ReplaceAll(manifest, "namespace: kube-agentfs-system", "namespace: default")
+	manifest = strings.ReplaceAll(manifest, "image: agentfs-controller:latest", "image: agentfs-controller:e2e\n          imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: agentfs-node-daemon:latest", "image: agentfs-node-daemon:e2e\n          imagePullPolicy: Never")
+
+	// Specifically set --enable-erofs-layers=true instead of --enable-erofs
+	manifest = strings.ReplaceAll(manifest, `"--controller-address=agentfs-controller:50051"`, `"--controller-address=agentfs-controller:50051"`+"\n            - \"--enable-erofs-layers=true\"")
+
+	// Apply manifests
+	h.KubectlApplyContent("agentfs", manifest)
+
+	// Wait for controller
+	if err := h.WaitForStatefulSet("agentfs-controller", "default", 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Fatalf("AgentFS Controller failed to start: %v", err)
+	}
+
+	// Wait for node-daemon
+	if err := h.WaitForDaemonSet("agentfs-node-daemon", "default", 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Fatalf("AgentFS Node Daemon failed to start: %v", err)
+	}
+
+	volumeID := "erofs-layers-volume-1"
+
+	// Step 1: Create first layer with file1.txt
+	pod1Name := "layers-pod-1"
+	pod1Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "echo 'layer1-content' > /data/file1.txt && sync && sleep 10"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: agentfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod1Name, volumeID)
+
+	t.Logf("Creating Pod 1 (Layer 1)")
+	h.KubectlApplyContent(pod1Name, pod1Yaml)
+	if err := h.WaitForPodReady(pod1Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Test Pod 1 failed to start: %v", err)
+	}
+
+	time.Sleep(5 * time.Second)
+	t.Logf("Deleting Pod 1 to trigger layer 1 upload")
+	h.DeletePodWithTimeout(t, pod1Name, "default", 1*time.Minute)
+
+	// Verify snapshot has exactly 1 layer
+	snap1 := getLatestSnapshot(t, h, volumeID)
+	t.Logf("Snapshot 1: %v", snap1)
+	if len(snap1.ErofsLayers) != 1 {
+		t.Fatalf("Expected exactly 1 EROFS layer in Snapshot 1, got %d", len(snap1.ErofsLayers))
+	}
+
+	// Step 2: Create second layer with file2.txt, also read file1.txt to verify layer stacking
+	pod2Name := "layers-pod-2"
+	pod2Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "cat /data/file1.txt && echo 'layer2-content' > /data/file2.txt && sync && sleep 10"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: agentfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod2Name, volumeID)
+
+	t.Logf("Creating Pod 2 (Layer 2)")
+	h.KubectlApplyContent(pod2Name, pod2Yaml)
+	if err := h.WaitForPodReady(pod2Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Test Pod 2 failed to start: %v", err)
+	}
+
+	time.Sleep(5 * time.Second)
+	logs2 := h.GetPodLogsByName(pod2Name, "default")
+	if !strings.Contains(logs2, "layer1-content") {
+		t.Fatalf("Pod 2 did not successfully read stacked layer1: %s", logs2)
+	}
+
+	t.Logf("Deleting Pod 2 to trigger layer 2 upload")
+	h.DeletePodWithTimeout(t, pod2Name, "default", 1*time.Minute)
+
+	// Verify snapshot now has exactly 2 layers
+	snap2 := getLatestSnapshot(t, h, volumeID)
+	t.Logf("Snapshot 2: %v", snap2)
+	if len(snap2.ErofsLayers) != 2 {
+		t.Fatalf("Expected exactly 2 EROFS layers in Snapshot 2, got %d", len(snap2.ErofsLayers))
+	}
+
+	// Step 3: Create third layer with file3.txt, which should trigger flattening/combining
+	pod3Name := "layers-pod-3"
+	pod3Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "cat /data/file1.txt && cat /data/file2.txt && echo 'layer3-content' > /data/file3.txt && sync && sleep 10"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: agentfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod3Name, volumeID)
+
+	t.Logf("Creating Pod 3 (Layer 3 - should trigger combining/flattening)")
+	h.KubectlApplyContent(pod3Name, pod3Yaml)
+	if err := h.WaitForPodReady(pod3Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Test Pod 3 failed to start: %v", err)
+	}
+
+	time.Sleep(5 * time.Second)
+	logs3 := h.GetPodLogsByName(pod3Name, "default")
+	if !strings.Contains(logs3, "layer1-content") || !strings.Contains(logs3, "layer2-content") {
+		t.Fatalf("Pod 3 did not successfully read stacked layers: %s", logs3)
+	}
+
+	t.Logf("Deleting Pod 3 to trigger layer 3 upload and combination/flattening")
+	h.DeletePodWithTimeout(t, pod3Name, "default", 1*time.Minute)
+
+	// Verify snapshot is now combined back to exactly 1 layer!
+	snap3 := getLatestSnapshot(t, h, volumeID)
+	t.Logf("Snapshot 3 (Combined): %v", snap3)
+	if len(snap3.ErofsLayers) != 1 {
+		t.Fatalf("Expected EROFS layers to be combined/flattened back to exactly 1 layer, got %d", len(snap3.ErofsLayers))
+	}
+
+	// Step 4: Verify the flattened layer has all three files
+	pod4Name := "layers-pod-4"
+	pod4Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "cat /data/file1.txt && cat /data/file2.txt && cat /data/file3.txt && sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      csi:
+        driver: agentfs.labs.gke.io
+        volumeAttributes:
+          volumeID: %s
+`, pod4Name, volumeID)
+
+	t.Logf("Creating Pod 4 (Verifying Combined state)")
+	h.KubectlApplyContent(pod4Name, pod4Yaml)
+	if err := h.WaitForPodReady(pod4Name, "default", 1*time.Minute); err != nil {
+		t.Fatalf("Test Pod 4 failed to start: %v", err)
+	}
+
+	out, err := h.RunInPod(pod4Name, "default", "cat", "/data/file3.txt")
+	if err != nil {
+		t.Fatalf("Failed to read file3.txt in Pod 4: %v", err)
+	}
+	if !strings.Contains(out, "layer3-content") {
+		t.Fatalf("Unexpected file3 content: %s", out)
+	}
+
+	h.DeletePodWithTimeout(t, pod4Name, "default", 1*time.Minute)
+	t.Logf("Successfully verified EROFS layers stacking, client-side dynamic flattening, and full correctness!")
 }
 
 func getLatestSnapshot(t *testing.T, h *Harness, volumeID string) *pb.SnapshotMetadata {

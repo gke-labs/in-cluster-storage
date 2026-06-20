@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"testing"
+	"time"
 
 	"github.com/gke-labs/gke-labs-infra/ktesting/e2e"
 )
@@ -27,5 +28,32 @@ type Harness struct {
 func NewHarness(t *testing.T, clusterName string) *Harness {
 	return &Harness{
 		Harness: e2e.NewHarness(t, clusterName),
+	}
+}
+
+func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
+	t.Log("======= DUMPING DIAGNOSTIC LOGS =======")
+	t.Logf("Events:\n%s\n", h.GetEvents("default"))
+	t.Logf("AgentFS Controller Logs:\n%s\n", h.GetPodLogsByName("agentfs-controller-0", "default"))
+	t.Logf("AgentFS Node Daemon Logs:\n%s\n", h.GetPodLogs("app=agentfs-node-daemon", "default"))
+	t.Log("=========================================")
+}
+
+func (h *Harness) DeletePodWithTimeout(t *testing.T, name, namespace string, timeout time.Duration) {
+	t.Logf("Deleting Pod %s in namespace %s with a timeout of %v", name, namespace, timeout)
+
+	done := make(chan struct{})
+	go func() {
+		h.DeletePod(name, namespace)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Logf("Successfully deleted Pod %s", name)
+	case <-time.After(timeout):
+		t.Errorf("TIMED OUT waiting for Pod %s to be deleted (timeout: %v)", name, timeout)
+		h.DumpDiagnosticLogs(t)
+		t.FailNow()
 	}
 }

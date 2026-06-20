@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,9 +35,11 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/erofs"
 	unix "golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
 )
@@ -48,6 +51,7 @@ var (
 	controllerAddress = flag.String("controller-address", "agentfs-controller:50051", "AgentFS Controller address")
 	lazyLoadThreshold = flag.Int64("lazy-load-threshold", -1, "Threshold in bytes. Files larger than or equal to this will be lazy loaded. Set to -1 to disable.")
 	enableEROFS       = flag.Bool("enable-erofs", false, "Use EROFS to mount the base readonly layer instead of classic mode.")
+	enableEROFSLayers = flag.Bool("enable-erofs-layers", false, "Use EROFS layers mode for storing and mounting volume snapshots.")
 )
 
 func main() {
@@ -84,8 +88,9 @@ func main() {
 	defer cancel()
 
 	driver := &agentFSDriver{
-		nodeID:      *nodeID,
-		enableEROFS: *enableEROFS,
+		nodeID:            *nodeID,
+		enableEROFS:       *enableEROFS,
+		enableEROFSLayers: *enableEROFSLayers,
 		lazyLoader: lazyLoader{
 			pending:            make(map[string]*pb.FileMetadata),
 			downloadOperations: make(map[string]*downloadOperation),
@@ -185,8 +190,9 @@ type agentFSDriver struct {
 	csi.UnimplementedIdentityServer
 	csi.UnimplementedNodeServer
 
-	nodeID      string
-	enableEROFS bool
+	nodeID            string
+	enableEROFS       bool
+	enableEROFSLayers bool
 
 	// volumeMappings maps K8s volume ID to logical volume ID (if provided in volumeContext)
 	volumeMappings sync.Map
@@ -318,13 +324,36 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 	}
 
 	// Mount overlayfs to target path
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerPath, upperPath, workPath)
+	var lowerdirOpt string
+	if d.enableEROFSLayers {
+		var layers []string
+		for i := 0; ; i++ {
+			p := filepath.Join(volumeDir, fmt.Sprintf("layer-%d", i))
+			if _, err := os.Stat(p); err != nil {
+				if os.IsNotExist(err) {
+					break
+				}
+				return nil, fmt.Errorf("failed to stat layer directory %s: %v", p, err)
+			}
+			layers = append(layers, p)
+		}
+		if len(layers) > 0 {
+			slices.Reverse(layers)
+			lowerdirOpt = strings.Join(layers, ":")
+		} else {
+			lowerdirOpt = lowerPath // empty lower directory
+		}
+	} else {
+		lowerdirOpt = lowerPath
+	}
+
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdirOpt, upperPath, workPath)
 	if err := syscall.Mount("overlay", targetPath, "overlay", 0, opts); err != nil {
 		return nil, fmt.Errorf("failed to mount overlayfs to %s: %v", targetPath, err)
 	}
 
 	var fanotifyActive bool
-	if d.fanotifyFd >= 0 {
+	if d.fanotifyFd >= 0 && !d.enableEROFSLayers {
 		err = unix.FanotifyMark(d.fanotifyFd, uint(unix.FAN_MARK_ADD|unix.FAN_MARK_FILESYSTEM), uint64(unix.FAN_OPEN_PERM), unix.AT_FDCWD, targetPath)
 		if err != nil {
 			klog.Errorf("failed to mark fanotify on targetPath %s: %v", targetPath, err)
@@ -416,6 +445,19 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 	delete(d.lazyLoader.mounts, targetPath)
 	d.lazyLoader.mountsMu.Unlock()
 
+	volumeDir := filepath.Join(*storagePath, k8sVolumeID)
+
+	// Push snapshot to controller if EROFS layers mode is enabled.
+	// This must be done before targetPath is unmounted because when we combine or flatten layers,
+	// we compile the entire merged targetPath (active union/view of all layers) into a single,
+	// consolidated EROFS image. If the targetPath is unmounted first, we would lose this unified
+	// view and would be unable to perform client-side layer flattening/compilation.
+	if d.enableEROFSLayers {
+		if err := d.pushErofsLayersSnapshot(ctx, logicalVolumeID, volumeDir, targetPath); err != nil {
+			return nil, fmt.Errorf("failed to push EROFS layers snapshot for volume %s (logical: %s): %w", k8sVolumeID, logicalVolumeID, err)
+		}
+	}
+
 	// Try to unmount the target path. Ignore if not a mount point.
 	if err := syscall.Unmount(targetPath, 0); err != nil {
 		if err != syscall.EINVAL {
@@ -434,34 +476,50 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 		}
 	}
 
-	// Push snapshot to controller
-	volumeDir := filepath.Join(*storagePath, k8sVolumeID)
-	if err := d.pushSnapshot(ctx, logicalVolumeID, volumeDir); err != nil {
-		klog.Errorf("failed to push snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
-	} else {
-		// Clean up lazyLoader pending entries for this volume
-		d.lazyLoader.pendingMu.Lock()
-		for path := range d.lazyLoader.pending {
-			if strings.HasPrefix(path, volumeDir) {
-				delete(d.lazyLoader.pending, path)
+	// Try to unmount any EROFS layer mounts if we are in EROFS layers mode
+	if d.enableEROFSLayers {
+		layerDirs, _ := filepath.Glob(filepath.Join(volumeDir, "layer-*"))
+		for _, ld := range layerDirs {
+			if err := syscall.Unmount(ld, 0); err != nil {
+				klog.Warningf("failed to unmount EROFS layer mount %s: %v", ld, err)
 			}
-		}
-		d.lazyLoader.pendingMu.Unlock()
-
-		d.lazyLoader.downloadMu.Lock()
-		for path := range d.lazyLoader.downloadOperations {
-			if strings.HasPrefix(path, volumeDir) {
-				delete(d.lazyLoader.downloadOperations, path)
-			}
-		}
-		d.lazyLoader.downloadMu.Unlock()
-
-		if err := os.RemoveAll(volumeDir); err != nil {
-			klog.Errorf("failed to cleanup source path %s: %v", volumeDir, err)
 		}
 	}
 
+	if !d.enableEROFSLayers {
+		// Push snapshot to controller (classic/standard mode)
+		if err := d.pushSnapshot(ctx, logicalVolumeID, volumeDir); err != nil {
+			return nil, fmt.Errorf("failed to push snapshot for volume %s (logical: %s): %w", k8sVolumeID, logicalVolumeID, err)
+		}
+		d.cleanupVolumeDir(volumeDir)
+	} else {
+		d.cleanupVolumeDir(volumeDir)
+	}
+
 	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+func (d *agentFSDriver) cleanupVolumeDir(volumeDir string) {
+	// Clean up lazyLoader pending entries for this volume
+	d.lazyLoader.pendingMu.Lock()
+	for path := range d.lazyLoader.pending {
+		if strings.HasPrefix(path, volumeDir) {
+			delete(d.lazyLoader.pending, path)
+		}
+	}
+	d.lazyLoader.pendingMu.Unlock()
+
+	d.lazyLoader.downloadMu.Lock()
+	for path := range d.lazyLoader.downloadOperations {
+		if strings.HasPrefix(path, volumeDir) {
+			delete(d.lazyLoader.downloadOperations, path)
+		}
+	}
+	d.lazyLoader.downloadMu.Unlock()
+
+	if err := os.RemoveAll(volumeDir); err != nil {
+		klog.Errorf("failed to cleanup source path %s: %v", volumeDir, err)
+	}
 }
 
 func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath string) error {
@@ -473,7 +531,7 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 	client := pb.NewAgentFSControllerClient(conn)
 	resp, err := client.GetLatestSnapshot(ctx, &pb.GetLatestSnapshotRequest{
 		VolumeId:          volumeID,
-		WantErofs:         d.enableEROFS,
+		WantErofs:         d.enableEROFS || d.enableEROFSLayers,
 		LazyLoadThreshold: *lazyLoadThreshold,
 	})
 	if err != nil {
@@ -482,6 +540,82 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 
 	if resp.Snapshot == nil {
 		klog.Infof("No snapshot found for volume %s", volumeID)
+		resp.Snapshot = &pb.SnapshotMetadata{}
+	}
+
+	volumeDir := filepath.Dir(sourcePath)
+
+	// Save the latest snapshot metadata as snapshot.pb inside volumeDir on disk.
+	// This enables offline/cached state access and facilitates optimistic concurrency checks.
+	snapshotPBPath := filepath.Join(volumeDir, "snapshot.pb")
+	snapshotData, err := proto.Marshal(resp.Snapshot)
+	if err != nil {
+		return fmt.Errorf("failed to marshal snapshot metadata: %w", err)
+	}
+	if err := os.WriteFile(snapshotPBPath, snapshotData, 0644); err != nil {
+		return fmt.Errorf("failed to write snapshot metadata to %s: %w", snapshotPBPath, err)
+	}
+
+	if d.enableEROFSLayers {
+		layers := resp.Snapshot.ErofsLayers
+		if len(layers) == 0 && resp.Snapshot.ErofsSha256 != "" {
+			layers = []string{resp.Snapshot.ErofsSha256}
+		}
+
+		if len(layers) == 0 {
+			klog.Infof("No EROFS layers for volume %s, using empty lower path", volumeID)
+			return nil
+		}
+
+		// Store read-only EROFS layers in a shared blobs directory to avoid redundant downloads
+		sharedBlobsDir := filepath.Join(*storagePath, "blobs")
+		if err := os.MkdirAll(sharedBlobsDir, 0755); err != nil {
+			return fmt.Errorf("failed to create shared blobs directory: %v", err)
+		}
+
+		for i, layerSha := range layers {
+			imagePath := filepath.Join(sharedBlobsDir, layerSha)
+			layerPath := filepath.Join(volumeDir, fmt.Sprintf("layer-%d", i))
+
+			if err := os.MkdirAll(layerPath, 0755); err != nil {
+				return fmt.Errorf("failed to create layer path %s: %v", layerPath, err)
+			}
+
+			// Only download the layer if it is not already cached locally
+			if _, err := os.Stat(imagePath); err != nil {
+				if os.IsNotExist(err) {
+					// Use temporary file to prevent concurrent download corruption
+					tempFile, err := os.CreateTemp(sharedBlobsDir, "download-blob-*.tmp")
+					if err != nil {
+						return fmt.Errorf("failed to create temp file for blob download: %v", err)
+					}
+					tempPath := tempFile.Name()
+					tempFile.Close()
+					defer os.Remove(tempPath)
+
+					klog.Infof("Downloading EROFS layer blob %s once to shared cache", layerSha)
+					if err := d.downloadBlob(ctx, client, layerSha, tempPath); err != nil {
+						return fmt.Errorf("failed to download EROFS layer blob %s: %v", layerSha, err)
+					}
+
+					// Atomically move the downloaded layer into position
+					if err := os.Rename(tempPath, imagePath); err != nil {
+						if _, errStat := os.Stat(imagePath); errStat != nil {
+							return fmt.Errorf("failed to move EROFS layer %s into cache: %v", layerSha, err)
+						}
+					}
+				} else {
+					return fmt.Errorf("failed to stat EROFS layer %s in cache: %v", layerSha, err)
+				}
+			}
+
+			klog.Infof("Loop mounting EROFS layer %s onto %s", imagePath, layerPath)
+			cmdMount := exec.Command("mount", "-t", "erofs", "-o", "loop", imagePath, layerPath)
+			if out, err := cmdMount.CombinedOutput(); err != nil {
+				return fmt.Errorf("failed to mount EROFS layer %s onto %s: %v, output: %s", imagePath, layerPath, err, string(out))
+			}
+		}
+
 		return nil
 	}
 
@@ -574,6 +708,160 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 		if err := os.Chtimes(targetFile, file.ModTime.AsTime(), file.ModTime.AsTime()); err != nil {
 			klog.Warningf("failed to set times for %s: %v", targetFile, err)
 		}
+	}
+
+	return nil
+}
+
+func (d *agentFSDriver) pushErofsLayersSnapshot(ctx context.Context, volumeID, volumeDir, targetPath string) error {
+	conn, err := d.getControllerConn()
+	if err != nil {
+		return err
+	}
+
+	client := pb.NewAgentFSControllerClient(conn)
+
+	// Load the volume snapshot information from the local snapshot.pb file on disk
+	snapshotPBPath := filepath.Join(volumeDir, "snapshot.pb")
+	data, err := os.ReadFile(snapshotPBPath)
+	if err != nil {
+		return fmt.Errorf("failed to read local snapshot metadata from %s: %w", snapshotPBPath, err)
+	}
+	var localSnapshot pb.SnapshotMetadata
+	if err := proto.Unmarshal(data, &localSnapshot); err != nil {
+		return fmt.Errorf("failed to unmarshal local snapshot metadata from %s: %w", snapshotPBPath, err)
+	}
+
+	var existingLayers []string
+	existingLayers = localSnapshot.ErofsLayers
+	if len(existingLayers) == 0 && localSnapshot.ErofsSha256 != "" {
+		existingLayers = []string{localSnapshot.ErofsSha256}
+	}
+
+	// Fetch the latest snapshot from the controller to check for optimistic concurrency / state conflict
+	resp, err := client.GetLatestSnapshot(ctx, &pb.GetLatestSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		return fmt.Errorf("failed to check latest snapshot from controller: %v", err)
+	}
+
+	if resp != nil && resp.Snapshot != nil {
+		var serverLayers []string
+		serverLayers = resp.Snapshot.ErofsLayers
+		if len(serverLayers) == 0 && resp.Snapshot.ErofsSha256 != "" {
+			serverLayers = []string{resp.Snapshot.ErofsSha256}
+		}
+
+		// Detect optimistic concurrency conflict: if local EROFS layers list does not match
+		// the server's latest EROFS layers list, then another client has updated the snapshot.
+		conflict := false
+		if len(serverLayers) != len(existingLayers) {
+			conflict = true
+		} else {
+			for idx, layer := range existingLayers {
+				if serverLayers[idx] != layer {
+					conflict = true
+					break
+				}
+			}
+		}
+
+		if conflict {
+			return fmt.Errorf("optimistic concurrency conflict: local EROFS layers list %v does not match the controller's latest EROFS layers list %v", existingLayers, serverLayers)
+		}
+	}
+
+	upperPath := filepath.Join(volumeDir, "upper")
+
+	// Check if upper/ directory is empty (no changes)
+	isUpperLayerEmpty := true
+	if _, err := os.Stat(upperPath); err == nil {
+		entries, err := os.ReadDir(upperPath)
+		if err == nil && len(entries) > 0 {
+			isUpperLayerEmpty = false
+		}
+	}
+
+	if isUpperLayerEmpty {
+		klog.Infof("Upper directory %s is empty, no new EROFS layer to create/push", upperPath)
+		return nil
+	}
+
+	// Check if we should combine/flatten layers.
+	// This threshold (2 layers) is a performance-driven heuristic rather than a hard kernel limit.
+	// While modern Linux kernels support up to 500 stacked OverlayFS directories/layers, deeply stacked
+	// overlays can incur non-trivial file lookup latency and performance degradation. Therefore, we
+	// proactively flatten the snapshot stack down to a single combined layer as soon as we reach
+	// more than 2 layers.
+	shouldCombine := len(existingLayers) >= 2
+
+	var erofsSrcPath string
+	if shouldCombine {
+		klog.Infof("Combining layers: compiling the entire merged target path %s", targetPath)
+		erofsSrcPath = targetPath
+	} else {
+		klog.Infof("Creating delta layer: compiling upper path %s", upperPath)
+		erofsSrcPath = upperPath
+	}
+
+	// Create temp EROFS image
+	tempImg, err := os.CreateTemp(volumeDir, "upper-erofs-*.img")
+	if err != nil {
+		return fmt.Errorf("failed to create temp EROFS image file: %v", err)
+	}
+	tempImgPath := tempImg.Name()
+	defer os.Remove(tempImgPath)
+
+	klog.Infof("Compiling %s to EROFS image using pkg/erofs at %s", erofsSrcPath, tempImgPath)
+	rootNode := erofs.NewFileSystemNode("", erofsSrcPath)
+	if rootNode == nil {
+		tempImg.Close()
+		return fmt.Errorf("failed to create file system node for %s", erofsSrcPath)
+	}
+
+	if err := erofs.WriteImage(tempImg, rootNode); err != nil {
+		tempImg.Close()
+		return fmt.Errorf("failed to write EROFS image using pkg/erofs: %v", err)
+	}
+	tempImg.Close()
+
+	// Calculate SHA256 of the new EROFS layer
+	sha, err := calculateSHA256(tempImgPath)
+	if err != nil {
+		return fmt.Errorf("failed to calculate EROFS image SHA256: %v", err)
+	}
+
+	// Check if controller already has the blob
+	hasResp, err := client.HasBlob(ctx, &pb.HasBlobRequest{Sha256: sha})
+	if err != nil {
+		return fmt.Errorf("failed to check HasBlob: %v", err)
+	}
+
+	if !hasResp.Exists {
+		klog.Infof("Uploading EROFS layer blob %s to controller", sha)
+		if err := d.uploadBlob(ctx, client, sha, tempImgPath); err != nil {
+			return fmt.Errorf("failed to upload EROFS layer blob %s: %v", sha, err)
+		}
+	}
+
+	var newLayers []string
+	if shouldCombine {
+		newLayers = []string{sha}
+	} else {
+		newLayers = append(existingLayers, sha)
+	}
+
+	klog.Infof("Uploading updated snapshot with EROFS layers: %v", newLayers)
+	snapshot := &pb.SnapshotMetadata{
+		ErofsLayers: newLayers,
+		ErofsSha256: sha, // compatibility
+	}
+
+	_, err = client.UploadSnapshot(ctx, &pb.UploadSnapshotRequest{
+		VolumeId: volumeID,
+		Snapshot: snapshot,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to upload EROFS layers snapshot: %v", err)
 	}
 
 	return nil
