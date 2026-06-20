@@ -454,7 +454,7 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 	// view and would be unable to perform client-side layer flattening/compilation.
 	if d.enableEROFSLayers {
 		if err := d.pushErofsLayersSnapshot(ctx, logicalVolumeID, volumeDir, targetPath); err != nil {
-			klog.Errorf("failed to push EROFS layers snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
+			return nil, fmt.Errorf("failed to push EROFS layers snapshot for volume %s (logical: %s): %w", k8sVolumeID, logicalVolumeID, err)
 		}
 	}
 
@@ -489,10 +489,9 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 	if !d.enableEROFSLayers {
 		// Push snapshot to controller (classic/standard mode)
 		if err := d.pushSnapshot(ctx, logicalVolumeID, volumeDir); err != nil {
-			klog.Errorf("failed to push snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
-		} else {
-			d.cleanupVolumeDir(volumeDir)
+			return nil, fmt.Errorf("failed to push snapshot for volume %s (logical: %s): %w", k8sVolumeID, logicalVolumeID, err)
 		}
+		d.cleanupVolumeDir(volumeDir)
 	} else {
 		d.cleanupVolumeDir(volumeDir)
 	}
@@ -541,23 +540,23 @@ func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath s
 
 	if resp.Snapshot == nil {
 		klog.Infof("No snapshot found for volume %s", volumeID)
-		return nil
+		resp.Snapshot = &pb.SnapshotMetadata{}
+	}
+
+	volumeDir := filepath.Dir(sourcePath)
+
+	// Save the latest snapshot metadata as snapshot.pb inside volumeDir on disk.
+	// This enables offline/cached state access and facilitates optimistic concurrency checks.
+	snapshotPBPath := filepath.Join(volumeDir, "snapshot.pb")
+	snapshotData, err := proto.Marshal(resp.Snapshot)
+	if err != nil {
+		return fmt.Errorf("failed to marshal snapshot metadata: %w", err)
+	}
+	if err := os.WriteFile(snapshotPBPath, snapshotData, 0644); err != nil {
+		return fmt.Errorf("failed to write snapshot metadata to %s: %w", snapshotPBPath, err)
 	}
 
 	if d.enableEROFSLayers {
-		volumeDir := filepath.Dir(sourcePath)
-
-		// Save the latest snapshot metadata as snapshot.pb inside volumeDir on disk.
-		// This enables offline/cached state access and facilitates optimistic concurrency checks.
-		snapshotPBPath := filepath.Join(volumeDir, "snapshot.pb")
-		snapshotData, err := proto.Marshal(resp.Snapshot)
-		if err != nil {
-			return fmt.Errorf("failed to marshal snapshot metadata: %v", err)
-		}
-		if err := os.WriteFile(snapshotPBPath, snapshotData, 0644); err != nil {
-			return fmt.Errorf("failed to write snapshot metadata to %s: %v", snapshotPBPath, err)
-		}
-
 		layers := resp.Snapshot.ErofsLayers
 		if len(layers) == 0 && resp.Snapshot.ErofsSha256 != "" {
 			layers = []string{resp.Snapshot.ErofsSha256}
@@ -724,22 +723,19 @@ func (d *agentFSDriver) pushErofsLayersSnapshot(ctx context.Context, volumeID, v
 
 	// Load the volume snapshot information from the local snapshot.pb file on disk
 	snapshotPBPath := filepath.Join(volumeDir, "snapshot.pb")
+	data, err := os.ReadFile(snapshotPBPath)
+	if err != nil {
+		return fmt.Errorf("failed to read local snapshot metadata from %s: %w", snapshotPBPath, err)
+	}
 	var localSnapshot pb.SnapshotMetadata
-	hasLocalSnapshot := false
-	if data, err := os.ReadFile(snapshotPBPath); err == nil {
-		if err := proto.Unmarshal(data, &localSnapshot); err == nil {
-			hasLocalSnapshot = true
-		} else {
-			klog.Warningf("failed to unmarshal local snapshot metadata from %s: %v", snapshotPBPath, err)
-		}
+	if err := proto.Unmarshal(data, &localSnapshot); err != nil {
+		return fmt.Errorf("failed to unmarshal local snapshot metadata from %s: %w", snapshotPBPath, err)
 	}
 
 	var existingLayers []string
-	if hasLocalSnapshot {
-		existingLayers = localSnapshot.ErofsLayers
-		if len(existingLayers) == 0 && localSnapshot.ErofsSha256 != "" {
-			existingLayers = []string{localSnapshot.ErofsSha256}
-		}
+	existingLayers = localSnapshot.ErofsLayers
+	if len(existingLayers) == 0 && localSnapshot.ErofsSha256 != "" {
+		existingLayers = []string{localSnapshot.ErofsSha256}
 	}
 
 	// Fetch the latest snapshot from the controller to check for optimistic concurrency / state conflict
