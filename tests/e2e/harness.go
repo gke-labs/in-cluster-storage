@@ -41,7 +41,7 @@ func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 
 func (h *Harness) DeletePodWithTimeout(t *testing.T, name, namespace string, timeout time.Duration) {
 	t.Logf("Deleting Pod %s in namespace %s with a timeout of %v", name, namespace, timeout)
-	
+
 	done := make(chan struct{})
 	go func() {
 		h.DeletePod(name, namespace)
