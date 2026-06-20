@@ -119,7 +119,7 @@ spec:
 	time.Sleep(5 * time.Second)
 
 	t.Logf("Deleting Pod 1 to trigger snapshot push")
-	h.DeletePod(pod1Name, "default")
+	h.DeletePodWithTimeout(t, pod1Name, "default", 1*time.Minute)
 	t.Logf("Pod 1 deleted")
 
 	// Step 2: Start a new Pod, read the file, and update it
@@ -165,7 +165,7 @@ spec:
 	}
 	t.Logf("Pod 2 verified, deleting")
 
-	h.DeletePod(pod2Name, "default")
+	h.DeletePodWithTimeout(t, pod2Name, "default", 1*time.Minute)
 	t.Logf("Pod 2 deleted")
 
 	// Step 3: Launch another Pod to read the file and verify the value again
@@ -206,7 +206,7 @@ spec:
 		t.Fatalf("Expected content %q, got %q", expected, out)
 	}
 
-	h.DeletePod(pod3Name, "default")
+	h.DeletePodWithTimeout(t, pod3Name, "default", 1*time.Minute)
 
 	// Step 4: Verify Incremental Snapshot & Deletion/Whiteout behavior
 	incVolumeID := "test-incremental-vol"
@@ -243,7 +243,7 @@ spec:
 
 	time.Sleep(5 * time.Second)
 	t.Logf("Deleting Pod 4 to trigger snapshot push")
-	h.DeletePod(pod4Name, "default")
+	h.DeletePodWithTimeout(t, pod4Name, "default", 1*time.Minute)
 	t.Logf("Pod 4 deleted")
 
 	// Verify snapshot has file1.txt and file2.txt
@@ -312,7 +312,7 @@ spec:
 	}
 
 	t.Logf("Deleting Pod 5 to trigger second snapshot push")
-	h.DeletePod(pod5Name, "default")
+	h.DeletePodWithTimeout(t, pod5Name, "default", 1*time.Minute)
 	t.Logf("Pod 5 deleted")
 
 	// Verify second snapshot
@@ -442,7 +442,7 @@ spec:
 
 	time.Sleep(5 * time.Second)
 	t.Logf("Deleting Pod 1 to trigger layer 1 upload")
-	h.DeletePod(pod1Name, "default")
+	h.DeletePodWithTimeout(t, pod1Name, "default", 1*time.Minute)
 
 	// Verify snapshot has exactly 1 layer
 	snap1 := getLatestSnapshot(t, h, volumeID)
@@ -488,7 +488,7 @@ spec:
 	}
 
 	t.Logf("Deleting Pod 2 to trigger layer 2 upload")
-	h.DeletePod(pod2Name, "default")
+	h.DeletePodWithTimeout(t, pod2Name, "default", 1*time.Minute)
 
 	// Verify snapshot now has exactly 2 layers
 	snap2 := getLatestSnapshot(t, h, volumeID)
@@ -534,7 +534,7 @@ spec:
 	}
 
 	t.Logf("Deleting Pod 3 to trigger layer 3 upload and combination/flattening")
-	h.DeletePod(pod3Name, "default")
+	h.DeletePodWithTimeout(t, pod3Name, "default", 1*time.Minute)
 
 	// Verify snapshot is now combined back to exactly 1 layer!
 	snap3 := getLatestSnapshot(t, h, volumeID)
@@ -580,7 +580,7 @@ spec:
 		t.Fatalf("Unexpected file3 content: %s", out)
 	}
 
-	h.DeletePod(pod4Name, "default")
+	h.DeletePodWithTimeout(t, pod4Name, "default", 1*time.Minute)
 	t.Logf("Successfully verified EROFS layers stacking, client-side dynamic flattening, and full correctness!")
 }
 
