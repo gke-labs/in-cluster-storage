@@ -8,7 +8,7 @@ This document describes how to set up your environment and run the full end-to-e
 
 To run the E2E tests, the following tools must be available in your execution environment:
 
-1. **Go Toolchain** (Go 1.26.4 or later, or run with `GOTOOLCHAIN=auto`)
+1. **Go Toolchain** (Go 1.27.1 or later, or run with `GOTOOLCHAIN=auto`)
 2. **Docker Client CLI** (pointing to a running Docker daemon via `DOCKER_HOST` if containerized)
 3. **kind** (Kubernetes in Docker)
 4. **kubectl** (Kubernetes command-line tool)
