@@ -1,0 +1,55 @@
+# Protocol Buffers / gRPC generated code
+
+# Go
+*.pb.go linguist-generated=true
+*.pb.gw.go linguist-generated=true
+
+# Python
+*_pb2.py linguist-generated=true
+*_pb2_grpc.py linguist-generated=true
+*_pb2.pyi linguist-generated=true
+*_pb2_grpc.pyi linguist-generated=true
+
+# C++
+*.pb.cc linguist-generated=true
+*.pb.h linguist-generated=true
+*.grpc.pb.cc linguist-generated=true
+*.grpc.pb.h linguist-generated=true
+
+# JavaScript / TypeScript
+*_pb.js linguist-generated=true
+*_pb.d.ts linguist-generated=true
+*_grpc_web_pb.js linguist-generated=true
+*_grpc_web_pb.d.ts linguist-generated=true
+*_pb_service.js linguist-generated=true
+*_pb_service.d.ts linguist-generated=true
+*_grpc.js linguist-generated=true
+*_grpc.d.ts linguist-generated=true
+
+# Rust
+*.pb.rs linguist-generated=true
+
+# C#
+*Grpc.cs linguist-generated=true
+
+# Swift
+*.pb.swift linguist-generated=true
+*.grpc.swift linguist-generated=true
+
+# Ruby
+*_pb.rb linguist-generated=true
+*_services_pb.rb linguist-generated=true
+
+# Dart
+*.pb.dart linguist-generated=true
+*.pbenum.dart linguist-generated=true
+*.pbserver.dart linguist-generated=true
+*.pbjson.dart linguist-generated=true
+*.pbgrpc.dart linguist-generated=true
+
+# Objective-C
+*.pbobjc.h linguist-generated=true
+*.pbobjc.m linguist-generated=true
+
+# PHP
+*.pb.php linguist-generated=true
