@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -253,6 +254,9 @@ func (s *Server) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MkdirResp
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.Mkdir(ctx, req.GetPath(), req.GetMode())
 	if err != nil {
+		if errors.Is(err, walclient.ErrDurabilityUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		return nil, status.Errorf(codes.Internal, "mkdir failed: %v", err)
 	}
 	return &pb.MkdirResponse{Attr: attr}, nil
@@ -265,6 +269,9 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.CreateFile(ctx, req.GetPath(), req.GetMode(), req.GetInitialContent())
 	if err != nil {
+		if errors.Is(err, walclient.ErrDurabilityUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		return nil, status.Errorf(codes.Internal, "create file failed: %v", err)
 	}
 	return &pb.CreateFileResponse{Attr: attr}, nil
@@ -296,6 +303,9 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	bytesWritten, newSize, modTime, err := vol.WriteFile(ctx, req.GetPath(), req.GetOffset(), req.GetData(), req.GetWriteMode())
 	if err != nil {
+		if errors.Is(err, walclient.ErrDurabilityUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		return nil, status.Errorf(codes.Internal, "write file failed: %v", err)
 	}
 	return &pb.WriteFileResponse{
@@ -312,6 +322,9 @@ func (s *Server) TruncateFile(ctx context.Context, req *pb.TruncateFileRequest) 
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.TruncateFile(ctx, req.GetPath(), req.GetSize())
 	if err != nil {
+		if errors.Is(err, walclient.ErrDurabilityUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		return nil, status.Errorf(codes.Internal, "truncate failed: %v", err)
 	}
 	return &pb.TruncateFileResponse{Attr: attr}, nil
@@ -323,6 +336,9 @@ func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkR
 	}
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	if err := vol.Unlink(ctx, req.GetPath()); err != nil {
+		if errors.Is(err, walclient.ErrDurabilityUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		return nil, status.Errorf(codes.Internal, "unlink failed: %v", err)
 	}
 	return &pb.UnlinkResponse{Success: true}, nil
@@ -334,6 +350,9 @@ func (s *Server) Rmdir(ctx context.Context, req *pb.RmdirRequest) (*pb.RmdirResp
 	}
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	if err := vol.Rmdir(ctx, req.GetPath()); err != nil {
+		if errors.Is(err, walclient.ErrDurabilityUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		return nil, status.Errorf(codes.Internal, "rmdir failed: %v", err)
 	}
 	return &pb.RmdirResponse{Success: true}, nil
@@ -346,6 +365,9 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	attr, err := vol.Rename(ctx, req.GetOldPath(), req.GetNewPath())
 	if err != nil {
+		if errors.Is(err, walclient.ErrDurabilityUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		return nil, status.Errorf(codes.Internal, "rename failed: %v", err)
 	}
 	return &pb.RenameResponse{Attr: attr}, nil
@@ -357,6 +379,9 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	}
 	vol := s.getOrCreateVolume(req.GetVolumeId())
 	if err := vol.Fsync(ctx, req.GetPath()); err != nil {
+		if errors.Is(err, walclient.ErrDurabilityUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		return nil, status.Errorf(codes.Internal, "fsync failed: %v", err)
 	}
 	return &pb.FsyncResponse{Success: true}, nil

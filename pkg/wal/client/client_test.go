@@ -18,6 +18,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -800,5 +801,56 @@ func TestTwoStreamsOneServerFlushIsolation(t *testing.T) {
 	_, _, perm2After := stream2.Watermarks()
 	if perm2After != 1 {
 		t.Fatalf("expected perm2=1 to remain unchanged, got %d", perm2After)
+	}
+}
+
+// 12. Target-less stream fast failure on Witness or Permanent durability.
+func TestTargetlessStreamDurabilityFastFail(t *testing.T) {
+	clientDir := t.TempDir()
+	streamID := uuid.New()
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	stream, err := Open(ctx, clientDir, streamID, "")
+	if err != nil {
+		t.Fatalf("open failed: %v", err)
+	}
+	defer stream.Close()
+
+	if stream.HasTarget() {
+		t.Fatalf("expected HasTarget() to be false for target-less stream")
+	}
+
+	seq, err := stream.Append(ctx, []byte("test-data"))
+	if err != nil {
+		t.Fatalf("append failed: %v", err)
+	}
+
+	// Local durability should succeed immediately
+	if err := stream.Wait(ctx, seq, Local, false); err != nil {
+		t.Fatalf("Wait(Local) failed: %v", err)
+	}
+
+	// Witness durability should fail fast with ErrDurabilityUnavailable
+	err = stream.Wait(ctx, seq, Witness, false)
+	if !errors.Is(err, ErrDurabilityUnavailable) {
+		t.Fatalf("expected ErrDurabilityUnavailable for Wait(Witness), got: %v", err)
+	}
+
+	// Permanent durability should fail fast with ErrDurabilityUnavailable
+	err = stream.Wait(ctx, seq, Permanent, false)
+	if !errors.Is(err, ErrDurabilityUnavailable) {
+		t.Fatalf("expected ErrDurabilityUnavailable for Wait(Permanent, false), got: %v", err)
+	}
+
+	err = stream.Wait(ctx, seq, Permanent, true)
+	if !errors.Is(err, ErrDurabilityUnavailable) {
+		t.Fatalf("expected ErrDurabilityUnavailable for Wait(Permanent, true), got: %v", err)
+	}
+
+	// Flush should fail fast with ErrDurabilityUnavailable
+	err = stream.Flush(ctx)
+	if !errors.Is(err, ErrDurabilityUnavailable) {
+		t.Fatalf("expected ErrDurabilityUnavailable for Flush(), got: %v", err)
 	}
 }

@@ -31,6 +31,8 @@ import (
 	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestControllerServiceOperations(t *testing.T) {
@@ -1530,5 +1532,89 @@ func TestApplyRecordDirect(t *testing.T) {
 	_, err = vol.GetAttr(ctx, "/a/b/c")
 	if err == nil {
 		t.Fatalf("Expected /a/b/c to be deleted")
+	}
+}
+
+func TestTargetlessWALDurabilityFastFail(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	walDir := t.TempDir()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithServerWAL(walDir, "", walclient.Local))
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-vol-targetless-wal"
+
+	// Create file should succeed under default Local durability
+	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/test.txt",
+		Mode:           0644,
+		InitialContent: []byte("initial"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// WriteFile with WRITE_THROUGH_FSYNC (Permanent) should fail promptly with FailedPrecondition
+	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Path:      "/test.txt",
+		Offset:    0,
+		Data:      []byte("data-permanent"),
+		WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
+	})
+	if err == nil {
+		t.Fatalf("expected WriteFile(WRITE_THROUGH_FSYNC) to fail on target-less WAL, got nil")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected codes.FailedPrecondition for WRITE_THROUGH_FSYNC, got %v (status: %v)", err, st.Code())
+	} else if !strings.Contains(st.Message(), "durability level permanent requested but WAL has no remote target") {
+		t.Fatalf("unexpected error message: %q", st.Message())
+	}
+
+	// WriteFile with EAGER_REPLICATION (Witness) should fail promptly with FailedPrecondition
+	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Path:      "/test.txt",
+		Offset:    0,
+		Data:      []byte("data-witness"),
+		WriteMode: pb.WriteMode_EAGER_REPLICATION,
+	})
+	if err == nil {
+		t.Fatalf("expected WriteFile(EAGER_REPLICATION) to fail on target-less WAL, got nil")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected codes.FailedPrecondition for EAGER_REPLICATION, got %v (status: %v)", err, st.Code())
+	} else if !strings.Contains(st.Message(), "durability level witness requested but WAL has no remote target") {
+		t.Fatalf("unexpected error message: %q", st.Message())
+	}
+
+	// WriteFile with LAZY_WRITE (Local) should succeed
+	writeResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Path:      "/test.txt",
+		Offset:    0,
+		Data:      []byte("data-local"),
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil {
+		t.Fatalf("WriteFile(LAZY_WRITE) failed: %v", err)
+	}
+	if writeResp.BytesWritten != int64(len("data-local")) {
+		t.Fatalf("expected %d bytes written, got %d", len("data-local"), writeResp.BytesWritten)
+	}
+
+	// Fsync should fail fast with FailedPrecondition on target-less WAL because it flushes to permanent storage
+	_, err = server.Fsync(ctx, &pb.FsyncRequest{
+		VolumeId: volumeID,
+		Path:     "/test.txt",
+	})
+	if err == nil {
+		t.Fatalf("expected Fsync to fail on target-less WAL with unflushed records, got nil")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected codes.FailedPrecondition for Fsync, got %v (status: %v)", err, st.Code())
 	}
 }

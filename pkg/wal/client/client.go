@@ -41,6 +41,23 @@ const (
 	Permanent              // flushed to permanent object storage
 )
 
+func (l Level) String() string {
+	switch l {
+	case Local:
+		return "local"
+	case Witness:
+		return "witness"
+	case Permanent:
+		return "permanent"
+	default:
+		return fmt.Sprintf("Level(%d)", int(l))
+	}
+}
+
+// ErrDurabilityUnavailable is returned when a durability level requiring a remote target
+// (Witness or Permanent) is requested on a stream with no remote target configured.
+var ErrDurabilityUnavailable = errors.New("WAL has no remote target")
+
 // Stream is the interface used by node daemons to append to the WAL.
 type Stream interface {
 	// Append writes and fsyncs locally, then returns the stream_seq.
@@ -53,6 +70,8 @@ type Stream interface {
 	Watermarks() (local, witness, permanent uint64)
 	// RecoveredRecords returns any existing records scanned from local segment files at open time.
 	RecoveredRecords() []*wal.ClientRecord
+	// HasTarget returns whether the stream has a remote replication target configured.
+	HasTarget() bool
 	Close() error
 }
 
@@ -119,6 +138,7 @@ type streamImpl struct {
 	closed          atomic.Bool
 	wg              sync.WaitGroup
 
+	hasTarget  bool
 	grpcClient pb.WalBufferClient
 	grpcConn   *grpc.ClientConn
 }
@@ -162,6 +182,7 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		newRecordSignal: make(chan struct{}, 1),
 		cancelCtx:       cancelCtx,
 		cancelFunc:      cancelFunc,
+		hasTarget:       opt.grpcClient != nil || target != "",
 	}
 	s.cond = sync.NewCond(&s.mu)
 
@@ -256,6 +277,10 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 
 // waitFor blocks until seq has reached level (Witness or Permanent).
 func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error {
+	if !s.hasTarget && (level == Witness || level == Permanent) {
+		return fmt.Errorf("durability level %s requested but %w", level, ErrDurabilityUnavailable)
+	}
+
 	s.mu.RLock()
 	witness := s.witnessSeq
 	s3 := s.s3Seq
@@ -330,6 +355,10 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 		return nil
 	}
 
+	if !s.hasTarget {
+		return fmt.Errorf("durability level %s requested but %w", level, ErrDurabilityUnavailable)
+	}
+
 	// 1. Always reach Witness first, even for Permanent.
 	if err := s.waitFor(ctx, seq, Witness); err != nil {
 		return err
@@ -365,6 +394,10 @@ func (s *streamImpl) Flush(ctx context.Context) error {
 		return nil
 	}
 
+	if !s.hasTarget {
+		return fmt.Errorf("durability level permanent requested but %w", ErrDurabilityUnavailable)
+	}
+
 	// 1. Wait for everything appended so far to reach Witness
 	if err := s.waitFor(ctx, targetSeq, Witness); err != nil {
 		return err
@@ -379,6 +412,11 @@ func (s *streamImpl) Flush(ctx context.Context) error {
 
 	// 3. Wait for permanent watermark
 	return s.waitFor(ctx, targetSeq, Permanent)
+}
+
+// HasTarget returns whether the stream has a remote replication target configured.
+func (s *streamImpl) HasTarget() bool {
+	return s.hasTarget
 }
 
 // Watermarks returns current local, witness, and permanent watermarks.

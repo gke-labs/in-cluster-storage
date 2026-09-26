@@ -380,11 +380,11 @@ func (v *Volume) logMutationLocked(ctx context.Context, record *MutationRecord, 
 	switch durability {
 	case walclient.Permanent:
 		if err := v.stream.Wait(ctx, seq, walclient.Permanent, true); err != nil {
-			return fmt.Errorf("failed waiting for permanent durability: %w", err)
+			return err
 		}
 	case walclient.Witness:
 		if err := v.stream.Wait(ctx, seq, walclient.Witness, false); err != nil {
-			return fmt.Errorf("failed waiting for witness durability: %w", err)
+			return err
 		}
 	case walclient.Local:
 		// Append already fsynced locally
@@ -1592,7 +1592,7 @@ func (v *Volume) Fsync(ctx context.Context, p string) error {
 	}
 	if v.stream != nil {
 		if err := v.stream.Flush(ctx); err != nil {
-			return fmt.Errorf("failed to flush WAL stream: %w", err)
+			return err
 		}
 	}
 	return nil
