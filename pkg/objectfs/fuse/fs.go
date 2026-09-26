@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -131,18 +132,65 @@ func grpcErrorToStatus(err error) fuse.Status {
 	if !ok {
 		return fuse.Status(syscall.EIO)
 	}
+	msg := strings.ToLower(st.Message())
 	switch st.Code() {
 	case codes.NotFound:
 		return fuse.ENOENT
 	case codes.AlreadyExists:
 		return fuse.Status(syscall.EEXIST)
 	case codes.InvalidArgument:
+		if strings.Contains(msg, "is a directory") {
+			return fuse.Status(syscall.EISDIR)
+		}
+		if strings.Contains(msg, "not a directory") {
+			return fuse.Status(syscall.ENOTDIR)
+		}
 		return fuse.EINVAL
 	case codes.PermissionDenied, codes.Unauthenticated:
 		return fuse.EACCES
 	case codes.Unimplemented:
 		return fuse.ENOSYS
+	case codes.DeadlineExceeded:
+		return fuse.Status(syscall.ETIMEDOUT)
+	case codes.Canceled:
+		return fuse.Status(syscall.EINTR)
+	case codes.ResourceExhausted:
+		return fuse.Status(syscall.ENOSPC)
+	case codes.Aborted:
+		return fuse.Status(syscall.EBUSY)
+	case codes.FailedPrecondition:
+		if strings.Contains(msg, "not empty") {
+			return fuse.Status(syscall.ENOTEMPTY)
+		}
+		if strings.Contains(msg, "is a directory") {
+			return fuse.Status(syscall.EISDIR)
+		}
+		if strings.Contains(msg, "not a directory") {
+			return fuse.Status(syscall.ENOTDIR)
+		}
+		if strings.Contains(msg, "busy") {
+			return fuse.Status(syscall.EBUSY)
+		}
+		if strings.Contains(msg, "already exists") || strings.Contains(msg, "file exists") {
+			return fuse.Status(syscall.EEXIST)
+		}
+		if strings.Contains(msg, "not found") || strings.Contains(msg, "no such file") {
+			return fuse.ENOENT
+		}
+		return fuse.EINVAL
 	default:
+		if strings.Contains(msg, "not empty") {
+			return fuse.Status(syscall.ENOTEMPTY)
+		}
+		if strings.Contains(msg, "is a directory") {
+			return fuse.Status(syscall.EISDIR)
+		}
+		if strings.Contains(msg, "not a directory") {
+			return fuse.Status(syscall.ENOTDIR)
+		}
+		if strings.Contains(msg, "busy") {
+			return fuse.Status(syscall.EBUSY)
+		}
 		return fuse.Status(syscall.EIO)
 	}
 }

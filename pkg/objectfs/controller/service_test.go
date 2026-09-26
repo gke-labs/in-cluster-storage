@@ -31,6 +31,8 @@ import (
 	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestControllerServiceOperations(t *testing.T) {
@@ -205,6 +207,98 @@ func TestControllerServiceOperations(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("Expected subdir to not exist after rmdir")
+	}
+}
+
+func TestServerRmdirAndUnlinkErrorCodes(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-error-codes-vol"
+
+	// Create /parent/child.txt
+	_, err := server.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId: volumeID,
+		Path:     "/parent",
+		Mode:     0755,
+	})
+	if err != nil {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId: volumeID,
+		Path:     "/parent/child.txt",
+		Mode:     0644,
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// 1. Rmdir non-empty directory -> FailedPrecondition ("not empty")
+	_, err = server.Rmdir(ctx, &pb.RmdirRequest{
+		VolumeId: volumeID,
+		Path:     "/parent",
+	})
+	if err == nil {
+		t.Fatalf("Expected error when rmdir non-empty dir")
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition || !strings.Contains(st.Message(), "not empty") {
+		t.Fatalf("Expected FailedPrecondition with 'not empty', got %v", err)
+	}
+
+	// 2. Unlink directory -> FailedPrecondition ("is a directory")
+	_, err = server.Unlink(ctx, &pb.UnlinkRequest{
+		VolumeId: volumeID,
+		Path:     "/parent",
+	})
+	if err == nil {
+		t.Fatalf("Expected error when unlinking dir")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition || !strings.Contains(st.Message(), "is a directory") {
+		t.Fatalf("Expected FailedPrecondition with 'is a directory', got %v", err)
+	}
+
+	// 3. Rmdir regular file -> FailedPrecondition ("not a directory")
+	_, err = server.Rmdir(ctx, &pb.RmdirRequest{
+		VolumeId: volumeID,
+		Path:     "/parent/child.txt",
+	})
+	if err == nil {
+		t.Fatalf("Expected error when rmdir file")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition || !strings.Contains(st.Message(), "not a directory") {
+		t.Fatalf("Expected FailedPrecondition with 'not a directory', got %v", err)
+	}
+
+	// 4. Rmdir nonexistent -> NotFound
+	_, err = server.Rmdir(ctx, &pb.RmdirRequest{
+		VolumeId: volumeID,
+		Path:     "/nonexistent",
+	})
+	if err == nil {
+		t.Fatalf("Expected error when rmdir nonexistent")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.NotFound {
+		t.Fatalf("Expected NotFound, got %v", err)
+	}
+
+	// 5. Mkdir already exists -> AlreadyExists
+	_, err = server.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId: volumeID,
+		Path:     "/parent",
+		Mode:     0755,
+	})
+	if err == nil {
+		t.Fatalf("Expected error when mkdir existing dir")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.AlreadyExists {
+		t.Fatalf("Expected AlreadyExists, got %v", err)
 	}
 }
 

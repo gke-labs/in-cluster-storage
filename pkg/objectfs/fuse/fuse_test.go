@@ -26,7 +26,9 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -141,6 +143,21 @@ func TestRawFileSystemOperations(t *testing.T) {
 		t.Fatalf("Lookup returned node %d, want %d", lookupOut.NodeId, fileID)
 	}
 
+	// 8a. Rmdir "docs" while non-empty should fail with ENOTEMPTY
+	if st := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "docs"); st != fuse.Status(syscall.ENOTEMPTY) {
+		t.Fatalf("Rmdir on non-empty dir: expected ENOTEMPTY, got %v", st)
+	}
+
+	// 8b. Unlink "docs" (a directory) should fail with EISDIR
+	if st := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "docs"); st != fuse.Status(syscall.EISDIR) {
+		t.Fatalf("Unlink on directory: expected EISDIR, got %v", st)
+	}
+
+	// 8c. Rmdir "readme.txt" (a file) should fail with ENOTDIR
+	if st := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: docsEntryOut.NodeId}, "readme.txt"); st != fuse.Status(syscall.ENOTDIR) {
+		t.Fatalf("Rmdir on file: expected ENOTDIR, got %v", st)
+	}
+
 	// 9. Unlink "readme.txt"
 	if status := rawFS.Unlink(nil, &fuse.InHeader{NodeId: docsEntryOut.NodeId}, "readme.txt"); status != fuse.OK {
 		t.Fatalf("Unlink failed: %v", status)
@@ -149,6 +166,90 @@ func TestRawFileSystemOperations(t *testing.T) {
 	// 10. Rmdir "docs"
 	if status := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "docs"); status != fuse.OK {
 		t.Fatalf("Rmdir failed: %v", status)
+	}
+}
+
+func TestFUSERmdirAndUnlinkErrors(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(client, "vol-errors", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	// Create directory /dir and child /dir/file
+	var dirOut fuse.EntryOut
+	if st := rawFS.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0755}, "dir", &dirOut); st != fuse.OK {
+		t.Fatalf("Mkdir failed: %v", st)
+	}
+
+	var fileOut fuse.CreateOut
+	if st := rawFS.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: dirOut.NodeId}, Mode: 0644}, "file", &fileOut); st != fuse.OK {
+		t.Fatalf("Create failed: %v", st)
+	}
+
+	// 1. Rmdir non-empty directory returns ENOTEMPTY
+	if st := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "dir"); st != fuse.Status(syscall.ENOTEMPTY) {
+		t.Fatalf("Expected ENOTEMPTY for non-empty dir, got %v", st)
+	}
+
+	// 2. Unlink directory returns EISDIR
+	if st := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "dir"); st != fuse.Status(syscall.EISDIR) {
+		t.Fatalf("Expected EISDIR for unlinking directory, got %v", st)
+	}
+
+	// 3. Rmdir regular file returns ENOTDIR
+	if st := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: dirOut.NodeId}, "file"); st != fuse.Status(syscall.ENOTDIR) {
+		t.Fatalf("Expected ENOTDIR for rmdir on regular file, got %v", st)
+	}
+
+	// 4. Rmdir nonexistent returns ENOENT
+	if st := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "nonexistent"); st != fuse.ENOENT {
+		t.Fatalf("Expected ENOENT for nonexistent dir, got %v", st)
+	}
+
+	// 5. Unlink child file
+	if st := rawFS.Unlink(nil, &fuse.InHeader{NodeId: dirOut.NodeId}, "file"); st != fuse.OK {
+		t.Fatalf("Unlink file failed: %v", st)
+	}
+
+	// 6. Rmdir now-empty directory succeeds
+	if st := rawFS.Rmdir(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "dir"); st != fuse.OK {
+		t.Fatalf("Rmdir on empty dir failed: %v", st)
+	}
+}
+
+func TestGrpcErrorToStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected fuse.Status
+	}{
+		{"nil error", nil, fuse.OK},
+		{"not found", status.Error(codes.NotFound, "not found"), fuse.ENOENT},
+		{"already exists", status.Error(codes.AlreadyExists, "already exists"), fuse.Status(syscall.EEXIST)},
+		{"invalid argument", status.Error(codes.InvalidArgument, "invalid argument"), fuse.EINVAL},
+		{"permission denied", status.Error(codes.PermissionDenied, "permission denied"), fuse.EACCES},
+		{"unauthenticated", status.Error(codes.Unauthenticated, "unauthenticated"), fuse.EACCES},
+		{"unimplemented", status.Error(codes.Unimplemented, "unimplemented"), fuse.ENOSYS},
+		{"deadline exceeded", status.Error(codes.DeadlineExceeded, "deadline"), fuse.Status(syscall.ETIMEDOUT)},
+		{"canceled", status.Error(codes.Canceled, "canceled"), fuse.Status(syscall.EINTR)},
+		{"resource exhausted", status.Error(codes.ResourceExhausted, "out of space"), fuse.Status(syscall.ENOSPC)},
+		{"aborted", status.Error(codes.Aborted, "aborted"), fuse.Status(syscall.EBUSY)},
+		{"failed precondition not empty", status.Error(codes.FailedPrecondition, "rmdir failed: directory /foo not empty: directory not empty"), fuse.Status(syscall.ENOTEMPTY)},
+		{"failed precondition is dir", status.Error(codes.FailedPrecondition, "unlink failed: cannot unlink directory /foo: is a directory"), fuse.Status(syscall.EISDIR)},
+		{"failed precondition not dir", status.Error(codes.FailedPrecondition, "rmdir failed: cannot rmdir non-directory /foo: not a directory"), fuse.Status(syscall.ENOTDIR)},
+		{"failed precondition busy", status.Error(codes.FailedPrecondition, "cannot rmdir root: device or resource busy"), fuse.Status(syscall.EBUSY)},
+		{"failed precondition generic", status.Error(codes.FailedPrecondition, "other precondition failed"), fuse.EINVAL},
+		{"internal generic", status.Error(codes.Internal, "internal disk corruption"), fuse.Status(syscall.EIO)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := grpcErrorToStatus(tc.err)
+			if got != tc.expected {
+				t.Errorf("grpcErrorToStatus(%v) = %v, want %v", tc.err, got, tc.expected)
+			}
+		})
 	}
 }
 
