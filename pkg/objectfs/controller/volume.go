@@ -358,17 +358,25 @@ func (v *Volume) Close() error {
 	return firstErr
 }
 
-func (v *Volume) logMutationLocked(ctx context.Context, record *MutationRecord, reqLevel *walclient.Level) error {
+// logMutationLocked appends a mutation record to the WAL stream under v.mu.
+// It returns a wait function that blocks until the requested durability level is reached.
+// The wait function MUST be invoked outside v.mu so that WAL durability waits do not
+// block concurrent volume operations.
+//
+// If the durability wait fails (e.g. context cancelled, stream closed), the mutation
+// has already been applied to in-memory state and appended locally, so no rollback is
+// attempted; the error is returned to inform the caller that durability was not achieved.
+func (v *Volume) logMutationLocked(ctx context.Context, record *MutationRecord, reqLevel *walclient.Level) (func(context.Context) error, error) {
 	if v.stream == nil {
-		return nil
+		return nil, nil
 	}
 	payload, err := EncodeMutationRecord(record)
 	if err != nil {
-		return fmt.Errorf("failed to encode mutation record: %w", err)
+		return nil, fmt.Errorf("failed to encode mutation record: %w", err)
 	}
 	seq, err := v.stream.Append(ctx, payload)
 	if err != nil {
-		return fmt.Errorf("failed to append mutation to WAL stream: %w", err)
+		return nil, fmt.Errorf("failed to append mutation to WAL stream: %w", err)
 	}
 	record.StreamSeq = seq
 
@@ -377,19 +385,22 @@ func (v *Volume) logMutationLocked(ctx context.Context, record *MutationRecord, 
 		durability = *reqLevel
 	}
 
-	switch durability {
-	case walclient.Permanent:
-		if err := v.stream.Wait(ctx, seq, walclient.Permanent, true); err != nil {
-			return fmt.Errorf("failed waiting for permanent durability: %w", err)
+	waitFn := func(waitCtx context.Context) error {
+		switch durability {
+		case walclient.Permanent:
+			if err := v.stream.Wait(waitCtx, seq, walclient.Permanent, true); err != nil {
+				return fmt.Errorf("failed waiting for permanent durability: %w", err)
+			}
+		case walclient.Witness:
+			if err := v.stream.Wait(waitCtx, seq, walclient.Witness, false); err != nil {
+				return fmt.Errorf("failed waiting for witness durability: %w", err)
+			}
+		case walclient.Local:
+			// Append already fsynced locally
 		}
-	case walclient.Witness:
-		if err := v.stream.Wait(ctx, seq, walclient.Witness, false); err != nil {
-			return fmt.Errorf("failed waiting for witness durability: %w", err)
-		}
-	case walclient.Local:
-		// Append already fsynced locally
+		return nil
 	}
-	return nil
+	return waitFn, nil
 }
 
 func (v *Volume) allocInode() uint64 {
@@ -807,180 +818,254 @@ func (v *Volume) ReadDir(ctx context.Context, p string) ([]*pb.EntryAttr, error)
 }
 
 func (v *Volume) Mkdir(ctx context.Context, p string, mode uint32) (*pb.EntryAttr, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
 
-	p = cleanPath(p)
-	if p == "/" {
-		return nil, fmt.Errorf("cannot recreate root directory: %w", syscall.EEXIST)
-	}
+		p = cleanPath(p)
+		if p == "/" {
+			return nil, nil, fmt.Errorf("cannot recreate root directory: %w", syscall.EEXIST)
+		}
 
-	parentPath := path.Dir(p)
-	baseName := path.Base(p)
+		parentPath := path.Dir(p)
+		baseName := path.Base(p)
 
-	parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
-	if err != nil {
-		return nil, fmt.Errorf("parent directory not found: %w", err)
-	}
+		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parent directory not found: %w", err)
+		}
 
-	parentInode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		parentInode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !parentInode.IsDir {
+			return nil, nil, fmt.Errorf("parent %s is not a directory: %w", parentPath, syscall.ENOTDIR)
+		}
+
+		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if _, exists := parentDir.Entries[baseName]; exists {
+			return nil, nil, fmt.Errorf("directory %s already exists: %w", p, syscall.EEXIST)
+		}
+
+		if mode == 0 {
+			mode = 0755
+		}
+		mode |= syscall.S_IFDIR
+
+		now := time.Now()
+		childInodeID := v.allocInode()
+
+		newEntry := DirEntry{
+			Name:    baseName,
+			InodeID: childInodeID,
+			IsDir:   true,
+			Mode:    mode,
+		}
+		parentDir.Entries[baseName] = newEntry
+		parentDir.Added[baseName] = true
+		delete(parentDir.Deleted, baseName)
+		parentDir.IsDirty = true
+		parentInode.ModTime = now
+		parentInode.IsDirty = true
+
+		childInode := &CachedInode{
+			ID:      childInodeID,
+			Mode:    mode,
+			ModTime: now,
+			IsDir:   true,
+			IsDirty: true,
+		}
+		v.inodeCache.Put(childInodeID, childInode)
+
+		childDir := &CachedDir{
+			ID:         childInodeID,
+			Entries:    make(map[string]DirEntry),
+			Added:      make(map[string]bool),
+			Deleted:    make(map[string]bool),
+			PrevOffset: NoOffset,
+			IsDirty:    true,
+		}
+		v.dirCache.Put(childInodeID, childDir)
+
+		rec := &MutationRecord{
+			Type:     MutationMkdir,
+			VolumeId: v.volumeID,
+			Path:     p,
+			Mode:     mode,
+			ModTime:  timestamppb.New(now),
+			Inode:    childInodeID,
+		}
+		waitFn, err := v.logMutationLocked(ctx, rec, nil)
+		if err != nil {
+			delete(parentDir.Entries, baseName)
+			delete(parentDir.Added, baseName)
+			return nil, nil, err
+		}
+
+		attr := &pb.EntryAttr{
+			Inode:   childInodeID,
+			Path:    p,
+			Name:    baseName,
+			IsDir:   true,
+			Size:    0,
+			Mode:    mode,
+			ModTime: timestamppb.New(now),
+		}
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_CREATED,
+			Path:      p,
+			Attr:      attr,
+		})
+
+		v.checkAutoSnapshotTriggerLocked(ctx)
+		return attr, waitFn, nil
+	}()
 	if err != nil {
 		return nil, err
 	}
-	if !parentInode.IsDir {
-		return nil, fmt.Errorf("parent %s is not a directory: %w", parentPath, syscall.ENOTDIR)
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return nil, err
+		}
 	}
-
-	parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, exists := parentDir.Entries[baseName]; exists {
-		return nil, fmt.Errorf("directory %s already exists: %w", p, syscall.EEXIST)
-	}
-
-	if mode == 0 {
-		mode = 0755
-	}
-	mode |= syscall.S_IFDIR
-
-	now := time.Now()
-	childInodeID := v.allocInode()
-
-	newEntry := DirEntry{
-		Name:    baseName,
-		InodeID: childInodeID,
-		IsDir:   true,
-		Mode:    mode,
-	}
-	parentDir.Entries[baseName] = newEntry
-	parentDir.Added[baseName] = true
-	delete(parentDir.Deleted, baseName)
-	parentDir.IsDirty = true
-	parentInode.ModTime = now
-	parentInode.IsDirty = true
-
-	childInode := &CachedInode{
-		ID:      childInodeID,
-		Mode:    mode,
-		ModTime: now,
-		IsDir:   true,
-		IsDirty: true,
-	}
-	v.inodeCache.Put(childInodeID, childInode)
-
-	childDir := &CachedDir{
-		ID:         childInodeID,
-		Entries:    make(map[string]DirEntry),
-		Added:      make(map[string]bool),
-		Deleted:    make(map[string]bool),
-		PrevOffset: NoOffset,
-		IsDirty:    true,
-	}
-	v.dirCache.Put(childInodeID, childDir)
-
-	rec := &MutationRecord{
-		Type:     MutationMkdir,
-		VolumeId: v.volumeID,
-		Path:     p,
-		Mode:     mode,
-		ModTime:  timestamppb.New(now),
-		Inode:    childInodeID,
-	}
-	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
-		delete(parentDir.Entries, baseName)
-		delete(parentDir.Added, baseName)
-		return nil, err
-	}
-
-	attr := &pb.EntryAttr{
-		Inode:   childInodeID,
-		Path:    p,
-		Name:    baseName,
-		IsDir:   true,
-		Size:    0,
-		Mode:    mode,
-		ModTime: timestamppb.New(now),
-	}
-	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-		EventType: pb.WatchEventType_EVENT_CREATED,
-		Path:      p,
-		Attr:      attr,
-	})
-
-	v.checkAutoSnapshotTriggerLocked(ctx)
 	return attr, nil
 }
 
 func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialContent []byte) (*pb.EntryAttr, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
 
-	p = cleanPath(p)
-	if p == "/" {
-		return nil, fmt.Errorf("cannot create file at root: %w", syscall.EISDIR)
-	}
+		p = cleanPath(p)
+		if p == "/" {
+			return nil, nil, fmt.Errorf("cannot create file at root: %w", syscall.EISDIR)
+		}
 
-	parentPath := path.Dir(p)
-	baseName := path.Base(p)
+		parentPath := path.Dir(p)
+		baseName := path.Base(p)
 
-	parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
-	if err != nil {
-		return nil, fmt.Errorf("parent directory not found: %w", err)
-	}
-
-	parentInode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
-	if err != nil {
-		return nil, err
-	}
-	if !parentInode.IsDir {
-		return nil, fmt.Errorf("parent %s is not a directory: %w", parentPath, syscall.ENOTDIR)
-	}
-
-	parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-	if err != nil {
-		return nil, err
-	}
-
-	if mode == 0 {
-		mode = 0644
-	}
-	mode |= syscall.S_IFREG
-
-	now := time.Now()
-	var hashStr string
-	if len(initialContent) > 0 {
-		h := sha256.Sum256(initialContent)
-		hashStr = fmt.Sprintf("%x", h)
-	}
-
-	dataCopy := make([]byte, len(initialContent))
-	copy(dataCopy, initialContent)
-
-	var stream blob.ByteStream
-	if len(dataCopy) > 0 {
-		stream = blob.NewByteStreamFromBytes(dataCopy)
-	}
-
-	entry, exists := parentDir.Entries[baseName]
-	if exists {
-		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
 		if err != nil {
-			return nil, err
+			return nil, nil, fmt.Errorf("parent directory not found: %w", err)
 		}
-		if childInode.IsDir {
-			return nil, fmt.Errorf("cannot overwrite directory with file: %w", syscall.EISDIR)
+
+		parentInode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		if err != nil {
+			return nil, nil, err
 		}
-		if childInode.Data != nil {
-			_ = childInode.Data.Close()
+		if !parentInode.IsDir {
+			return nil, nil, fmt.Errorf("parent %s is not a directory: %w", parentPath, syscall.ENOTDIR)
 		}
-		childInode.Mode = mode
-		childInode.Size = int64(len(dataCopy))
-		childInode.Data = stream
-		childInode.ModTime = now
-		childInode.Sha256 = hashStr
-		childInode.IsDirty = true
+
+		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if mode == 0 {
+			mode = 0644
+		}
+		mode |= syscall.S_IFREG
+
+		now := time.Now()
+		var hashStr string
+		if len(initialContent) > 0 {
+			h := sha256.Sum256(initialContent)
+			hashStr = fmt.Sprintf("%x", h)
+		}
+
+		dataCopy := make([]byte, len(initialContent))
+		copy(dataCopy, initialContent)
+
+		var stream blob.ByteStream
+		if len(dataCopy) > 0 {
+			stream = blob.NewByteStreamFromBytes(dataCopy)
+		}
+
+		entry, exists := parentDir.Entries[baseName]
+		if exists {
+			childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if childInode.IsDir {
+				return nil, nil, fmt.Errorf("cannot overwrite directory with file: %w", syscall.EISDIR)
+			}
+			if childInode.Data != nil {
+				_ = childInode.Data.Close()
+			}
+			childInode.Mode = mode
+			childInode.Size = int64(len(dataCopy))
+			childInode.Data = stream
+			childInode.ModTime = now
+			childInode.Sha256 = hashStr
+			childInode.IsDirty = true
+
+			rec := &MutationRecord{
+				Type:     MutationCreateFile,
+				VolumeId: v.volumeID,
+				Path:     p,
+				Mode:     mode,
+				Size:     int64(len(dataCopy)),
+				ModTime:  timestamppb.New(now),
+				Sha256:   hashStr,
+				Inode:    childInode.ID,
+				Data:     dataCopy,
+			}
+			waitFn, err := v.logMutationLocked(ctx, rec, nil)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			attr := &pb.EntryAttr{
+				Inode:   childInode.ID,
+				Path:    p,
+				Name:    baseName,
+				IsDir:   false,
+				Size:    childInode.Size,
+				Mode:    childInode.Mode,
+				ModTime: timestamppb.New(now),
+				Sha256:  hashStr,
+			}
+			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+				EventType: pb.WatchEventType_EVENT_MODIFIED,
+				Path:      p,
+				Attr:      attr,
+			})
+			v.checkAutoSnapshotTriggerLocked(ctx)
+			return attr, waitFn, nil
+		}
+
+		childInodeID := v.allocInode()
+		newEntry := DirEntry{
+			Name:    baseName,
+			InodeID: childInodeID,
+			IsDir:   false,
+			Mode:    mode,
+		}
+		parentDir.Entries[baseName] = newEntry
+		parentDir.Added[baseName] = true
+		delete(parentDir.Deleted, baseName)
+		parentDir.IsDirty = true
+		parentInode.ModTime = now
+		parentInode.IsDirty = true
+
+		childInode := &CachedInode{
+			ID:      childInodeID,
+			Mode:    mode,
+			Size:    int64(len(dataCopy)),
+			ModTime: now,
+			Data:    stream,
+			Sha256:  hashStr,
+			IsDir:   false,
+			IsDirty: true,
+		}
+		v.inodeCache.Put(childInodeID, childInode)
 
 		rec := &MutationRecord{
 			Type:     MutationCreateFile,
@@ -990,92 +1075,43 @@ func (v *Volume) CreateFile(ctx context.Context, p string, mode uint32, initialC
 			Size:     int64(len(dataCopy)),
 			ModTime:  timestamppb.New(now),
 			Sha256:   hashStr,
-			Inode:    childInode.ID,
+			Inode:    childInodeID,
 			Data:     dataCopy,
 		}
-		if err := v.logMutationLocked(ctx, rec, nil); err != nil {
-			return nil, err
+		waitFn, err := v.logMutationLocked(ctx, rec, nil)
+		if err != nil {
+			delete(parentDir.Entries, baseName)
+			delete(parentDir.Added, baseName)
+			return nil, nil, err
 		}
 
 		attr := &pb.EntryAttr{
-			Inode:   childInode.ID,
+			Inode:   childInodeID,
 			Path:    p,
 			Name:    baseName,
 			IsDir:   false,
-			Size:    childInode.Size,
-			Mode:    childInode.Mode,
+			Size:    int64(len(dataCopy)),
+			Mode:    mode,
 			ModTime: timestamppb.New(now),
 			Sha256:  hashStr,
 		}
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-			EventType: pb.WatchEventType_EVENT_MODIFIED,
+			EventType: pb.WatchEventType_EVENT_CREATED,
 			Path:      p,
 			Attr:      attr,
 		})
+
 		v.checkAutoSnapshotTriggerLocked(ctx)
-		return attr, nil
-	}
-
-	childInodeID := v.allocInode()
-	newEntry := DirEntry{
-		Name:    baseName,
-		InodeID: childInodeID,
-		IsDir:   false,
-		Mode:    mode,
-	}
-	parentDir.Entries[baseName] = newEntry
-	parentDir.Added[baseName] = true
-	delete(parentDir.Deleted, baseName)
-	parentDir.IsDirty = true
-	parentInode.ModTime = now
-	parentInode.IsDirty = true
-
-	childInode := &CachedInode{
-		ID:      childInodeID,
-		Mode:    mode,
-		Size:    int64(len(dataCopy)),
-		ModTime: now,
-		Data:    stream,
-		Sha256:  hashStr,
-		IsDir:   false,
-		IsDirty: true,
-	}
-	v.inodeCache.Put(childInodeID, childInode)
-
-	rec := &MutationRecord{
-		Type:     MutationCreateFile,
-		VolumeId: v.volumeID,
-		Path:     p,
-		Mode:     mode,
-		Size:     int64(len(dataCopy)),
-		ModTime:  timestamppb.New(now),
-		Sha256:   hashStr,
-		Inode:    childInodeID,
-		Data:     dataCopy,
-	}
-	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
-		delete(parentDir.Entries, baseName)
-		delete(parentDir.Added, baseName)
+		return attr, waitFn, nil
+	}()
+	if err != nil {
 		return nil, err
 	}
-
-	attr := &pb.EntryAttr{
-		Inode:   childInodeID,
-		Path:    p,
-		Name:    baseName,
-		IsDir:   false,
-		Size:    int64(len(dataCopy)),
-		Mode:    mode,
-		ModTime: timestamppb.New(now),
-		Sha256:  hashStr,
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return nil, err
+		}
 	}
-	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-		EventType: pb.WatchEventType_EVENT_CREATED,
-		Path:      p,
-		Attr:      attr,
-	})
-
-	v.checkAutoSnapshotTriggerLocked(ctx)
 	return attr, nil
 }
 
@@ -1143,443 +1179,503 @@ func (v *Volume) ReadFile(ctx context.Context, p string, offset, length int64) (
 }
 
 func (v *Volume) WriteFile(ctx context.Context, p string, offset int64, data []byte, writeMode pb.WriteMode) (int64, int64, time.Time, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	nWritten, newSize, modTime, waitFn, err := func() (int64, int64, time.Time, func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
 
-	p = cleanPath(p)
-	inodeID, _, baseName, err := v.resolvePathLocked(ctx, p)
-	if err != nil {
-		return 0, 0, time.Time{}, err
-	}
+		p = cleanPath(p)
+		inodeID, _, baseName, err := v.resolvePathLocked(ctx, p)
+		if err != nil {
+			return 0, 0, time.Time{}, nil, err
+		}
 
-	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
-	if err != nil {
-		return 0, 0, time.Time{}, err
-	}
+		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+		if err != nil {
+			return 0, 0, time.Time{}, nil, err
+		}
 
-	if node.IsDir {
-		return 0, 0, time.Time{}, fmt.Errorf("cannot write to directory: %w", syscall.EISDIR)
-	}
+		if node.IsDir {
+			return 0, 0, time.Time{}, nil, fmt.Errorf("cannot write to directory: %w", syscall.EISDIR)
+		}
 
-	var currentData []byte
-	if node.Data != nil {
-		_ = node.Data.Rewind()
-		currentData, _ = io.ReadAll(node.Data)
-		_ = node.Data.Close()
-	}
+		var currentData []byte
+		if node.Data != nil {
+			_ = node.Data.Rewind()
+			currentData, _ = io.ReadAll(node.Data)
+			_ = node.Data.Close()
+		}
 
-	neededLen := offset + int64(len(data))
-	if neededLen > int64(len(currentData)) {
-		newBuf := make([]byte, neededLen)
-		copy(newBuf, currentData)
-		currentData = newBuf
-	}
-	copy(currentData[offset:], data)
-	node.Size = int64(len(currentData))
-	now := time.Now()
-	node.ModTime = now
-	node.IsDirty = true
+		neededLen := offset + int64(len(data))
+		if neededLen > int64(len(currentData)) {
+			newBuf := make([]byte, neededLen)
+			copy(newBuf, currentData)
+			currentData = newBuf
+		}
+		copy(currentData[offset:], data)
+		node.Size = int64(len(currentData))
+		now := time.Now()
+		node.ModTime = now
+		node.IsDirty = true
 
-	h := sha256.Sum256(currentData)
-	node.Sha256 = fmt.Sprintf("%x", h)
+		h := sha256.Sum256(currentData)
+		node.Sha256 = fmt.Sprintf("%x", h)
 
-	if node.Size <= blob.MemoryThreshold {
-		node.Data = blob.NewByteStreamFromBytes(currentData)
-	} else {
-		tf, err := os.CreateTemp("", "objectfs-node-*")
-		if err == nil {
-			_, _ = tf.Write(currentData)
-			_, _ = tf.Seek(0, io.SeekStart)
-			node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
-		} else {
+		if node.Size <= blob.MemoryThreshold {
 			node.Data = blob.NewByteStreamFromBytes(currentData)
+		} else {
+			tf, err := os.CreateTemp("", "objectfs-node-*")
+			if err == nil {
+				_, _ = tf.Write(currentData)
+				_, _ = tf.Seek(0, io.SeekStart)
+				node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
+			} else {
+				node.Data = blob.NewByteStreamFromBytes(currentData)
+			}
+		}
+
+		var reqLevel *walclient.Level
+		switch writeMode {
+		case pb.WriteMode_WRITE_THROUGH_FSYNC:
+			l := walclient.Permanent
+			reqLevel = &l
+		case pb.WriteMode_EAGER_REPLICATION:
+			l := walclient.Witness
+			reqLevel = &l
+		case pb.WriteMode_LAZY_WRITE:
+			l := walclient.Local
+			reqLevel = &l
+		}
+
+		rec := &MutationRecord{
+			Type:     MutationWriteFile,
+			VolumeId: v.volumeID,
+			Path:     p,
+			Offset:   offset,
+			Size:     node.Size,
+			ModTime:  timestamppb.New(now),
+			Sha256:   node.Sha256,
+			Data:     data,
+		}
+		waitFn, err := v.logMutationLocked(ctx, rec, reqLevel)
+		if err != nil {
+			return 0, 0, time.Time{}, nil, err
+		}
+
+		attr := &pb.EntryAttr{
+			Inode:   node.ID,
+			Path:    p,
+			Name:    baseName,
+			IsDir:   false,
+			Size:    node.Size,
+			Mode:    node.Mode,
+			ModTime: timestamppb.New(now),
+			Sha256:  node.Sha256,
+		}
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_MODIFIED,
+			Path:      p,
+			Attr:      attr,
+		})
+
+		v.checkAutoSnapshotTriggerLocked(ctx)
+		return int64(len(data)), node.Size, now, waitFn, nil
+	}()
+	if err != nil {
+		return 0, 0, time.Time{}, err
+	}
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return 0, 0, time.Time{}, err
 		}
 	}
-
-	var reqLevel *walclient.Level
-	switch writeMode {
-	case pb.WriteMode_WRITE_THROUGH_FSYNC:
-		l := walclient.Permanent
-		reqLevel = &l
-	case pb.WriteMode_EAGER_REPLICATION:
-		l := walclient.Witness
-		reqLevel = &l
-	case pb.WriteMode_LAZY_WRITE:
-		l := walclient.Local
-		reqLevel = &l
-	}
-
-	rec := &MutationRecord{
-		Type:     MutationWriteFile,
-		VolumeId: v.volumeID,
-		Path:     p,
-		Offset:   offset,
-		Size:     node.Size,
-		ModTime:  timestamppb.New(now),
-		Sha256:   node.Sha256,
-		Data:     data,
-	}
-	if err := v.logMutationLocked(ctx, rec, reqLevel); err != nil {
-		return 0, 0, time.Time{}, err
-	}
-
-	attr := &pb.EntryAttr{
-		Inode:   node.ID,
-		Path:    p,
-		Name:    baseName,
-		IsDir:   false,
-		Size:    node.Size,
-		Mode:    node.Mode,
-		ModTime: timestamppb.New(now),
-		Sha256:  node.Sha256,
-	}
-	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-		EventType: pb.WatchEventType_EVENT_MODIFIED,
-		Path:      p,
-		Attr:      attr,
-	})
-
-	v.checkAutoSnapshotTriggerLocked(ctx)
-	return int64(len(data)), node.Size, now, nil
+	return nWritten, newSize, modTime, nil
 }
 
 func (v *Volume) TruncateFile(ctx context.Context, p string, size int64) (*pb.EntryAttr, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
 
-	p = cleanPath(p)
-	inodeID, _, baseName, err := v.resolvePathLocked(ctx, p)
-	if err != nil {
-		return nil, err
-	}
+		p = cleanPath(p)
+		inodeID, _, baseName, err := v.resolvePathLocked(ctx, p)
+		if err != nil {
+			return nil, nil, err
+		}
 
-	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
-	if err != nil {
-		return nil, err
-	}
+		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+		if err != nil {
+			return nil, nil, err
+		}
 
-	if node.IsDir {
-		return nil, fmt.Errorf("cannot truncate directory: %w", syscall.EISDIR)
-	}
+		if node.IsDir {
+			return nil, nil, fmt.Errorf("cannot truncate directory: %w", syscall.EISDIR)
+		}
 
-	if size < 0 {
-		return nil, fmt.Errorf("invalid size %d: %w", size, syscall.EINVAL)
-	}
+		if size < 0 {
+			return nil, nil, fmt.Errorf("invalid size %d: %w", size, syscall.EINVAL)
+		}
 
-	var currentData []byte
-	if node.Data != nil {
-		_ = node.Data.Rewind()
-		currentData, _ = io.ReadAll(node.Data)
-		_ = node.Data.Close()
-	}
+		var currentData []byte
+		if node.Data != nil {
+			_ = node.Data.Rewind()
+			currentData, _ = io.ReadAll(node.Data)
+			_ = node.Data.Close()
+		}
 
-	if size < int64(len(currentData)) {
-		currentData = currentData[:size]
-	} else if size > int64(len(currentData)) {
-		newBuf := make([]byte, size)
-		copy(newBuf, currentData)
-		currentData = newBuf
-	}
-	node.Size = size
-	now := time.Now()
-	node.ModTime = now
-	node.IsDirty = true
-	h := sha256.Sum256(currentData)
-	node.Sha256 = fmt.Sprintf("%x", h)
+		if size < int64(len(currentData)) {
+			currentData = currentData[:size]
+		} else if size > int64(len(currentData)) {
+			newBuf := make([]byte, size)
+			copy(newBuf, currentData)
+			currentData = newBuf
+		}
+		node.Size = size
+		now := time.Now()
+		node.ModTime = now
+		node.IsDirty = true
+		h := sha256.Sum256(currentData)
+		node.Sha256 = fmt.Sprintf("%x", h)
 
-	if node.Size <= blob.MemoryThreshold {
-		node.Data = blob.NewByteStreamFromBytes(currentData)
-	} else {
-		tf, err := os.CreateTemp("", "objectfs-node-*")
-		if err == nil {
-			_, _ = tf.Write(currentData)
-			_, _ = tf.Seek(0, io.SeekStart)
-			node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
-		} else {
+		if node.Size <= blob.MemoryThreshold {
 			node.Data = blob.NewByteStreamFromBytes(currentData)
+		} else {
+			tf, err := os.CreateTemp("", "objectfs-node-*")
+			if err == nil {
+				_, _ = tf.Write(currentData)
+				_, _ = tf.Seek(0, io.SeekStart)
+				node.Data = blob.NewByteStreamFromFile(tf, int64(len(currentData)), true)
+			} else {
+				node.Data = blob.NewByteStreamFromBytes(currentData)
+			}
+		}
+
+		rec := &MutationRecord{
+			Type:     MutationTruncateFile,
+			VolumeId: v.volumeID,
+			Path:     p,
+			Size:     size,
+			ModTime:  timestamppb.New(now),
+			Sha256:   node.Sha256,
+		}
+		waitFn, err := v.logMutationLocked(ctx, rec, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		attr := &pb.EntryAttr{
+			Inode:   node.ID,
+			Path:    p,
+			Name:    baseName,
+			IsDir:   false,
+			Size:    node.Size,
+			Mode:    node.Mode,
+			ModTime: timestamppb.New(now),
+			Sha256:  node.Sha256,
+		}
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_MODIFIED,
+			Path:      p,
+			Attr:      attr,
+		})
+		v.checkAutoSnapshotTriggerLocked(ctx)
+		return attr, waitFn, nil
+	}()
+	if err != nil {
+		return nil, err
+	}
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return nil, err
 		}
 	}
-
-	rec := &MutationRecord{
-		Type:     MutationTruncateFile,
-		VolumeId: v.volumeID,
-		Path:     p,
-		Size:     size,
-		ModTime:  timestamppb.New(now),
-		Sha256:   node.Sha256,
-	}
-	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
-		return nil, err
-	}
-
-	attr := &pb.EntryAttr{
-		Inode:   node.ID,
-		Path:    p,
-		Name:    baseName,
-		IsDir:   false,
-		Size:    node.Size,
-		Mode:    node.Mode,
-		ModTime: timestamppb.New(now),
-		Sha256:  node.Sha256,
-	}
-	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-		EventType: pb.WatchEventType_EVENT_MODIFIED,
-		Path:      p,
-		Attr:      attr,
-	})
-	v.checkAutoSnapshotTriggerLocked(ctx)
 	return attr, nil
 }
 
 func (v *Volume) Unlink(ctx context.Context, p string) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	waitFn, err := func() (func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
 
-	p = cleanPath(p)
-	if p == "/" {
-		return fmt.Errorf("cannot unlink root: %w", syscall.EBUSY)
-	}
+		p = cleanPath(p)
+		if p == "/" {
+			return nil, fmt.Errorf("cannot unlink root: %w", syscall.EBUSY)
+		}
 
-	parentPath := path.Dir(p)
-	baseName := path.Base(p)
+		parentPath := path.Dir(p)
+		baseName := path.Base(p)
 
-	parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
+		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
+		if err != nil {
+			return nil, err
+		}
+
+		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
+		if err != nil {
+			return nil, err
+		}
+
+		entry, ok := parentDir.Entries[baseName]
+		if !ok {
+			return nil, fmt.Errorf("file %s not found: %w", p, syscall.ENOENT)
+		}
+
+		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+		if err != nil {
+			return nil, err
+		}
+		if childInode.IsDir {
+			return nil, fmt.Errorf("cannot unlink directory %s: %w", p, syscall.EISDIR)
+		}
+
+		if childInode.Data != nil {
+			_ = childInode.Data.Close()
+		}
+
+		delete(parentDir.Entries, baseName)
+		delete(parentDir.Added, baseName)
+		parentDir.Deleted[baseName] = true
+		parentDir.IsDirty = true
+
+		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		if parentInode != nil {
+			parentInode.ModTime = time.Now()
+			parentInode.IsDirty = true
+		}
+
+		v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, p)
+
+		rec := &MutationRecord{
+			Type:     MutationUnlink,
+			VolumeId: v.volumeID,
+			Path:     p,
+		}
+		waitFn, err := v.logMutationLocked(ctx, rec, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_DELETED,
+			Path:      p,
+		})
+
+		v.checkAutoSnapshotTriggerLocked(ctx)
+		return waitFn, nil
+	}()
 	if err != nil {
 		return err
 	}
-
-	parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-	if err != nil {
-		return err
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return err
+		}
 	}
-
-	entry, ok := parentDir.Entries[baseName]
-	if !ok {
-		return fmt.Errorf("file %s not found: %w", p, syscall.ENOENT)
-	}
-
-	childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
-	if err != nil {
-		return err
-	}
-	if childInode.IsDir {
-		return fmt.Errorf("cannot unlink directory %s: %w", p, syscall.EISDIR)
-	}
-
-	if childInode.Data != nil {
-		_ = childInode.Data.Close()
-	}
-
-	delete(parentDir.Entries, baseName)
-	delete(parentDir.Added, baseName)
-	parentDir.Deleted[baseName] = true
-	parentDir.IsDirty = true
-
-	parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
-	if parentInode != nil {
-		parentInode.ModTime = time.Now()
-		parentInode.IsDirty = true
-	}
-
-	v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, p)
-
-	rec := &MutationRecord{
-		Type:     MutationUnlink,
-		VolumeId: v.volumeID,
-		Path:     p,
-	}
-	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
-		return err
-	}
-
-	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-		EventType: pb.WatchEventType_EVENT_DELETED,
-		Path:      p,
-	})
-
-	v.checkAutoSnapshotTriggerLocked(ctx)
 	return nil
 }
 
 func (v *Volume) Rmdir(ctx context.Context, p string) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	waitFn, err := func() (func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
 
-	p = cleanPath(p)
-	if p == "/" {
-		return fmt.Errorf("cannot rmdir root: %w", syscall.EBUSY)
-	}
+		p = cleanPath(p)
+		if p == "/" {
+			return nil, fmt.Errorf("cannot rmdir root: %w", syscall.EBUSY)
+		}
 
-	parentPath := path.Dir(p)
-	baseName := path.Base(p)
+		parentPath := path.Dir(p)
+		baseName := path.Base(p)
 
-	parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
+		parentInodeID, _, _, err := v.resolvePathLocked(ctx, parentPath)
+		if err != nil {
+			return nil, err
+		}
+
+		parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
+		if err != nil {
+			return nil, err
+		}
+
+		entry, ok := parentDir.Entries[baseName]
+		if !ok {
+			return nil, fmt.Errorf("directory %s not found: %w", p, syscall.ENOENT)
+		}
+
+		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+		if err != nil {
+			return nil, err
+		}
+		if !childInode.IsDir {
+			return nil, fmt.Errorf("cannot rmdir non-directory %s: %w", p, syscall.ENOTDIR)
+		}
+
+		childDir, err := v.getOrLoadDirLocked(ctx, entry.InodeID)
+		if err != nil {
+			return nil, err
+		}
+		if len(childDir.Entries) > 0 {
+			return nil, fmt.Errorf("directory %s not empty: %w", p, syscall.ENOTEMPTY)
+		}
+
+		delete(parentDir.Entries, baseName)
+		delete(parentDir.Added, baseName)
+		parentDir.Deleted[baseName] = true
+		parentDir.IsDirty = true
+
+		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		if parentInode != nil {
+			parentInode.ModTime = time.Now()
+			parentInode.IsDirty = true
+		}
+
+		rec := &MutationRecord{
+			Type:     MutationRmdir,
+			VolumeId: v.volumeID,
+			Path:     p,
+		}
+		waitFn, err := v.logMutationLocked(ctx, rec, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_DELETED,
+			Path:      p,
+		})
+
+		v.checkAutoSnapshotTriggerLocked(ctx)
+		return waitFn, nil
+	}()
 	if err != nil {
 		return err
 	}
-
-	parentDir, err := v.getOrLoadDirLocked(ctx, parentInodeID)
-	if err != nil {
-		return err
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return err
+		}
 	}
-
-	entry, ok := parentDir.Entries[baseName]
-	if !ok {
-		return fmt.Errorf("directory %s not found: %w", p, syscall.ENOENT)
-	}
-
-	childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
-	if err != nil {
-		return err
-	}
-	if !childInode.IsDir {
-		return fmt.Errorf("cannot rmdir non-directory %s: %w", p, syscall.ENOTDIR)
-	}
-
-	childDir, err := v.getOrLoadDirLocked(ctx, entry.InodeID)
-	if err != nil {
-		return err
-	}
-	if len(childDir.Entries) > 0 {
-		return fmt.Errorf("directory %s not empty: %w", p, syscall.ENOTEMPTY)
-	}
-
-	delete(parentDir.Entries, baseName)
-	delete(parentDir.Added, baseName)
-	parentDir.Deleted[baseName] = true
-	parentDir.IsDirty = true
-
-	parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
-	if parentInode != nil {
-		parentInode.ModTime = time.Now()
-		parentInode.IsDirty = true
-	}
-
-	rec := &MutationRecord{
-		Type:     MutationRmdir,
-		VolumeId: v.volumeID,
-		Path:     p,
-	}
-	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
-		return err
-	}
-
-	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-		EventType: pb.WatchEventType_EVENT_DELETED,
-		Path:      p,
-	})
-
-	v.checkAutoSnapshotTriggerLocked(ctx)
 	return nil
 }
 
 func (v *Volume) Rename(ctx context.Context, oldPath, newPath string) (*pb.EntryAttr, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
 
-	oldPath = cleanPath(oldPath)
-	newPath = cleanPath(newPath)
+		oldPath = cleanPath(oldPath)
+		newPath = cleanPath(newPath)
 
-	if oldPath == "/" || newPath == "/" {
-		return nil, fmt.Errorf("cannot rename root: %w", syscall.EBUSY)
-	}
+		if oldPath == "/" || newPath == "/" {
+			return nil, nil, fmt.Errorf("cannot rename root: %w", syscall.EBUSY)
+		}
 
-	oldParentPath := path.Dir(oldPath)
-	oldBaseName := path.Base(oldPath)
-	newParentPath := path.Dir(newPath)
-	newBaseName := path.Base(newPath)
+		oldParentPath := path.Dir(oldPath)
+		oldBaseName := path.Base(oldPath)
+		newParentPath := path.Dir(newPath)
+		newBaseName := path.Base(newPath)
 
-	oldParentInodeID, _, _, err := v.resolvePathLocked(ctx, oldParentPath)
-	if err != nil {
-		return nil, fmt.Errorf("old parent not found: %w", err)
-	}
+		oldParentInodeID, _, _, err := v.resolvePathLocked(ctx, oldParentPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("old parent not found: %w", err)
+		}
 
-	oldParentDir, err := v.getOrLoadDirLocked(ctx, oldParentInodeID)
-	if err != nil {
-		return nil, fmt.Errorf("old parent directory not loaded: %w", err)
-	}
+		oldParentDir, err := v.getOrLoadDirLocked(ctx, oldParentInodeID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("old parent directory not loaded: %w", err)
+		}
 
-	entry, ok := oldParentDir.Entries[oldBaseName]
-	if !ok {
-		return nil, fmt.Errorf("source %s not found: %w", oldPath, syscall.ENOENT)
-	}
+		entry, ok := oldParentDir.Entries[oldBaseName]
+		if !ok {
+			return nil, nil, fmt.Errorf("source %s not found: %w", oldPath, syscall.ENOENT)
+		}
 
-	newParentInodeID, _, _, err := v.resolvePathLocked(ctx, newParentPath)
-	if err != nil {
-		return nil, fmt.Errorf("new parent not found: %w", err)
-	}
+		newParentInodeID, _, _, err := v.resolvePathLocked(ctx, newParentPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("new parent not found: %w", err)
+		}
 
-	newParentInode, err := v.getOrLoadInodeLocked(ctx, newParentInodeID)
+		newParentInode, err := v.getOrLoadInodeLocked(ctx, newParentInodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !newParentInode.IsDir {
+			return nil, nil, fmt.Errorf("target parent %s is not a directory: %w", newParentPath, syscall.ENOTDIR)
+		}
+
+		newParentDir, err := v.getOrLoadDirLocked(ctx, newParentInodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// Move entry
+		delete(oldParentDir.Entries, oldBaseName)
+		delete(oldParentDir.Added, oldBaseName)
+		oldParentDir.Deleted[oldBaseName] = true
+		oldParentDir.IsDirty = true
+
+		entry.Name = newBaseName
+		newParentDir.Entries[newBaseName] = entry
+		newParentDir.Added[newBaseName] = true
+		delete(newParentDir.Deleted, newBaseName)
+		newParentDir.IsDirty = true
+
+		now := time.Now()
+		childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
+		if err == nil {
+			childInode.ModTime = now
+			childInode.IsDirty = true
+		}
+
+		oldParentInode, _ := v.getOrLoadInodeLocked(ctx, oldParentInodeID)
+		if oldParentInode != nil {
+			oldParentInode.ModTime = now
+			oldParentInode.IsDirty = true
+		}
+		newParentInode.ModTime = now
+		newParentInode.IsDirty = true
+
+		v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, oldPath)
+
+		rec := &MutationRecord{
+			Type:     MutationRename,
+			VolumeId: v.volumeID,
+			Path:     newPath,
+			OldPath:  oldPath,
+			ModTime:  timestamppb.New(now),
+		}
+		waitFn, err := v.logMutationLocked(ctx, rec, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		attr := &pb.EntryAttr{
+			Inode:   entry.InodeID,
+			Path:    newPath,
+			Name:    newBaseName,
+			IsDir:   entry.IsDir,
+			Size:    childInode.Size,
+			Mode:    childInode.Mode,
+			ModTime: timestamppb.New(now),
+			Sha256:  childInode.Sha256,
+		}
+		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
+			EventType: pb.WatchEventType_EVENT_RENAMED,
+			Path:      newPath,
+			OldPath:   oldPath,
+			Attr:      attr,
+		})
+
+		v.checkAutoSnapshotTriggerLocked(ctx)
+		return attr, waitFn, nil
+	}()
 	if err != nil {
 		return nil, err
 	}
-	if !newParentInode.IsDir {
-		return nil, fmt.Errorf("target parent %s is not a directory: %w", newParentPath, syscall.ENOTDIR)
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return nil, err
+		}
 	}
-
-	newParentDir, err := v.getOrLoadDirLocked(ctx, newParentInodeID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Move entry
-	delete(oldParentDir.Entries, oldBaseName)
-	delete(oldParentDir.Added, oldBaseName)
-	oldParentDir.Deleted[oldBaseName] = true
-	oldParentDir.IsDirty = true
-
-	entry.Name = newBaseName
-	newParentDir.Entries[newBaseName] = entry
-	newParentDir.Added[newBaseName] = true
-	delete(newParentDir.Deleted, newBaseName)
-	newParentDir.IsDirty = true
-
-	now := time.Now()
-	childInode, err := v.getOrLoadInodeLocked(ctx, entry.InodeID)
-	if err == nil {
-		childInode.ModTime = now
-		childInode.IsDirty = true
-	}
-
-	oldParentInode, _ := v.getOrLoadInodeLocked(ctx, oldParentInodeID)
-	if oldParentInode != nil {
-		oldParentInode.ModTime = now
-		oldParentInode.IsDirty = true
-	}
-	newParentInode.ModTime = now
-	newParentInode.IsDirty = true
-
-	v.deletedPathsSinceFlush = append(v.deletedPathsSinceFlush, oldPath)
-
-	rec := &MutationRecord{
-		Type:     MutationRename,
-		VolumeId: v.volumeID,
-		Path:     newPath,
-		OldPath:  oldPath,
-		ModTime:  timestamppb.New(now),
-	}
-	if err := v.logMutationLocked(ctx, rec, nil); err != nil {
-		return nil, err
-	}
-
-	attr := &pb.EntryAttr{
-		Inode:   entry.InodeID,
-		Path:    newPath,
-		Name:    newBaseName,
-		IsDir:   entry.IsDir,
-		Size:    childInode.Size,
-		Mode:    childInode.Mode,
-		ModTime: timestamppb.New(now),
-		Sha256:  childInode.Sha256,
-	}
-	v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
-		EventType: pb.WatchEventType_EVENT_RENAMED,
-		Path:      newPath,
-		OldPath:   oldPath,
-		Attr:      attr,
-	})
-
-	v.checkAutoSnapshotTriggerLocked(ctx)
 	return attr, nil
 }
 

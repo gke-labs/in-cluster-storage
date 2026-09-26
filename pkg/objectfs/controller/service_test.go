@@ -22,12 +22,14 @@ import (
 	"encoding/json"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
@@ -1531,4 +1533,420 @@ func TestApplyRecordDirect(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected /a/b/c to be deleted")
 	}
+}
+
+type fakeBlockingStream struct {
+	appendCalled chan struct{}
+	waitCalled   chan struct{}
+	waitGate     chan struct{}
+	localSeq     atomic.Uint64
+}
+
+func (s *fakeBlockingStream) Append(ctx context.Context, payload []byte) (uint64, error) {
+	seq := s.localSeq.Add(1)
+	select {
+	case s.appendCalled <- struct{}{}:
+	default:
+	}
+	return seq, nil
+}
+
+func (s *fakeBlockingStream) Wait(ctx context.Context, seq uint64, level walclient.Level, requestFlush bool) error {
+	select {
+	case s.waitCalled <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.waitGate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *fakeBlockingStream) Flush(ctx context.Context) error {
+	return nil
+}
+
+func (s *fakeBlockingStream) Watermarks() (local, witness, permanent uint64) {
+	return s.localSeq.Load(), 0, 0
+}
+
+func (s *fakeBlockingStream) RecoveredRecords() []*wal.ClientRecord {
+	return nil
+}
+
+func (s *fakeBlockingStream) Close() error {
+	return nil
+}
+
+func TestStreamsDurabilityConcurrency(t *testing.T) {
+	ctx := t.Context()
+	fakeStream := &fakeBlockingStream{
+		appendCalled: make(chan struct{}, 10),
+		waitCalled:   make(chan struct{}, 10),
+		waitGate:     make(chan struct{}),
+	}
+
+	backend := NewMemoryBackend()
+	server := NewServer(backend,
+		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
+			return fakeStream, nil
+		}),
+		WithServerDurability(walclient.Witness),
+	)
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-concurrency-vol"
+
+	// 1. Concurrently start CreateFile which blocks on fakeStream.Wait
+	type createResult struct {
+		resp *pb.CreateFileResponse
+		err  error
+	}
+	createCh := make(chan createResult, 1)
+
+	go func() {
+		resp, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:       volumeID,
+			Path:           "/blocking_file.txt",
+			Mode:           0644,
+			InitialContent: []byte("initial-data"),
+		})
+		createCh <- createResult{resp: resp, err: err}
+	}()
+
+	// Wait until CreateFile enters fakeStream.Wait (outside v.mu)
+	select {
+	case <-fakeStream.waitCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for CreateFile to enter stream.Wait")
+	}
+
+	// While CreateFile is still blocked in Wait, ensure GetAttr, Lookup, and ReadFile complete promptly
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+
+		// Root GetAttr
+		rootAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
+			VolumeId: volumeID,
+			Path:     "/",
+		})
+		if err != nil || !rootAttr.Attr.IsDir {
+			t.Errorf("GetAttr root failed while write is waiting for durability: %v", err)
+			return
+		}
+
+		// Lookup the new file (in-memory state is already updated)
+		lookupResp, err := server.Lookup(ctx, &pb.LookupRequest{
+			VolumeId:   volumeID,
+			ParentPath: "/",
+			Name:       "blocking_file.txt",
+		})
+		if err != nil || lookupResp.Attr.Name != "blocking_file.txt" {
+			t.Errorf("Lookup new file failed while write is waiting for durability: %v", err)
+			return
+		}
+
+		// GetAttr on the new file
+		fileAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
+			VolumeId: volumeID,
+			Path:     "/blocking_file.txt",
+		})
+		if err != nil || fileAttr.Attr.Size != int64(len("initial-data")) {
+			t.Errorf("GetAttr new file failed while write is waiting for durability: %v", err)
+			return
+		}
+
+		// ReadFile on the new file
+		readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+			VolumeId: volumeID,
+			Path:     "/blocking_file.txt",
+			Offset:   0,
+			Size:     1024,
+		})
+		if err != nil || string(readResp.Data) != "initial-data" {
+			t.Errorf("ReadFile failed while write is waiting for durability: %v", err)
+			return
+		}
+	}()
+
+	select {
+	case <-readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Concurrent reads stalled while writer waited for WAL durability")
+	}
+
+	// Unblock the stream and ensure CreateFile completes successfully
+	close(fakeStream.waitGate)
+	select {
+	case res := <-createCh:
+		if res.err != nil {
+			t.Fatalf("CreateFile failed: %v", res.err)
+		}
+		if res.resp.Attr.Name != "blocking_file.txt" {
+			t.Fatalf("Unexpected CreateFile attr: %v", res.resp.Attr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timed out waiting for CreateFile to return after unblocking stream")
+	}
+
+	// 2. Test wait failure semantics: context cancellation during Wait returns error to caller,
+	// but in-memory mutation remains visible.
+	fakeStream2 := &fakeBlockingStream{
+		appendCalled: make(chan struct{}, 10),
+		waitCalled:   make(chan struct{}, 10),
+		waitGate:     make(chan struct{}),
+	}
+	server2 := NewServer(backend,
+		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
+			return fakeStream2, nil
+		}),
+		WithServerDurability(walclient.Witness),
+	)
+	defer func() { _ = server2.Close() }()
+
+	vol2 := "test-wait-fail-vol"
+	writeCtx, cancelWrite := context.WithCancel(ctx)
+
+	writeCh := make(chan error, 1)
+	go func() {
+		_, err := server2.CreateFile(writeCtx, &pb.CreateFileRequest{
+			VolumeId:       vol2,
+			Path:           "/fail_durability.txt",
+			Mode:           0644,
+			InitialContent: []byte("persisted-in-mem"),
+		})
+		writeCh <- err
+	}()
+
+	select {
+	case <-fakeStream2.waitCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for CreateFile on server2 to enter stream.Wait")
+	}
+
+	// Cancel context during wait
+	cancelWrite()
+
+	select {
+	case err := <-writeCh:
+		if err == nil {
+			t.Fatalf("Expected CreateFile to fail on canceled context, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timed out waiting for CreateFile to fail on canceled context")
+	}
+
+	// Verify in-memory state is still visible (not rolled back)
+	attr, err := server2.GetAttr(ctx, &pb.GetAttrRequest{
+		VolumeId: vol2,
+		Path:     "/fail_durability.txt",
+	})
+	if err != nil || attr.Attr.Name != "fail_durability.txt" {
+		t.Fatalf("Expected in-memory state to remain intact after durability wait failure: %v", err)
+	}
+}
+
+func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
+	ctx := t.Context()
+	fakeStream := &fakeBlockingStream{
+		appendCalled: make(chan struct{}, 10),
+		waitCalled:   make(chan struct{}, 10),
+		waitGate:     make(chan struct{}),
+	}
+
+	backend := NewMemoryBackend()
+	server := NewServer(backend,
+		WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
+			return fakeStream, nil
+		}),
+		WithServerDurability(walclient.Witness),
+	)
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-all-mutations-vol"
+
+	// Helper to run a mutation while checking that concurrent reads succeed
+	runMutationTest := func(name string, mutate func(), checkReads func()) {
+		// New waitGate for this mutation
+		fakeStream.waitGate = make(chan struct{})
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			mutate()
+		}()
+
+		select {
+		case <-fakeStream.waitCalled:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("[%s] Timed out waiting for mutation to enter stream.Wait", name)
+		}
+
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			checkReads()
+		}()
+
+		select {
+		case <-readDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("[%s] Concurrent reads stalled while waiting for durability", name)
+		}
+
+		close(fakeStream.waitGate)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("[%s] Mutation did not complete after unblocking wait", name)
+		}
+	}
+
+	// 1. CreateFile
+	runMutationTest("CreateFile", func() {
+		_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:       volumeID,
+			Path:           "/test_file.txt",
+			Mode:           0644,
+			InitialContent: []byte("initial"),
+		})
+		if err != nil {
+			t.Errorf("CreateFile failed: %v", err)
+		}
+	}, func() {
+		attr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
+			VolumeId: volumeID,
+			Path:     "/test_file.txt",
+		})
+		if err != nil || attr.Attr.Size != 7 {
+			t.Errorf("GetAttr during CreateFile failed: %v", err)
+		}
+	})
+
+	// 2. WriteFile
+	runMutationTest("WriteFile", func() {
+		_, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId:  volumeID,
+			Path:      "/test_file.txt",
+			Offset:    7,
+			Data:      []byte("-appended"),
+			WriteMode: pb.WriteMode_WRITE_THROUGH_FSYNC,
+		})
+		if err != nil {
+			t.Errorf("WriteFile failed: %v", err)
+		}
+	}, func() {
+		resp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+			VolumeId: volumeID,
+			Path:     "/test_file.txt",
+			Offset:   0,
+			Size:     1024,
+		})
+		if err != nil || string(resp.Data) != "initial-appended" {
+			t.Errorf("ReadFile during WriteFile durability wait failed: %v, data=%q", err, string(resp.Data))
+		}
+	})
+
+	// 3. Mkdir
+	runMutationTest("Mkdir", func() {
+		_, err := server.Mkdir(ctx, &pb.MkdirRequest{
+			VolumeId: volumeID,
+			Path:     "/newdir",
+			Mode:     0755,
+		})
+		if err != nil {
+			t.Errorf("Mkdir failed: %v", err)
+		}
+	}, func() {
+		dirAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
+			VolumeId: volumeID,
+			Path:     "/newdir",
+		})
+		if err != nil || !dirAttr.Attr.IsDir {
+			t.Errorf("GetAttr during Mkdir durability wait failed: %v", err)
+		}
+	})
+
+	// 4. Rename
+	runMutationTest("Rename", func() {
+		_, err := server.Rename(ctx, &pb.RenameRequest{
+			VolumeId: volumeID,
+			OldPath:  "/test_file.txt",
+			NewPath:  "/renamed_file.txt",
+		})
+		if err != nil {
+			t.Errorf("Rename failed: %v", err)
+		}
+	}, func() {
+		renamedAttr, err := server.GetAttr(ctx, &pb.GetAttrRequest{
+			VolumeId: volumeID,
+			Path:     "/renamed_file.txt",
+		})
+		if err != nil || renamedAttr.Attr.Name != "renamed_file.txt" {
+			t.Errorf("GetAttr during Rename durability wait failed: %v", err)
+		}
+	})
+
+	// 5. TruncateFile
+	runMutationTest("TruncateFile", func() {
+		_, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{
+			VolumeId: volumeID,
+			Path:     "/renamed_file.txt",
+			Size:     7,
+		})
+		if err != nil {
+			t.Errorf("TruncateFile failed: %v", err)
+		}
+	}, func() {
+		truncRead, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+			VolumeId: volumeID,
+			Path:     "/renamed_file.txt",
+			Offset:   0,
+			Size:     1024,
+		})
+		if err != nil || string(truncRead.Data) != "initial" {
+			t.Errorf("ReadFile during TruncateFile durability wait failed: %v, data=%q", err, string(truncRead.Data))
+		}
+	})
+
+	// 6. Unlink
+	runMutationTest("Unlink", func() {
+		_, err := server.Unlink(ctx, &pb.UnlinkRequest{
+			VolumeId: volumeID,
+			Path:     "/renamed_file.txt",
+		})
+		if err != nil {
+			t.Errorf("Unlink failed: %v", err)
+		}
+	}, func() {
+		_, err := server.GetAttr(ctx, &pb.GetAttrRequest{
+			VolumeId: volumeID,
+			Path:     "/renamed_file.txt",
+		})
+		if err == nil {
+			t.Errorf("Expected file to be unlinked in memory during Unlink durability wait")
+		}
+	})
+
+	// 7. Rmdir
+	runMutationTest("Rmdir", func() {
+		_, err := server.Rmdir(ctx, &pb.RmdirRequest{
+			VolumeId: volumeID,
+			Path:     "/newdir",
+		})
+		if err != nil {
+			t.Errorf("Rmdir failed: %v", err)
+		}
+	}, func() {
+		_, err := server.GetAttr(ctx, &pb.GetAttrRequest{
+			VolumeId: volumeID,
+			Path:     "/newdir",
+		})
+		if err == nil {
+			t.Errorf("Expected directory to be removed in memory during Rmdir durability wait")
+		}
+	})
 }
