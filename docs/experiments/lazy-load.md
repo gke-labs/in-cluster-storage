@@ -57,6 +57,16 @@ EROFS is a lightweight read-only file system designed for high performance and l
 * **Pros**: Highly portable across almost all standard modern Linux kernels; file-level granularity is simple to implement and manage; does not require custom read-only filesystem images.
 * **Cons**: Intercepts at the open/file level rather than block/chunk level. High-overhead for large numbers of concurrent opens.
 
+#### Note on `FAN_REPORT_FID` and Path Lookup Efficiency:
+We evaluated whether `FAN_REPORT_FID` (File ID reporting) could be used to avoid resolving target file paths via the `/proc/self/fd/` symbolic links. Our findings indicate that `FAN_REPORT_FID` is **not suitable or viable** for our architecture due to the following reasons:
+1. **Kernel Compatibility with Permission Classes**:
+   - `FAN_REPORT_FID` historically did not support permission events (`FAN_CLASS_PRE_CONTENT`/`FAN_CLASS_CONTENT`).
+   - Combining `FAN_REPORT_FID` with `FAN_CLASS_PRE_CONTENT` was only introduced in Linux 6.13. On older kernels (such as GKE's COS or standard enterprise host kernels which are typically `< 6.13`, e.g. `6.12`), calling `FanotifyInit` with this combination fails immediately with `EINVAL`.
+2. **Path Resolution Complexity**:
+   - `FAN_REPORT_FID` replaces open file descriptors with file handles (FIDs) containing an inode and filesystem identifier.
+   - It does not report a filesystem path. To reconstruct the file path from a file handle, we would need to call `open_by_handle_at` and walk the directory hierarchy or maintain a massive in-memory inode-to-path cache.
+   - For permission events, the kernel **already** allocates and opens a file descriptor (`Fd`) for the listener. Using `os.Readlink` on `/proc/self/fd/<fd>` simply queries the dentry already pinned by that open file descriptor, which is extremely efficient and does not trigger new `open` operations or require complex user-space path reconstruction.
+
 ---
 
 ## 3. Design of the Hybrid Lazy-Loading Protocol
