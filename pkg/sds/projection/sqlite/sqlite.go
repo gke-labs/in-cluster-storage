@@ -50,6 +50,18 @@ func TableName(fullName string) string {
 	return strings.ReplaceAll(trimmed, ".", "_")
 }
 
+// Index defines a declarative secondary index on a projection table.
+type Index struct {
+	// Table is the protobuf message name (e.g. "objectfs.DirEntry") or SQLite table name (e.g. "objectfs_DirEntry").
+	Table string
+	// Columns is the ordered list of column names to index.
+	Columns []string
+	// Unique specifies whether to enforce uniqueness.
+	Unique bool
+	// Name optionally specifies an explicit index name. If empty, a canonical name is generated.
+	Name string
+}
+
 // Option configures a SQLite projection DB.
 type Option func(*options)
 
@@ -58,6 +70,7 @@ type options struct {
 	journalMode string
 	synchronous string
 	decoderOpts []record.DecoderOption
+	indexes     []Index
 }
 
 // WithStreamID sets the stream ID for the projection.
@@ -88,6 +101,23 @@ func WithDecoderOptions(opts ...record.DecoderOption) Option {
 	}
 }
 
+// WithIndex declares a secondary index on a projection table.
+func WithIndex(table string, columns ...string) Option {
+	return func(o *options) {
+		o.indexes = append(o.indexes, Index{
+			Table:   table,
+			Columns: columns,
+		})
+	}
+}
+
+// WithSecondaryIndexes declares multiple secondary indexes on projection tables.
+func WithSecondaryIndexes(indexes ...Index) Option {
+	return func(o *options) {
+		o.indexes = append(o.indexes, indexes...)
+	}
+}
+
 // DB represents a SQLite projection database for a structured data stream.
 type DB struct {
 	mu           sync.RWMutex
@@ -97,6 +127,7 @@ type DB struct {
 	position     uint64
 	changeReader *sds.ChangeReader
 	knownTables  map[string]bool // tableName -> table created
+	indexes      []Index
 }
 
 // Open opens an existing SQLite projection database or creates a new one if it does not exist.
@@ -130,6 +161,7 @@ func Open(ctx context.Context, path string, opts ...Option) (*DB, error) {
 		streamID:     opt.streamID,
 		changeReader: sds.NewChangeReader(opt.decoderOpts...),
 		knownTables:  make(map[string]bool),
+		indexes:      opt.indexes,
 	}
 
 	if err := db.initBookkeeping(ctx); err != nil {
@@ -263,7 +295,14 @@ func (d *DB) loadState(ctx context.Context) error {
 		return fmt.Errorf("error reading _stream_types: %w", err)
 	}
 
-	// 2. Load stream position
+	// 2. Ensure schema for all restored types
+	for _, def := range d.changeReader.Registry().Export().GetTypes() {
+		if err := d.ensureTableSchema(ctx, nil, def); err != nil {
+			return fmt.Errorf("failed to ensure table schema for %s: %w", def.GetName(), err)
+		}
+	}
+
+	// 3. Load stream position
 	posRows, err := d.sqlDB.QueryContext(ctx, "SELECT stream_id, position FROM _stream_position LIMIT 1")
 	if err != nil {
 		return fmt.Errorf("failed to query _stream_position: %w", err)
@@ -386,7 +425,7 @@ func (d *DB) ApplyBatch(ctx context.Context, changes []sds.Change) error {
 }
 
 func (d *DB) applyChangeInTx(ctx context.Context, tx *sql.Tx, ch sds.Change) error {
-	def, _, ok := d.changeReader.Registry().LookupByID(ch.TypeID)
+	def, md, ok := d.changeReader.Registry().LookupByID(ch.TypeID)
 	if !ok {
 		return fmt.Errorf("%w: type ID %d (%s)", ErrTypeNotRegistered, ch.TypeID, ch.TypeName)
 	}
@@ -399,8 +438,47 @@ func (d *DB) applyChangeInTx(ctx context.Context, tx *sql.Tx, ch sds.Change) err
 
 	switch ch.Op {
 	case sds.OpCreate, sds.OpUpdate:
-		query := fmt.Sprintf("INSERT OR REPLACE INTO %q (keydata, valuedata) VALUES (?, ?);", tableName)
-		if _, err := tx.ExecContext(ctx, query, ch.RawKey, ch.RawVal); err != nil {
+		var rowMsg proto.Message
+		if ch.Row != nil {
+			rowMsg = ch.Row
+		} else {
+			msgType, err := d.changeReader.Registry().ResolveMessageType(ch.TypeID)
+			if err != nil {
+				return fmt.Errorf("failed to resolve message type for %d: %w", ch.TypeID, err)
+			}
+			rowMsg = msgType.New().Interface()
+			if err := sds.MergeKeyAndNonKey(rowMsg, ch.RawKey, ch.RawVal); err != nil {
+				return fmt.Errorf("failed to merge row proto: %w", err)
+			}
+		}
+
+		rowBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(rowMsg)
+		if err != nil {
+			return fmt.Errorf("failed to marshal full row proto: %w", err)
+		}
+
+		cols := sds.Columns(md)
+		colNames := make([]string, 0, 2+len(cols))
+		placeholders := make([]string, 0, 2+len(cols))
+		args := make([]any, 0, 2+len(cols))
+
+		colNames = append(colNames, "keydata", "rowdata")
+		placeholders = append(placeholders, "?", "?")
+		args = append(args, ch.RawKey, rowBytes)
+
+		mReflect := rowMsg.ProtoReflect()
+		for _, col := range cols {
+			colNames = append(colNames, fmt.Sprintf("%q", col.Name))
+			placeholders = append(placeholders, "?")
+			args = append(args, sds.ExtractColumnValue(col, mReflect))
+		}
+
+		query := fmt.Sprintf("INSERT OR REPLACE INTO %q (%s) VALUES (%s);",
+			tableName,
+			strings.Join(colNames, ", "),
+			strings.Join(placeholders, ", "),
+		)
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("failed to upsert row in %q: %w", tableName, err)
 		}
 
@@ -417,12 +495,15 @@ func (d *DB) applyChangeInTx(ctx context.Context, tx *sql.Tx, ch sds.Change) err
 	return nil
 }
 
+type dbExecQueryer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 func (d *DB) ensureTableSchema(ctx context.Context, tx *sql.Tx, def *sdsv1.TypeDefinition) error {
 	tableName := TableName(def.GetName())
 
-	var execer interface {
-		ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	}
+	var execer dbExecQueryer
 	if tx != nil {
 		execer = tx
 	} else {
@@ -444,19 +525,128 @@ func (d *DB) ensureTableSchema(ctx context.Context, tx *sql.Tx, def *sdsv1.TypeD
 		return fmt.Errorf("failed to upsert _stream_types for %d: %w", def.GetId(), err)
 	}
 
-	// 2. Ensure table exists with (keydata BLOB PRIMARY KEY, valuedata BLOB)
-	if !d.knownTables[tableName] {
-		createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %q (
-    keydata BLOB PRIMARY KEY,
-    valuedata BLOB
-);`, tableName)
+	// 2. Resolve MessageDescriptor and derived columns
+	msgType, err := d.changeReader.Registry().ResolveMessageType(def.GetId())
+	if err != nil {
+		return fmt.Errorf("failed to resolve message type for %d: %w", def.GetId(), err)
+	}
+	md := msgType.Descriptor()
+	cols := sds.Columns(md)
+
+	// 3. Inspect existing table columns using PRAGMA table_info
+	existingCols := make(map[string]bool)
+	rows, err := execer.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%q);", tableName))
+	if err != nil {
+		return fmt.Errorf("failed to inspect table info for %q: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var colType string
+		var notNull int
+		var dfltVal sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			return fmt.Errorf("failed to scan table info row for %q: %w", tableName, err)
+		}
+		existingCols[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error reading table info for %q: %w", tableName, err)
+	}
+
+	if len(existingCols) == 0 {
+		// Table does not exist: create with keydata BLOB PRIMARY KEY, rowdata BLOB, and all typed columns
+		colDefs := []string{
+			"keydata BLOB PRIMARY KEY",
+			"rowdata BLOB",
+		}
+		for _, col := range cols {
+			colDefs = append(colDefs, fmt.Sprintf("%q %s", col.Name, col.SQLiteType()))
+		}
+
+		createSQL := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %q (\n    %s\n);", tableName, strings.Join(colDefs, ",\n    "))
 		if _, err := execer.ExecContext(ctx, createSQL); err != nil {
 			return fmt.Errorf("failed to create table %q: %w", tableName, err)
+		}
+		for _, col := range cols {
+			existingCols[col.Name] = true
+		}
+		d.knownTables[tableName] = true
+	} else {
+		// Table exists: evolve schema if new columns are defined
+		for _, col := range cols {
+			if !existingCols[col.Name] {
+				alterSQL := fmt.Sprintf("ALTER TABLE %q ADD COLUMN %q %s;", tableName, col.Name, col.SQLiteType())
+				if _, err := execer.ExecContext(ctx, alterSQL); err != nil {
+					return fmt.Errorf("failed to add column %q to table %q: %w", col.Name, tableName, err)
+				}
+				existingCols[col.Name] = true
+			}
 		}
 		d.knownTables[tableName] = true
 	}
 
+	// 4. Ensure secondary indexes for this table
+	for _, idx := range d.indexes {
+		if !matchesTable(idx.Table, def.GetName(), tableName) {
+			continue
+		}
+
+		// Check all indexed columns exist
+		allColsExist := true
+		for _, colName := range idx.Columns {
+			if !existingCols[colName] {
+				allColsExist = false
+				break
+			}
+		}
+		if !allColsExist {
+			continue
+		}
+
+		idxName := idx.Name
+		if idxName == "" {
+			idxName = fmt.Sprintf("idx_%s_%s", tableName, strings.Join(idx.Columns, "_"))
+		}
+
+		var quotedCols []string
+		for _, colName := range idx.Columns {
+			quotedCols = append(quotedCols, fmt.Sprintf("%q", colName))
+		}
+
+		uniqueStr := ""
+		if idx.Unique {
+			uniqueStr = "UNIQUE "
+		}
+
+		createIndexSQL := fmt.Sprintf("CREATE %sINDEX IF NOT EXISTS %q ON %q (%s);",
+			uniqueStr,
+			idxName,
+			tableName,
+			strings.Join(quotedCols, ", "),
+		)
+		if _, err := execer.ExecContext(ctx, createIndexSQL); err != nil {
+			return fmt.Errorf("failed to create index %q on %q: %w", idxName, tableName, err)
+		}
+	}
+
 	return nil
+}
+
+func matchesTable(indexTable, fullName, tableName string) bool {
+	if indexTable == fullName || indexTable == tableName {
+		return true
+	}
+	if TableName(indexTable) == tableName {
+		return true
+	}
+	if strings.HasSuffix(fullName, "."+indexTable) {
+		return true
+	}
+	return false
 }
 
 func (d *DB) updatePositionInTx(ctx context.Context, tx *sql.Tx, seq uint64) error {
@@ -479,9 +669,9 @@ func (d *DB) Get(ctx context.Context, typeName string, key sds.Key) (proto.Messa
 	}
 
 	tableName := TableName(typeName)
-	var valuedata []byte
-	query := fmt.Sprintf("SELECT valuedata FROM %q WHERE keydata = ?;", tableName)
-	err := d.sqlDB.QueryRowContext(ctx, query, key.Bytes()).Scan(&valuedata)
+	var rowdata []byte
+	query := fmt.Sprintf("SELECT rowdata FROM %q WHERE keydata = ?;", tableName)
+	err := d.sqlDB.QueryRowContext(ctx, query, key.Bytes()).Scan(&rowdata)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -495,8 +685,8 @@ func (d *DB) Get(ctx context.Context, typeName string, key sds.Key) (proto.Messa
 	}
 
 	target := msgType.New().Interface()
-	if err := sds.MergeKeyAndNonKey(target, key.Bytes(), valuedata); err != nil {
-		return nil, false, fmt.Errorf("failed to merge proto key and value: %w", err)
+	if err := proto.Unmarshal(rowdata, target); err != nil {
+		return nil, false, fmt.Errorf("failed to unmarshal row proto: %w", err)
 	}
 
 	return target, true, nil
@@ -548,7 +738,7 @@ func (d *DB) Rows(ctx context.Context, typeName string) ([]proto.Message, error)
 	}
 
 	tableName := TableName(typeName)
-	query := fmt.Sprintf("SELECT keydata, valuedata FROM %q;", tableName)
+	query := fmt.Sprintf("SELECT rowdata FROM %q;", tableName)
 	rows, err := d.sqlDB.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query rows from %q: %w", tableName, err)
@@ -557,14 +747,14 @@ func (d *DB) Rows(ctx context.Context, typeName string) ([]proto.Message, error)
 
 	var result []proto.Message
 	for rows.Next() {
-		var keydata, valuedata []byte
-		if err := rows.Scan(&keydata, &valuedata); err != nil {
+		var rowdata []byte
+		if err := rows.Scan(&rowdata); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
 		target := msgType.New().Interface()
-		if err := sds.MergeKeyAndNonKey(target, keydata, valuedata); err != nil {
-			return nil, fmt.Errorf("failed to merge proto key and value: %w", err)
+		if err := proto.Unmarshal(rowdata, target); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal row proto: %w", err)
 		}
 		result = append(result, target)
 	}

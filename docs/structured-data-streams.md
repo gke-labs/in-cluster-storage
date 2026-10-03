@@ -197,13 +197,14 @@ Snapshots are also the **retention anchor**. Segments older than the oldest snap
 ### SQLite (OLTP)
 
 - One database file per stream (or per shard if a stream is sharded).
-- Tables are created from the registry. Each scalar field is a column; `key_fields` become the `PRIMARY KEY`; indexes are a property of the projection, not the log, and may differ between two SQLite snapshots of the same stream.
+- Tables are created from the registry via `sds.Columns(md)`. Each scalar field and `google.protobuf.Timestamp` is a typed SQL column (`INTEGER`, `REAL`, `TEXT`, `BLOB`); `keydata BLOB` is the canonical primary key; `rowdata BLOB` stores the full encoded row (key and non-key fields merged) preserving nested messages and repeated fields losslessly.
+- Column naming rule: derived from the protobuf field name. If a field name collides with internal projection columns (`keydata`, `rowdata`, `valuedata`) or duplicate column names, underscores are appended (e.g. `keydata_`). SQL identifiers are quoted in double quotes to prevent keyword conflicts.
+- Secondary indexes are a declarative projection option (e.g. `WithIndex("DirEntry", "ino")`), created when the table is created or evolved.
+- Schema evolution is handled in place: when an evolved `TypeDefinition` is registered mid-stream, new columns are added via `ALTER TABLE ... ADD COLUMN`, leaving earlier rows `NULL` for new columns.
 - Two bookkeeping tables: `_stream_types` (`id`, `name`, `fingerprint`, `descriptors BLOB`, `key_fields`) and `_stream_position` (`stream_id`, `position`, `snapshot_time`).
 - Apply rules: `CREATE` → `INSERT OR REPLACE`; `UPDATE` → `UPDATE ... WHERE key` (or replace); `DELETE` → `DELETE WHERE key`. An autocommit `OpRecord` is its own SQLite transaction; a `TxCommit` closes one covering its pending rows.
 - Writing: build in a temp file, `PRAGMA journal_mode=OFF` during load, fsync, then upload. Serving: download or stream to local disk, open read-only, and keep applying the live tail into it from `Tail`.
 - SQLite is the initial OLTP shape because a single file is trivially snapshotted, has real indexes and a page cache, and is readable everywhere. Its WAL and page format are *not* used as the log format: the log is logical, the file is a projection.
-
-> **TODO:** the OLTP projection format is not settled. SQLite is the starting point, and a different embedded store may replace it. A likely refinement even within SQLite is to store the **raw encoded proto** of each row in a `BLOB` column and treat the extracted scalar columns purely as an **index**: it preserves nested and repeated fields losslessly, makes the projection independent of the column-mapping rules, and makes a table row round-trip to the wire format byte for byte.
 
 ### Parquet (OLAP)
 

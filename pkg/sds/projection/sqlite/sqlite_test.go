@@ -17,11 +17,14 @@ package sqlite_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -32,6 +35,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type memoryAppender struct {
@@ -67,22 +71,55 @@ func field(name string, number int32, typeKind descriptorpb.FieldDescriptorProto
 	}
 }
 
-func buildMD(t *testing.T, name string, fields []*descriptorpb.FieldDescriptorProto) protoreflect.MessageDescriptor {
+func optionalField(name string, number int32, typeKind descriptorpb.FieldDescriptorProto_Type) *descriptorpb.FieldDescriptorProto {
+	f := field(name, number, typeKind, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL)
+	f.Proto3Optional = proto.Bool(true)
+	return f
+}
+
+func buildMD(t *testing.T, name string, fields []*descriptorpb.FieldDescriptorProto, nestedTypes ...*descriptorpb.DescriptorProto) protoreflect.MessageDescriptor {
 	t.Helper()
+	tsProto := &descriptorpb.DescriptorProto{
+		Name: proto.String("Timestamp"),
+		Field: []*descriptorpb.FieldDescriptorProto{
+			field("seconds", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+			field("nanos", 2, descriptorpb.FieldDescriptorProto_TYPE_INT32, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		},
+	}
+	tsFile := &descriptorpb.FileDescriptorProto{
+		Name:        proto.String("google/protobuf/timestamp.proto"),
+		Package:     proto.String("google.protobuf"),
+		MessageType: []*descriptorpb.DescriptorProto{tsProto},
+		Syntax:      proto.String("proto3"),
+	}
+
+	var oneofDecls []*descriptorpb.OneofDescriptorProto
+	for _, f := range fields {
+		if f.GetProto3Optional() {
+			f.OneofIndex = proto.Int32(int32(len(oneofDecls)))
+			oneofDecls = append(oneofDecls, &descriptorpb.OneofDescriptorProto{
+				Name: proto.String("_" + f.GetName()),
+			})
+		}
+	}
+
 	msgProto := &descriptorpb.DescriptorProto{
-		Name:  proto.String(name),
-		Field: fields,
+		Name:       proto.String(name),
+		Field:      fields,
+		OneofDecl:  oneofDecls,
+		NestedType: nestedTypes,
 	}
 
 	mainFile := &descriptorpb.FileDescriptorProto{
 		Name:        proto.String(name + ".proto"),
 		Package:     proto.String("testpkg"),
 		MessageType: []*descriptorpb.DescriptorProto{msgProto},
+		Dependency:  []string{"google/protobuf/timestamp.proto"},
 		Syntax:      proto.String("proto3"),
 	}
 
 	fds := &descriptorpb.FileDescriptorSet{
-		File: []*descriptorpb.FileDescriptorProto{mainFile},
+		File: []*descriptorpb.FileDescriptorProto{tsFile, mainFile},
 	}
 
 	files, err := protodesc.NewFiles(fds)
@@ -120,8 +157,8 @@ func verifySQLiteMatchesMemStore(t *testing.T, ctx context.Context, db *sqlite.D
 			t.Errorf("table %q row count mismatch: sqlite %d != memstore %d", fullTableName, count, memTable.Count())
 		}
 
-		// Read all (keydata, valuedata) rows from SQLite
-		querySQL := fmt.Sprintf("SELECT keydata, valuedata FROM %q;", sqlTableName)
+		// Read all (keydata, rowdata) rows from SQLite
+		querySQL := fmt.Sprintf("SELECT keydata, rowdata FROM %q;", sqlTableName)
 		rows, err := db.SQLDB().QueryContext(ctx, querySQL)
 		if err != nil {
 			t.Fatalf("failed to query rows from %q: %v", sqlTableName, err)
@@ -130,8 +167,8 @@ func verifySQLiteMatchesMemStore(t *testing.T, ctx context.Context, db *sqlite.D
 
 		sqliteRows := make(map[string]proto.Message)
 		for rows.Next() {
-			var keydata, valuedata []byte
-			if err := rows.Scan(&keydata, &valuedata); err != nil {
+			var keydata, rowdata []byte
+			if err := rows.Scan(&keydata, &rowdata); err != nil {
 				t.Fatalf("failed to scan row for %q: %v", sqlTableName, err)
 			}
 
@@ -146,8 +183,8 @@ func verifySQLiteMatchesMemStore(t *testing.T, ctx context.Context, db *sqlite.D
 			}
 
 			msg := msgType.New().Interface()
-			if err := sds.MergeKeyAndNonKey(msg, keydata, valuedata); err != nil {
-				t.Fatalf("failed to merge proto key and value for %q: %v", fullTableName, err)
+			if err := proto.Unmarshal(rowdata, msg); err != nil {
+				t.Fatalf("failed to unmarshal rowdata for %q: %v", fullTableName, err)
 			}
 
 			key, err := sds.ExtractKey(msg, def.GetKeyFields())
@@ -284,6 +321,387 @@ func TestReplayAndCompareWithMemTable(t *testing.T) {
 
 	// Verify SQLite exactly matches MemStore
 	verifySQLiteMatchesMemStore(t, ctx, sqliteDB, memStore)
+}
+
+func TestPlainSQLQueries(t *testing.T) {
+	ctx := t.Context()
+	appender := &memoryAppender{}
+	writer := sds.NewWriter(appender)
+
+	inodeMD := buildMD(t, "Inode", []*descriptorpb.FieldDescriptorProto{
+		field("ino", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("size", 2, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("mode", 3, descriptorpb.FieldDescriptorProto_TYPE_UINT32, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("is_dir", 4, descriptorpb.FieldDescriptorProto_TYPE_BOOL, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("ratio", 5, descriptorpb.FieldDescriptorProto_TYPE_DOUBLE, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("name", 6, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("sha256", 7, descriptorpb.FieldDescriptorProto_TYPE_BYTES, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		{
+			Name:     proto.String("mtime"),
+			Number:   proto.Int32(8),
+			Type:     descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum(),
+			TypeName: proto.String(".google.protobuf.Timestamp"),
+			Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		},
+	})
+	writer.RegisterDescriptor(inodeMD, 1)
+
+	// Insert test rows
+	now := time.Unix(1700000000, 500000000)
+	ts1 := timestamppb.New(now)
+	tsDyn1 := dynamicpb.NewMessage(inodeMD.Fields().ByName("mtime").Message())
+	tsDyn1.Set(tsDyn1.Descriptor().Fields().ByNumber(1), protoreflect.ValueOfInt64(ts1.GetSeconds()))
+	tsDyn1.Set(tsDyn1.Descriptor().Fields().ByNumber(2), protoreflect.ValueOfInt32(ts1.GetNanos()))
+
+	in1 := dynamicpb.NewMessage(inodeMD)
+	in1.Set(inodeMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(100))
+	in1.Set(inodeMD.Fields().ByName("size"), protoreflect.ValueOfInt64(4096))
+	in1.Set(inodeMD.Fields().ByName("mode"), protoreflect.ValueOfUint32(0755))
+	in1.Set(inodeMD.Fields().ByName("is_dir"), protoreflect.ValueOfBool(true))
+	in1.Set(inodeMD.Fields().ByName("ratio"), protoreflect.ValueOfFloat64(1.25))
+	in1.Set(inodeMD.Fields().ByName("name"), protoreflect.ValueOfString("root_dir"))
+	in1.Set(inodeMD.Fields().ByName("sha256"), protoreflect.ValueOfBytes([]byte{0xaa, 0xbb, 0xcc}))
+	in1.Set(inodeMD.Fields().ByName("mtime"), protoreflect.ValueOfMessage(tsDyn1))
+	writer.Insert(ctx, in1)
+
+	in2 := dynamicpb.NewMessage(inodeMD)
+	in2.Set(inodeMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(101))
+	in2.Set(inodeMD.Fields().ByName("size"), protoreflect.ValueOfInt64(1024))
+	in2.Set(inodeMD.Fields().ByName("mode"), protoreflect.ValueOfUint32(0644))
+	in2.Set(inodeMD.Fields().ByName("is_dir"), protoreflect.ValueOfBool(false))
+	in2.Set(inodeMD.Fields().ByName("ratio"), protoreflect.ValueOfFloat64(0.50))
+	in2.Set(inodeMD.Fields().ByName("name"), protoreflect.ValueOfString("file.txt"))
+	in2.Set(inodeMD.Fields().ByName("sha256"), protoreflect.ValueOfBytes([]byte{0x01, 0x02, 0x03}))
+	writer.Insert(ctx, in2)
+
+	dbPath := filepath.Join(t.TempDir(), "sql_test.sqlite")
+	db, err := sqlite.Open(ctx, dbPath, sqlite.WithStreamID("stream-sql"))
+	if err != nil {
+		t.Fatalf("sqlite.Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i, p := range appender.Payloads() {
+		seq := uint64(i + 1)
+		if _, err := db.Feed(ctx, seq, p); err != nil {
+			t.Fatalf("Feed failed: %v", err)
+		}
+	}
+
+	// 1. Plain SQL query with filters and projections
+	var ino, size int64
+	var mode uint32
+	var isDir bool
+	var ratio float64
+	var name string
+	var sha256 []byte
+	var mtimeMicros sql.NullInt64
+
+	row := db.SQLDB().QueryRowContext(ctx, `
+		SELECT ino, size, mode, is_dir, ratio, name, sha256, mtime
+		FROM testpkg_Inode
+		WHERE ino = 100;
+	`)
+	if err := row.Scan(&ino, &size, &mode, &isDir, &ratio, &name, &sha256, &mtimeMicros); err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if ino != 100 || size != 4096 || mode != 0755 || !isDir || ratio != 1.25 || name != "root_dir" {
+		t.Errorf("unexpected values scanned for ino 100: ino=%d, size=%d, mode=%o, isDir=%v, ratio=%f, name=%s",
+			ino, size, mode, isDir, ratio, name)
+	}
+	if !bytes.Equal(sha256, []byte{0xaa, 0xbb, 0xcc}) {
+		t.Errorf("sha256 mismatch: got %x", sha256)
+	}
+	if !mtimeMicros.Valid || mtimeMicros.Int64 != now.UnixMicro() {
+		t.Errorf("mtime mismatch: valid=%v, got=%d, want=%d", mtimeMicros.Valid, mtimeMicros.Int64, now.UnixMicro())
+	}
+
+	// 2. Query with non-set timestamp returning NULL
+	row2 := db.SQLDB().QueryRowContext(ctx, `SELECT is_dir, mtime FROM testpkg_Inode WHERE ino = 101;`)
+	if err := row2.Scan(&isDir, &mtimeMicros); err != nil {
+		t.Fatalf("Scan row 2 failed: %v", err)
+	}
+	if isDir {
+		t.Errorf("expected is_dir = false for ino 101")
+	}
+	if mtimeMicros.Valid {
+		t.Errorf("expected NULL mtime for ino 101, got %d", mtimeMicros.Int64)
+	}
+
+	// 3. Plain SQL aggregation / ORDER BY
+	var totalSize int64
+	if err := db.SQLDB().QueryRowContext(ctx, "SELECT SUM(size) FROM testpkg_Inode;").Scan(&totalSize); err != nil {
+		t.Fatalf("SUM query failed: %v", err)
+	}
+	if totalSize != 5120 {
+		t.Errorf("totalSize = %d, want 5120", totalSize)
+	}
+}
+
+func TestCompatibleSchemaEvolution_MidStreamNullForOldRows(t *testing.T) {
+	ctx := t.Context()
+	appender := &memoryAppender{}
+	writer := sds.NewWriter(appender)
+
+	// Schema V1: (id tag 1, name tag 2)
+	fieldsV1 := []*descriptorpb.FieldDescriptorProto{
+		field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("name", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	}
+	mdV1 := buildMD(t, "Article", fieldsV1)
+	writer.RegisterDescriptor(mdV1, 1)
+
+	// Insert row 1 and row 2 under V1
+	a1 := dynamicpb.NewMessage(mdV1)
+	a1.Set(mdV1.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
+	a1.Set(mdV1.Fields().ByName("name"), protoreflect.ValueOfString("Post 1"))
+	writer.Insert(ctx, a1)
+
+	a2 := dynamicpb.NewMessage(mdV1)
+	a2.Set(mdV1.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
+	a2.Set(mdV1.Fields().ByName("name"), protoreflect.ValueOfString("Post 2"))
+	writer.Insert(ctx, a2)
+
+	// Schema V2: evolved with category tag 3, views tag 4
+	fieldsV2 := []*descriptorpb.FieldDescriptorProto{
+		field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("name", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		optionalField("category", 3, descriptorpb.FieldDescriptorProto_TYPE_STRING),
+		field("views", 4, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	}
+	mdV2 := buildMD(t, "Article", fieldsV2)
+	writer.RegisterDescriptor(mdV2, 1)
+
+	// Insert row 3 under V2
+	a3 := dynamicpb.NewMessage(mdV2)
+	a3.Set(mdV2.Fields().ByName("id"), protoreflect.ValueOfInt64(3))
+	a3.Set(mdV2.Fields().ByName("name"), protoreflect.ValueOfString("Post 3"))
+	a3.Set(mdV2.Fields().ByName("category"), protoreflect.ValueOfString("Tech"))
+	a3.Set(mdV2.Fields().ByName("views"), protoreflect.ValueOfInt64(500))
+	writer.Insert(ctx, a3)
+
+	dbPath := filepath.Join(t.TempDir(), "evolve_null.sqlite")
+	db, err := sqlite.Open(ctx, dbPath, sqlite.WithStreamID("stream-evolve-null"))
+	if err != nil {
+		t.Fatalf("sqlite.Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i, p := range appender.Payloads() {
+		seq := uint64(i + 1)
+		if _, err := db.Feed(ctx, seq, p); err != nil {
+			t.Fatalf("Feed failed at seq %d: %v", seq, err)
+		}
+	}
+
+	// Verify old rows have NULL for newly added category column
+	var cat1 sql.NullString
+	var views1 sql.NullInt64
+	err = db.SQLDB().QueryRowContext(ctx, "SELECT category, views FROM testpkg_Article WHERE id = 1;").Scan(&cat1, &views1)
+	if err != nil {
+		t.Fatalf("Query row 1 failed: %v", err)
+	}
+	if cat1.Valid {
+		t.Errorf("expected NULL category for row 1, got %q", cat1.String)
+	}
+	if views1.Valid {
+		t.Errorf("expected NULL views for row 1 from ALTER TABLE, got %d", views1.Int64)
+	}
+
+	// Verify row 3 has category = 'Tech' and views = 500
+	var cat3 string
+	var views3 int64
+	err = db.SQLDB().QueryRowContext(ctx, "SELECT category, views FROM testpkg_Article WHERE id = 3;").Scan(&cat3, &views3)
+	if err != nil {
+		t.Fatalf("Query row 3 failed: %v", err)
+	}
+	if cat3 != "Tech" || views3 != 500 {
+		t.Errorf("row 3 values: got category=%q, views=%d, want 'Tech', 500", cat3, views3)
+	}
+}
+
+func TestSecondaryIndex_ExplainQueryPlan(t *testing.T) {
+	ctx := t.Context()
+	appender := &memoryAppender{}
+	writer := sds.NewWriter(appender)
+
+	dirEntryMD := buildMD(t, "DirEntry", []*descriptorpb.FieldDescriptorProto{
+		field("parent_ino", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("name", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("ino", 3, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("type", 4, descriptorpb.FieldDescriptorProto_TYPE_UINT32, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	})
+	writer.RegisterDescriptor(dirEntryMD, 1, 2) // Composite PK: parent_ino, name
+
+	// Insert directory entries
+	for i := 1; i <= 20; i++ {
+		de := dynamicpb.NewMessage(dirEntryMD)
+		de.Set(dirEntryMD.Fields().ByName("parent_ino"), protoreflect.ValueOfInt64(1))
+		de.Set(dirEntryMD.Fields().ByName("name"), protoreflect.ValueOfString(fmt.Sprintf("file_%02d.txt", i)))
+		de.Set(dirEntryMD.Fields().ByName("ino"), protoreflect.ValueOfInt64(int64(100+i)))
+		de.Set(dirEntryMD.Fields().ByName("type"), protoreflect.ValueOfUint32(1))
+		writer.Insert(ctx, de)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "indexed.sqlite")
+	// Declare secondary index on DirEntry.ino
+	db, err := sqlite.Open(ctx, dbPath,
+		sqlite.WithStreamID("stream-idx"),
+		sqlite.WithIndex("testpkg.DirEntry", "ino"),
+	)
+	if err != nil {
+		t.Fatalf("sqlite.Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i, p := range appender.Payloads() {
+		seq := uint64(i + 1)
+		if _, err := db.Feed(ctx, seq, p); err != nil {
+			t.Fatalf("Feed failed: %v", err)
+		}
+	}
+
+	// Verify secondary index exists and is used in EXPLAIN QUERY PLAN
+	queryPlanSQL := `EXPLAIN QUERY PLAN SELECT * FROM testpkg_DirEntry WHERE ino = 105;`
+	rows, err := db.SQLDB().QueryContext(ctx, queryPlanSQL)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN failed: %v", err)
+	}
+	defer rows.Close()
+
+	var planDetails []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("Scan plan row failed: %v", err)
+		}
+		planDetails = append(planDetails, detail)
+	}
+
+	fullPlan := strings.Join(planDetails, "\n")
+	if !strings.Contains(fullPlan, "USING INDEX idx_testpkg_DirEntry_ino") && !strings.Contains(fullPlan, "USING INDEX") {
+		t.Errorf("expected query plan to use secondary index, got:\n%s", fullPlan)
+	}
+}
+
+func TestFullRowColumn_LosslessRoundTrip(t *testing.T) {
+	ctx := t.Context()
+	appender := &memoryAppender{}
+	writer := sds.NewWriter(appender)
+
+	nestedChild := &descriptorpb.DescriptorProto{
+		Name: proto.String("Metadata"),
+		Field: []*descriptorpb.FieldDescriptorProto{
+			field("author", 1, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+			field("tags", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_REPEATED),
+		},
+	}
+
+	docMD := buildMD(t, "Document", []*descriptorpb.FieldDescriptorProto{
+		field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		field("title", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		{
+			Name:     proto.String("meta"),
+			Number:   proto.Int32(3),
+			Type:     descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum(),
+			TypeName: proto.String(".testpkg.Document.Metadata"),
+			Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		},
+		field("keywords", 4, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_REPEATED),
+	}, nestedChild)
+	writer.RegisterDescriptor(docMD, 1)
+
+	// Create document with nested message and repeated fields
+	doc := dynamicpb.NewMessage(docMD)
+	doc.Set(docMD.Fields().ByName("id"), protoreflect.ValueOfInt64(42))
+	doc.Set(docMD.Fields().ByName("title"), protoreflect.ValueOfString("Architecture Guide"))
+
+	metaField := docMD.Fields().ByName("meta")
+	metaMsg := dynamicpb.NewMessage(metaField.Message())
+	metaMsg.Set(metaField.Message().Fields().ByName("author"), protoreflect.ValueOfString("Google"))
+	metaTags := metaMsg.Mutable(metaField.Message().Fields().ByName("tags")).List()
+	metaTags.Append(protoreflect.ValueOfString("storage"))
+	metaTags.Append(protoreflect.ValueOfString("database"))
+	doc.Set(metaField, protoreflect.ValueOfMessage(metaMsg))
+
+	keywords := doc.Mutable(docMD.Fields().ByName("keywords")).List()
+	keywords.Append(protoreflect.ValueOfString("sqlite"))
+	keywords.Append(protoreflect.ValueOfString("sds"))
+	keywords.Append(protoreflect.ValueOfString("oltp"))
+
+	writer.Insert(ctx, doc)
+
+	dbPath := filepath.Join(t.TempDir(), "roundtrip.sqlite")
+	db, err := sqlite.Open(ctx, dbPath, sqlite.WithStreamID("stream-roundtrip"))
+	if err != nil {
+		t.Fatalf("sqlite.Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i, p := range appender.Payloads() {
+		seq := uint64(i + 1)
+		if _, err := db.Feed(ctx, seq, p); err != nil {
+			t.Fatalf("Feed failed: %v", err)
+		}
+	}
+
+	// 1. Read rowdata directly from SQLite table
+	var rowdata []byte
+	err = db.SQLDB().QueryRowContext(ctx, "SELECT rowdata FROM testpkg_Document WHERE id = 42;").Scan(&rowdata)
+	if err != nil {
+		t.Fatalf("Query rowdata failed: %v", err)
+	}
+
+	// 2. Canonical serialization of original doc
+	expectedBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal doc failed: %v", err)
+	}
+
+	// 3. Verify byte-for-byte equivalence
+	if !bytes.Equal(rowdata, expectedBytes) {
+		t.Errorf("rowdata byte mismatch:\n  got:  %x\n  want: %x", rowdata, expectedBytes)
+	}
+
+	// 4. Unmarshal rowdata and check proto equality
+	reconstructed := dynamicpb.NewMessage(docMD)
+	if err := proto.Unmarshal(rowdata, reconstructed); err != nil {
+		t.Fatalf("Unmarshal rowdata failed: %v", err)
+	}
+	if !proto.Equal(doc, reconstructed) {
+		t.Errorf("proto mismatch:\n  got:  %v\n  want: %v", reconstructed, doc)
+	}
+
+	// 5. Test db.Get and db.Rows convenience methods
+	k42, _ := sds.ExtractKey(doc, []int32{1})
+	gotMsg, ok, err := db.Get(ctx, "testpkg.Document", k42)
+	if err != nil || !ok {
+		t.Fatalf("db.Get failed: ok=%v, err=%v", ok, err)
+	}
+	gotBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(gotMsg)
+	if err != nil {
+		t.Fatalf("Marshal gotMsg failed: %v", err)
+	}
+	if !bytes.Equal(expectedBytes, gotBytes) {
+		t.Errorf("db.Get bytes mismatch:\n  got:  %x\n  want: %x", gotBytes, expectedBytes)
+	}
+
+	allRows, err := db.Rows(ctx, "testpkg.Document")
+	if err != nil {
+		t.Fatalf("db.Rows failed: %v", err)
+	}
+	if len(allRows) != 1 {
+		t.Fatalf("db.Rows expected 1 row, got %d", len(allRows))
+	}
+	row0Bytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(allRows[0])
+	if err != nil {
+		t.Fatalf("Marshal row0 failed: %v", err)
+	}
+	if !bytes.Equal(expectedBytes, row0Bytes) {
+		t.Errorf("db.Rows bytes mismatch:\n  got:  %x\n  want: %x", row0Bytes, expectedBytes)
+	}
 }
 
 func TestSnapshotRestoreAndTailFollow(t *testing.T) {

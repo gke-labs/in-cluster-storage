@@ -202,24 +202,27 @@ func PublishSnapshot(ctx context.Context, db *DB, backend objectstore.Backend, t
 
 // BuildSnapshot processes stream payloads into a new temporary SQLite database
 // configured with journal_mode=OFF during bulk load, and publishes the snapshot to object storage.
-func BuildSnapshot(ctx context.Context, streamID string, payloads [][]byte, backend objectstore.Backend, tempDir string) (string, uint64, error) {
+func BuildSnapshot(ctx context.Context, streamID string, payloads [][]byte, backend objectstore.Backend, tempDir string, opts ...Option) (string, uint64, error) {
 	if backend == nil {
 		return "", 0, errors.New("nil backend")
 	}
 
 	tmpFile, err := os.CreateTemp(tempDir, "sds-sqlite-build-*.sqlite")
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to create temp file: %w", err)
+		return "", 0, fmt.Errorf("failed to create temp file for snapshot: %w", err)
 	}
 	tmpPath := tmpFile.Name()
 	_ = tmpFile.Close()
 	defer os.Remove(tmpPath)
 
-	db, err := Open(ctx, tmpPath,
+	baseOpts := []Option{
 		WithStreamID(streamID),
 		WithJournalMode("OFF"),
 		WithSynchronous("OFF"),
-	)
+	}
+	allOpts := append(baseOpts, opts...)
+
+	db, err := Open(ctx, tmpPath, allOpts...)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to open build sqlite db: %w", err)
 	}
