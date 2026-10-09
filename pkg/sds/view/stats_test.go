@@ -29,6 +29,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 )
@@ -117,6 +118,17 @@ func TestView_StatsAggregation(t *testing.T) {
 			create: func(t *testing.T, ctx context.Context, streamID string) (sds.LocalIndex, func()) {
 				store := memtable.New(memtable.WithStreamID(streamID))
 				return store, func() { _ = store.Close() }
+			},
+		},
+		{
+			name: "Table",
+			create: func(t *testing.T, ctx context.Context, streamID string) (sds.LocalIndex, func()) {
+				dbDir := t.TempDir()
+				db, err := table.Open(ctx, dbDir, table.WithStreamID(streamID))
+				if err != nil {
+					t.Fatalf("table.Open failed: %v", err)
+				}
+				return db, func() { _ = db.Close() }
 			},
 		},
 	}

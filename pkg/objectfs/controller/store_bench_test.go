@@ -33,6 +33,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
+	_ "github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
 )
@@ -400,7 +401,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 	// 1. Directory Entry Addition Scaling (Empty vs 10,000 Entry Directory)
 	t.Log("\n--- 1. Directory Entry Addition Scaling ---")
-	for _, mode := range []string{"memory", "sqlite"} {
+	for _, mode := range []string{"memory", "sqlite", "table"} {
 		backend := inmemorystorage.New()
 		vol := NewVolume("scale-"+mode, backend, NewEventBroadcaster(),
 			WithMetadataIndex(mode),
@@ -439,6 +440,8 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		{name: "memory", store: "memory", cacheDisable: false},
 		{name: "sqlite (cache ON)", store: "sqlite", cacheDisable: false},
 		{name: "sqlite (cache OFF)", store: "sqlite", cacheDisable: true},
+		{name: "table (cache ON)", store: "table", cacheDisable: false},
+		{name: "table (cache OFF)", store: "table", cacheDisable: true},
 	} {
 		backend := inmemorystorage.New()
 		vol := NewVolume("cachemiss-"+cfg.name, backend, NewEventBroadcaster(),
@@ -608,7 +611,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 	// 5. Memory Consumption Comparison
 	t.Log("\n--- 5. Memory Consumption Comparison (15,000 files) ---")
-	for _, mode := range []string{"memory", "sqlite"} {
+	for _, mode := range []string{"memory", "sqlite", "table"} {
 		runtime.GC()
 		var m1 runtime.MemStats
 		runtime.ReadMemStats(&m1)
@@ -830,7 +833,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 
 	// 8. Benchmark Gate: 10,000 Files End-to-End Latency
 	t.Log("\n--- 8. Benchmark Gate: 10,000 Files End-to-End Latency (stat, create, readdir, rename, 64 KiB fsynced write) ---")
-	for _, mode := range []string{"sqlite", "memory"} {
+	for _, mode := range []string{"sqlite", "table", "memory"} {
 		localDir := t.TempDir()
 		vol := NewVolume("gate-10k-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
 			WithMetadataIndex(mode),
@@ -914,7 +917,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		t.Log("Skipping 1,000,000 scale benchmarks in default mode (set OBJECTFS_BENCH=1 to run full scale benchmark gate)")
 		t.Log("Running quick 10,000-file smoke scale test...")
 
-		for _, mode := range []string{"sqlite", "memory"} {
+		for _, mode := range []string{"sqlite", "table", "memory"} {
 			localDir := t.TempDir()
 			vol := NewVolume("gate-smoke-"+mode, inmemorystorage.New(), NewEventBroadcaster(),
 				WithMetadataIndex(mode),

@@ -28,6 +28,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
+	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -79,6 +80,25 @@ func localIndexFactories(t *testing.T) []localIndexFactory {
 			},
 			restore: func(ctx context.Context, backend objectstore.Backend, streamID string, maxPos uint64, targetDir string) (sds.LocalIndex, uint64, error) {
 				return memtable.RestoreSnapshot(ctx, backend, streamID, maxPos, targetDir)
+			},
+		},
+		{
+			name: "Table",
+			create: func(t *testing.T, ctx context.Context, streamID string) (sds.LocalIndex, func()) {
+				dbDir := t.TempDir()
+				db, err := table.Open(ctx, dbDir,
+					table.WithStreamID(streamID),
+				)
+				if err != nil {
+					t.Fatalf("table.Open failed: %v", err)
+				}
+				return db, func() { _ = db.Close() }
+			},
+			publish: func(ctx context.Context, idx sds.LocalIndex, backend objectstore.Backend) (string, uint64, error) {
+				return table.PublishSnapshot(ctx, idx.(*table.DB), backend, os.TempDir())
+			},
+			restore: func(ctx context.Context, backend objectstore.Backend, streamID string, maxPos uint64, targetDir string) (sds.LocalIndex, uint64, error) {
+				return table.RestoreSnapshot(ctx, backend, streamID, maxPos, targetDir)
 			},
 		},
 	}
@@ -474,6 +494,7 @@ func TestLocalIndexSnapshotPublishRestoreAndReplay(t *testing.T) {
 			if err != nil {
 				t.Fatalf("restore failed: %v", err)
 			}
+			defer restoredIdx.Close()
 			if restoredPos != snapPos {
 				t.Fatalf("restoredPos %d != snapPos %d", restoredPos, snapPos)
 			}

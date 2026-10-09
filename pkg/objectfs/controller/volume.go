@@ -41,6 +41,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	_ "github.com/gke-labs/in-cluster-storage/pkg/sds/memtable"
 	_ "github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
+	_ "github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
