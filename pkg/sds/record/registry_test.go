@@ -17,6 +17,8 @@ package record
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
@@ -203,5 +205,178 @@ func TestRegistryGoTypeResolution(t *testing.T) {
 	instance := msgType.New().Interface()
 	if _, ok := instance.(*sdsv1.TxCommit); !ok {
 		t.Errorf("instance type = %T, want *sdsv1.TxCommit", instance)
+	}
+}
+
+func TestRegistryConcurrentUse(t *testing.T) {
+	reg := NewRegistry()
+
+	// Pre-populate one type so lookups immediately find something
+	initialDef, err := reg.RegisterMessage(&sdsv1.TxCommit{}, 1)
+	if err != nil {
+		t.Fatalf("RegisterMessage error: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	const (
+		numGoroutines = 8
+		iterations    = 100
+	)
+
+	// Goroutines registering messages concurrently
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				switch (gid + i) % 4 {
+				case 0:
+					_, _ = reg.RegisterMessage(&sdsv1.SnapshotPointer{}, 1)
+				case 1:
+					_, _ = reg.RegisterMessage(&sdsv1.TxCommit{}, 1)
+				case 2:
+					_, _ = reg.RegisterDescriptor((&sdsv1.OpRecord{}).ProtoReflect().Descriptor(), 1)
+				case 3:
+					def := makeTestTypeDef("DynamicMsg", []*descriptorpb.FieldDescriptorProto{
+						field("f1", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+					}, nil, nil, []int32{1}, nil)
+					def.Id = uint32(100 + (gid % 5))
+					_ = reg.Register(def)
+				}
+			}
+		}(g)
+	}
+
+	// Goroutines reading concurrently: LookupByID, LookupByName, ResolveMessageType
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_, _, _ = reg.LookupByID(initialDef.GetId())
+				_, _, _ = reg.LookupByName(initialDef.GetName())
+				_, _ = reg.ResolveMessageType(initialDef.GetId())
+			}
+		}(g)
+	}
+
+	// Goroutines exporting and importing concurrently
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				exp := reg.Export()
+				if exp != nil && len(exp.GetTypes()) > 0 {
+					other := NewRegistry()
+					_ = other.Import(exp)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestRegistryConsistentExportUnderConcurrentWrites(t *testing.T) {
+	reg := NewRegistry()
+
+	const numTypes = 50
+	typeDefs := make([]*sdsv1.TypeDefinition, numTypes)
+	for i := 0; i < numTypes; i++ {
+		typeName := fmt.Sprintf("SnapType%d", i)
+		fields := []*descriptorpb.FieldDescriptorProto{
+			field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+			field("val", 2, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+		}
+		def := makeTestTypeDef(typeName, fields, nil, nil, []int32{1}, nil)
+		def.Id = MinAppTypeID + uint32(i)
+		typeDefs[i] = def
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Reader goroutines continuously check Export consistency (no torn maps)
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					exp := reg.Export()
+					types := exp.GetTypes()
+					n := len(types)
+					// Verify exported types represent a valid prefix of registered versions
+					for i, def := range types {
+						expectedID := MinAppTypeID + uint32(i)
+						if def.GetId() != expectedID {
+							t.Errorf("torn export detected: index %d has ID %d, expected consecutive %d", i, def.GetId(), expectedID)
+						}
+						expectedName := fmt.Sprintf("testpkg.SnapType%d", i)
+						if def.GetName() != expectedName {
+							t.Errorf("torn export detected: index %d has name %q, expected %q", i, def.GetName(), expectedName)
+						}
+					}
+					// Also verify that LookupByID and LookupByName match for all entries in the snapshot
+					if n > 0 {
+						last := types[n-1]
+						if ldef, _, ok := reg.LookupByID(last.GetId()); !ok || ldef == nil {
+							t.Errorf("LookupByID(%d) failed for exported type", last.GetId())
+						}
+						if ldef, _, ok := reg.LookupByName(last.GetName()); !ok || ldef == nil {
+							t.Errorf("LookupByName(%q) failed for exported type", last.GetName())
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	// Writer goroutine sequentially registers new types
+	for _, def := range typeDefs {
+		if err := reg.Register(def); err != nil {
+			t.Fatalf("Register error: %v", err)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+
+	finalExp := reg.Export()
+	if len(finalExp.GetTypes()) != numTypes {
+		t.Fatalf("final export count = %d, want %d", len(finalExp.GetTypes()), numTypes)
+	}
+}
+
+func TestRegistryRejectsUnresolvableDefinition(t *testing.T) {
+	reg := NewRegistry()
+
+	// 1. Definition where message name is not found in descriptors
+	fields := []*descriptorpb.FieldDescriptorProto{
+		field("id", 1, descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL),
+	}
+	def := makeTestTypeDef("ActualMsg", fields, nil, nil, []int32{1}, nil)
+	def.Id = 16
+	// Mismatch the definition name so resolveMessageDescriptor fails
+	def.Name = "testpkg.NonExistentMsg"
+
+	err := reg.Register(def)
+	if err == nil {
+		t.Fatalf("expected error registering unresolvable definition, got nil")
+	}
+
+	// Verify that unresolvable type was not registered
+	if _, _, ok := reg.LookupByName(def.GetName()); ok {
+		t.Errorf("LookupByName succeeded for unresolvable definition")
+	}
+	if _, _, ok := reg.LookupByID(def.GetId()); ok {
+		t.Errorf("LookupByID succeeded for unresolvable definition")
+	}
+	if _, err := reg.ResolveMessageType(def.GetId()); !errors.Is(err, ErrTypeNotRegistered) {
+		t.Errorf("ResolveMessageType error = %v, want ErrTypeNotRegistered", err)
 	}
 }

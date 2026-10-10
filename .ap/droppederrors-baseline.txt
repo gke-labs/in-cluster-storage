@@ -204,7 +204,6 @@ pkg/sds/projection/sqlite/sqlite.go:(*Factory).RestoreSnapshot:os.MkdirAll
 pkg/sds/projection/sqlite/sqlite.go:(*Factory).RestoreSnapshot:os.Remove
 pkg/sds/projection/sqlite/sqlite.go:Open:(*database/sql.DB).Close
 pkg/sds/projection/sqlite/sqlite.go:Open:(*database/sql.DB).Close
-pkg/sds/record/registry.go:(*Registry).ResolveMessageType:error-only-checked-for-success:github.com/gke-labs/in-cluster-storage/pkg/sds/record.ComputeMessageFingerprint
 pkg/sds/view/applier.go:(*applier).loop:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
 pkg/sds/view/view.go:(*View).Rebuild:(github.com/gke-labs/in-cluster-storage/pkg/sds.LocalIndex).Close
 pkg/sds/view/view.go:(*View).Scan:github.com/gke-labs/in-cluster-storage/pkg/sds.ExtractKey
