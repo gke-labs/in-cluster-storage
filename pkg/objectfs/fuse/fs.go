@@ -897,10 +897,20 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 	return uint32(len(data)), fuse.OK
 }
 
+// MaxSyncRunChunks is the maximum number of contiguous chunks coalesced into a single WriteFile RPC.
+const MaxSyncRunChunks = 32
+
+// MaxSyncRunBytes is the maximum total payload size for a coalesced WriteFile RPC,
+// capped at 2 MiB to remain comfortably within the default 4 MiB gRPC receive limit.
+const MaxSyncRunBytes = 2 * 1024 * 1024
+
 func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
 	dirtyChunks, chunkGens, chunkSize, _, isDirty := fs.cache.GetDirtyChunks(inode)
 	if !isDirty || len(dirtyChunks) == 0 {
 		return nil
+	}
+	if chunkSize == 0 {
+		chunkSize = DefaultChunkSize
 	}
 
 	indices := make([]int, 0, len(dirtyChunks))
@@ -909,15 +919,58 @@ func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
 	}
 	sort.Ints(indices)
 
+	// Coalesce contiguous chunk indices into runs capped at MaxSyncRunChunks (32 chunks)
+	// and MaxSyncRunBytes (2 MiB).
+	var runs [][]int
+	var currentRun []int
+	currentRunBytes := 0
+
 	for _, idx := range indices {
 		chunkData := dirtyChunks[idx]
-		chunkGen := chunkGens[idx]
-		chunkOffset := int64(idx) * int64(chunkSize)
+		if len(currentRun) > 0 {
+			prevIdx := currentRun[len(currentRun)-1]
+			prevData := dirtyChunks[prevIdx]
+			// A chunk can continue currentRun only if:
+			// 1. It is contiguous with the previous chunk index.
+			// 2. The previous chunk has full chunkSize length (otherwise concatenating would misalign byte offsets).
+			// 3. Adding this chunk does not exceed MaxSyncRunChunks.
+			// 4. Adding this chunk does not exceed MaxSyncRunBytes.
+			if idx != prevIdx+1 || len(prevData) != int(chunkSize) || len(currentRun) >= MaxSyncRunChunks || currentRunBytes+len(chunkData) > MaxSyncRunBytes {
+				runs = append(runs, currentRun)
+				currentRun = nil
+				currentRunBytes = 0
+			}
+		}
+		currentRun = append(currentRun, idx)
+		currentRunBytes += len(chunkData)
+	}
+	if len(currentRun) > 0 {
+		runs = append(runs, currentRun)
+	}
+
+	for _, run := range runs {
+		startIdx := run[0]
+		chunkOffset := int64(startIdx) * int64(chunkSize)
+
+		var data []byte
+		if len(run) == 1 {
+			data = dirtyChunks[startIdx]
+		} else {
+			runLen := 0
+			for _, idx := range run {
+				runLen += len(dirtyChunks[idx])
+			}
+			data = make([]byte, 0, runLen)
+			for _, idx := range run {
+				data = append(data, dirtyChunks[idx]...)
+			}
+		}
+
 		resp, err := fs.client.WriteFile(ctx, &pb.WriteFileRequest{
 			VolumeId:  fs.volumeID,
 			Inode:     inode,
 			Offset:    chunkOffset,
-			Data:      chunkData,
+			Data:      data,
 			WriteMode: fs.writeMode,
 		})
 		if err != nil {
@@ -927,7 +980,9 @@ func (fs *ObjectFS) syncFileToService(ctx context.Context, inode uint64) error {
 		if resp.GetError() != 0 {
 			return syscall.Errno(resp.GetError())
 		}
-		fs.cache.MarkChunkClean(inode, idx, chunkGen)
+		for _, idx := range run {
+			fs.cache.MarkChunkClean(inode, idx, chunkGens[idx])
+		}
 	}
 
 	return nil
