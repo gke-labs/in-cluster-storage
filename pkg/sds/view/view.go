@@ -144,6 +144,9 @@ func WithFaultHook(hook func() error) Option {
 }
 
 // WithBatchAppliedHook configures a callback invoked after an applier batch is applied.
+// It is called with the view unlocked, after the batch is visible to readers and before
+// flush waiters are released; it must be cheap and must not call back into the view
+// (e.g. only bumping a counter and scheduling background work).
 func WithBatchAppliedHook(fn func(appliedPos uint64)) Option {
 	return func(v *View) {
 		v.batchAppliedHook = fn

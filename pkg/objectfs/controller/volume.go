@@ -97,8 +97,10 @@ type Volume struct {
 	closed   bool
 	closedCh chan struct{}
 
-	snapshotMu   sync.Mutex
-	batchCheckWg sync.WaitGroup
+	snapshotMu       sync.Mutex
+	batchCheckMu     sync.Mutex
+	batchCheckCond   *sync.Cond
+	batchCheckActive int
 
 	dirParents map[uint64]uint64
 
@@ -359,6 +361,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		openInodes:   make(map[uint64]int),
 		inodeUploads: make(map[uint64]*InodeUpload),
 	}
+	v.batchCheckCond = sync.NewCond(&v.batchCheckMu)
 
 	for _, opt := range opts {
 		opt(v)
@@ -745,7 +748,7 @@ func (v *Volume) Close() error {
 		}
 	}
 
-	v.batchCheckWg.Wait()
+	v.waitBatchChecks()
 
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -988,7 +991,7 @@ func (v *Volume) FlushOverlay(ctx context.Context) error {
 	if err := mView.FlushTo(ctx, targetSeq); err != nil {
 		return err
 	}
-	v.batchCheckWg.Wait()
+	v.waitBatchChecks()
 	func() {
 		v.mu.Lock()
 		defer v.mu.Unlock()
@@ -3664,9 +3667,19 @@ func (v *Volume) assertStatsMatchLocked(reason string) {
 // stats consistency without blocking the applier or deadlocking with callers holding v.mu;
 // this is intended and safe for test and debug verification.
 func (v *Volume) checkStatsOnBatchApplied(appliedPos uint64) {
-	v.batchCheckWg.Add(1)
+	v.batchCheckMu.Lock()
+	v.batchCheckActive++
+	v.batchCheckMu.Unlock()
+
 	go func() {
-		defer v.batchCheckWg.Done()
+		defer func() {
+			v.batchCheckMu.Lock()
+			v.batchCheckActive--
+			if v.batchCheckActive == 0 {
+				v.batchCheckCond.Broadcast()
+			}
+			v.batchCheckMu.Unlock()
+		}()
 		v.mu.Lock()
 		defer v.mu.Unlock()
 		if v.closed {
@@ -3676,6 +3689,14 @@ func (v *Volume) checkStatsOnBatchApplied(appliedPos uint64) {
 			v.assertStatsMatchLocked("batch brought appliedPos to lastCommitSeq")
 		}
 	}()
+}
+
+func (v *Volume) waitBatchChecks() {
+	v.batchCheckMu.Lock()
+	for v.batchCheckActive > 0 {
+		v.batchCheckCond.Wait()
+	}
+	v.batchCheckMu.Unlock()
 }
 
 func (v *Volume) initLiveStatsLocked() {

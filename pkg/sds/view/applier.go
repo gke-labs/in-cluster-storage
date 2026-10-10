@@ -359,6 +359,13 @@ func (a *applier) loop() {
 			a.v.appliedPos = batchMaxSeq
 		}
 
+		hook := a.v.batchAppliedHook
+		if hook != nil {
+			a.v.mu.Unlock()
+			hook(batchMaxSeq)
+			a.v.mu.Lock()
+		}
+
 		// Signal any blocked writers or flush waiters
 		if a.v.backpressureCond != nil {
 			a.v.backpressureCond.Broadcast()
@@ -366,11 +373,6 @@ func (a *applier) loop() {
 		if a.v.flushCond != nil {
 			a.v.flushCond.Broadcast()
 		}
-		hook := a.v.batchAppliedHook
 		a.v.mu.Unlock()
-
-		if hook != nil {
-			hook(batchMaxSeq)
-		}
 	}
 }
