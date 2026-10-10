@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"google.golang.org/protobuf/proto"
@@ -42,31 +43,58 @@ type typeEntry struct {
 	resolvedType protoreflect.MessageType
 }
 
-// Registry maintains the in-band type definitions for a structured stream.
-// It is thread-safe.
-type Registry struct {
-	mu     sync.RWMutex
+type registrySnapshot struct {
 	types  map[uint32]*typeEntry
 	byName map[string]uint32
 	nextID uint32
 }
 
-// NewRegistry creates a new empty Registry with IDs starting at MinAppTypeID (16).
-func NewRegistry() *Registry {
-	return &Registry{
-		types:  make(map[uint32]*typeEntry),
-		byName: make(map[string]uint32),
-		nextID: MinAppTypeID,
+func cloneSnapshot(s *registrySnapshot) *registrySnapshot {
+	newTypes := make(map[uint32]*typeEntry, len(s.types)+1)
+	for k, v := range s.types {
+		newTypes[k] = v
+	}
+	newByName := make(map[string]uint32, len(s.byName)+1)
+	for k, v := range s.byName {
+		newByName[k] = v
+	}
+	return &registrySnapshot{
+		types:  newTypes,
+		byName: newByName,
+		nextID: s.nextID,
 	}
 }
 
-// AllocateID allocates the next available unused application type ID.
-func (r *Registry) AllocateID() uint32 {
+// Registry maintains the in-band type definitions for a structured stream.
+// An immutable snapshot is swapped atomically; writers are serialised by an internal mutex;
+// safe for concurrent use.
+type Registry struct {
+	snap atomic.Pointer[registrySnapshot]
+	mu   sync.Mutex
+}
+
+// NewRegistry creates a new empty Registry with IDs starting at MinAppTypeID (16).
+func NewRegistry() *Registry {
+	r := &Registry{}
+	r.snap.Store(&registrySnapshot{
+		types:  make(map[uint32]*typeEntry),
+		byName: make(map[string]uint32),
+		nextID: MinAppTypeID,
+	})
+	return r
+}
+
+func (r *Registry) update(fn func(s *registrySnapshot) error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	id := r.nextID
-	r.nextID++
-	return id
+
+	cur := r.snap.Load()
+	next := cloneSnapshot(cur)
+	if err := fn(next); err != nil {
+		return err
+	}
+	r.snap.Store(next)
+	return nil
 }
 
 // Register applies or updates a TypeDefinition in the registry according to SDS rules:
@@ -75,6 +103,16 @@ func (r *Registry) AllocateID() uint32 {
 //   - A new fingerprint for an existing ID is allowed only if it is a compatible schema evolution.
 //   - Incompatible changes are rejected with an error.
 func (r *Registry) Register(def *sdsv1.TypeDefinition) error {
+	if def == nil {
+		return fmt.Errorf("nil TypeDefinition")
+	}
+	defCopy := proto.Clone(def).(*sdsv1.TypeDefinition)
+	return r.update(func(s *registrySnapshot) error {
+		return registerIntoSnapshot(s, defCopy)
+	})
+}
+
+func registerIntoSnapshot(s *registrySnapshot, def *sdsv1.TypeDefinition) error {
 	if def == nil {
 		return fmt.Errorf("nil TypeDefinition")
 	}
@@ -88,10 +126,7 @@ func (r *Registry) Register(def *sdsv1.TypeDefinition) error {
 		return fmt.Errorf("empty fingerprint in TypeDefinition")
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	existing, ok := r.types[def.GetId()]
+	existing, ok := s.types[def.GetId()]
 	if ok {
 		// Idempotency check: same fingerprint is a no-op (rule 4).
 		if bytes.Equal(existing.def.GetFingerprint(), def.GetFingerprint()) {
@@ -109,12 +144,17 @@ func (r *Registry) Register(def *sdsv1.TypeDefinition) error {
 			return err
 		}
 
-		defCopy := proto.Clone(def).(*sdsv1.TypeDefinition)
-		r.types[def.GetId()] = &typeEntry{
-			def:        defCopy,
-			descriptor: md,
+		msgType, err := resolveMessageType(def, md)
+		if err != nil {
+			return err
 		}
-		r.byName[def.GetName()] = def.GetId()
+
+		s.types[def.GetId()] = &typeEntry{
+			def:          def,
+			descriptor:   md,
+			resolvedType: msgType,
+		}
+		s.byName[def.GetName()] = def.GetId()
 		return nil
 	}
 
@@ -156,15 +196,20 @@ func (r *Registry) Register(def *sdsv1.TypeDefinition) error {
 		}
 	}
 
-	defCopy := proto.Clone(def).(*sdsv1.TypeDefinition)
-	r.types[def.GetId()] = &typeEntry{
-		def:        defCopy,
-		descriptor: md,
+	msgType, err := resolveMessageType(def, md)
+	if err != nil {
+		return err
 	}
-	r.byName[def.GetName()] = def.GetId()
 
-	if def.GetId() >= r.nextID {
-		r.nextID = def.GetId() + 1
+	s.types[def.GetId()] = &typeEntry{
+		def:          def,
+		descriptor:   md,
+		resolvedType: msgType,
+	}
+	s.byName[def.GetName()] = def.GetId()
+
+	if def.GetId() >= s.nextID {
+		s.nextID = def.GetId() + 1
 	}
 
 	return nil
@@ -186,6 +231,26 @@ func resolveMessageDescriptor(def *sdsv1.TypeDefinition) (protoreflect.MessageDe
 	return md, nil
 }
 
+func resolveMessageType(def *sdsv1.TypeDefinition, md protoreflect.MessageDescriptor) (protoreflect.MessageType, error) {
+	if md == nil {
+		return nil, fmt.Errorf("nil message descriptor")
+	}
+
+	fullName := protoreflect.FullName(def.GetName())
+	if globalType, err := protoregistry.GlobalTypes.FindMessageByName(fullName); err == nil && globalType != nil {
+		compiledMD := globalType.Descriptor()
+		compiledFP, _, err := ComputeMessageFingerprint(compiledMD)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compute fingerprint for compiled type %s: %w", fullName, err)
+		}
+		if bytes.Equal(compiledFP, def.GetFingerprint()) {
+			return globalType, nil
+		}
+	}
+
+	return dynamicpb.NewMessageType(md), nil
+}
+
 // RegisterMessage registers a proto.Message, allocating a new type ID if not already registered,
 // or updating it if compatibly evolved.
 func (r *Registry) RegisterMessage(msg proto.Message, keyFields ...int32) (*sdsv1.TypeDefinition, error) {
@@ -202,35 +267,35 @@ func (r *Registry) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFiel
 		return nil, fmt.Errorf("nil message descriptor")
 	}
 
-	name := string(md.FullName())
-	r.mu.Lock()
-	existingID, exists := r.byName[name]
-	r.mu.Unlock()
+	var resultDef *sdsv1.TypeDefinition
+	err := r.update(func(s *registrySnapshot) error {
+		name := string(md.FullName())
+		typeID, exists := s.byName[name]
+		if !exists {
+			typeID = s.nextID
+		}
 
-	var typeID uint32
-	if exists {
-		typeID = existingID
-	} else {
-		typeID = r.AllocateID()
-	}
+		def, err := BuildTypeDefinition(typeID, md, keyFields)
+		if err != nil {
+			return err
+		}
 
-	def, err := BuildTypeDefinition(typeID, md, keyFields)
+		if err := registerIntoSnapshot(s, def); err != nil {
+			return err
+		}
+		resultDef = def
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	if err := r.Register(def); err != nil {
-		return nil, err
-	}
-
-	return def, nil
+	return resultDef, nil
 }
 
 // LookupByID returns the TypeDefinition and MessageDescriptor for a registered type ID.
 func (r *Registry) LookupByID(id uint32) (*sdsv1.TypeDefinition, protoreflect.MessageDescriptor, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	entry, ok := r.types[id]
+	snap := r.snap.Load()
+	entry, ok := snap.types[id]
 	if !ok {
 		return nil, nil, false
 	}
@@ -239,13 +304,12 @@ func (r *Registry) LookupByID(id uint32) (*sdsv1.TypeDefinition, protoreflect.Me
 
 // LookupByName returns the TypeDefinition and MessageDescriptor for a registered message name.
 func (r *Registry) LookupByName(name string) (*sdsv1.TypeDefinition, protoreflect.MessageDescriptor, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	id, ok := r.byName[name]
+	snap := r.snap.Load()
+	id, ok := snap.byName[name]
 	if !ok {
 		return nil, nil, false
 	}
-	entry, ok := r.types[id]
+	entry, ok := snap.types[id]
 	if !ok {
 		return nil, nil, false
 	}
@@ -253,60 +317,24 @@ func (r *Registry) LookupByName(name string) (*sdsv1.TypeDefinition, protoreflec
 }
 
 // ResolveMessageType returns a protoreflect.MessageType for the given type ID.
-// If the generated Go type is present in protoregistry.GlobalTypes and has a matching fingerprint,
-// its MessageType is returned. Otherwise, dynamicpb.NewMessageType is returned.
-// Resolved MessageType results are cached per typeEntry (keyed by definition fingerprint).
 func (r *Registry) ResolveMessageType(id uint32) (protoreflect.MessageType, error) {
-	r.mu.RLock()
-	entry, ok := r.types[id]
-	if ok && entry.resolvedType != nil {
-		msgType := entry.resolvedType
-		r.mu.RUnlock()
-		return msgType, nil
-	}
-	r.mu.RUnlock()
-
+	snap := r.snap.Load()
+	entry, ok := snap.types[id]
 	if !ok {
 		return nil, fmt.Errorf("%w: %d", ErrTypeNotRegistered, id)
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	entry, ok = r.types[id]
-	if !ok {
-		return nil, fmt.Errorf("%w: %d", ErrTypeNotRegistered, id)
-	}
-	if entry.resolvedType != nil {
-		return entry.resolvedType, nil
-	}
-
-	// Check if compiled Go type exists in protoregistry.GlobalTypes.
-	fullName := protoreflect.FullName(entry.def.GetName())
-	if globalType, err := protoregistry.GlobalTypes.FindMessageByName(fullName); err == nil && globalType != nil {
-		// Verify if compiled Go descriptor has the same fingerprint.
-		compiledMD := globalType.Descriptor()
-		if compiledFP, _, err := ComputeMessageFingerprint(compiledMD); err == nil {
-			if bytes.Equal(compiledFP, entry.def.GetFingerprint()) {
-				entry.resolvedType = globalType
-				return globalType, nil
-			}
-		}
-	}
-
-	// Fallback to dynamicpb.
-	entry.resolvedType = dynamicpb.NewMessageType(entry.descriptor)
 	return entry.resolvedType, nil
 }
 
 // Export returns the entire registry state as a Registry proto message.
+// Returned TypeDefinitions are shared immutable references under the view read-only contract;
+// callers must not mutate them.
 func (r *Registry) Export() *sdsv1.Registry {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	snap := r.snap.Load()
 
-	var types []*sdsv1.TypeDefinition
-	for _, entry := range r.types {
-		types = append(types, proto.Clone(entry.def).(*sdsv1.TypeDefinition))
+	types := make([]*sdsv1.TypeDefinition, 0, len(snap.types))
+	for _, entry := range snap.types {
+		types = append(types, entry.def)
 	}
 
 	sort.Slice(types, func(i, j int) bool {
@@ -323,10 +351,17 @@ func (r *Registry) Import(reg *sdsv1.Registry) error {
 	if reg == nil {
 		return nil
 	}
-	for _, def := range reg.GetTypes() {
-		if err := r.Register(def); err != nil {
-			return err
+
+	return r.update(func(s *registrySnapshot) error {
+		for _, def := range reg.GetTypes() {
+			if def == nil {
+				continue
+			}
+			defCopy := proto.Clone(def).(*sdsv1.TypeDefinition)
+			if err := registerIntoSnapshot(s, defCopy); err != nil {
+				return err
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
