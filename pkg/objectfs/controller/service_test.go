@@ -43,6 +43,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
@@ -4307,5 +4308,372 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 	staleResp, err := testReadFile(ctx, server1Restarted, volumeID, "/stale_local_file.txt", 0, 1024)
 	if err == nil && staleResp.GetError() == 0 {
 		t.Fatalf("expected /stale_local_file.txt to not exist on authoritative volume, but got data: %q", string(staleResp.GetData()))
+	}
+}
+
+type chunkFaultBackend struct {
+	ObjectStorageBackend
+	mu        sync.Mutex
+	failPacks map[string]bool
+	failAll   bool
+	packFiles []string
+}
+
+func newChunkFaultBackend(base ObjectStorageBackend) *chunkFaultBackend {
+	return &chunkFaultBackend{
+		ObjectStorageBackend: base,
+		failPacks:            make(map[string]bool),
+	}
+}
+
+func (b *chunkFaultBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
+	b.mu.Lock()
+	if strings.HasSuffix(key, ".pack") || strings.Contains(key, "blobs/") {
+		b.packFiles = append(b.packFiles, key)
+	}
+	b.mu.Unlock()
+	return b.ObjectStorageBackend.PutObject(ctx, volumeID, key, stream)
+}
+
+func (b *chunkFaultBackend) setFailPack(key string, fail bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.failPacks[key] = fail
+}
+
+func (b *chunkFaultBackend) setFailAll(fail bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.failAll = fail
+}
+
+func (b *chunkFaultBackend) GetObject(ctx context.Context, volumeID, key string, offset, length int64, w io.Writer) error {
+	b.mu.Lock()
+	failAll := b.failAll
+	failPack := b.failPacks[key]
+	b.mu.Unlock()
+
+	if failAll || failPack {
+		return fmt.Errorf("simulated object get failure for key: %s", key)
+	}
+	return b.ObjectStorageBackend.GetObject(ctx, volumeID, key, offset, length, w)
+}
+
+func TestChunkFetchFailurePropagated(t *testing.T) {
+	ctx := t.Context()
+	walDir := t.TempDir()
+	volumeID := "test-chunk-fetch-failure"
+	streamID := StreamIDForVolume(volumeID)
+
+	stream, err := walclient.Open(ctx, walDir, streamID, "")
+	if err != nil {
+		t.Fatalf("walclient.Open failed: %v", err)
+	}
+
+	rawBackend := NewMemoryBackend()
+	backend := newChunkFaultBackend(rawBackend)
+	chunkSize := uint32(16 * 1024)
+
+	vol := NewVolume(volumeID, backend, NewEventBroadcaster(),
+		WithStream(stream),
+		WithChunkSize(chunkSize),
+		WithDurability(walclient.Local),
+	)
+	defer vol.Close()
+
+	if err := vol.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed: %v", err)
+	}
+
+	// 1. Create a 32 KiB chunked file across 2 separate flushes so chunk 0 and chunk 1 are in separate packs.
+	chunk0Data := bytes.Repeat([]byte("A"), int(chunkSize))
+	chunk1Data := bytes.Repeat([]byte("B"), int(chunkSize))
+	fullData := append(append([]byte(nil), chunk0Data...), chunk1Data...)
+
+	attr, err := volCreateFile(ctx, vol, "/file.bin", 0644, chunk0Data, 0, 0)
+	if err != nil {
+		t.Fatalf("volCreateFile failed: %v", err)
+	}
+	ino := attr.GetInode().GetIno()
+
+	// Flush chunk 0
+	if err := vol.FlushToBackend(ctx); err != nil {
+		t.Fatalf("FlushToBackend chunk 0 failed: %v", err)
+	}
+
+	// Append chunk 1 and flush
+	_, _, _, err = vol.WriteFile(ctx, ino, int64(chunkSize), chunk1Data, pb.WriteMode_LAZY_WRITE)
+	if err != nil {
+		t.Fatalf("WriteFile chunk 1 failed: %v", err)
+	}
+	if err := vol.FlushToBackend(ctx); err != nil {
+		t.Fatalf("FlushToBackend chunk 1 failed: %v", err)
+	}
+
+	if len(backend.packFiles) < 2 {
+		t.Fatalf("expected at least 2 packfiles, got %d", len(backend.packFiles))
+	}
+	chunk1Pack := backend.packFiles[len(backend.packFiles)-1]
+
+	// Verify reading both chunks succeeds before inducing failure.
+	read0, _, _, err := vol.ReadFile(ctx, ino, 0, int64(chunkSize))
+	if err != nil || !bytes.Equal(read0, chunk0Data) {
+		t.Fatalf("initial read chunk 0 failed: %v", err)
+	}
+	read1, _, _, err := vol.ReadFile(ctx, ino, int64(chunkSize), int64(chunkSize))
+	if err != nil || !bytes.Equal(read1, chunk1Data) {
+		t.Fatalf("initial read chunk 1 failed: %v", err)
+	}
+
+	// 2. Fail chunk 1 fetch only.
+	backend.setFailPack(chunk1Pack, true)
+
+	// Read chunk 0 must still succeed:
+	read0After, _, _, err := vol.ReadFile(ctx, ino, 0, int64(chunkSize))
+	if err != nil || !bytes.Equal(read0After, chunk0Data) {
+		t.Fatalf("read chunk 0 should succeed when only chunk 1 fails, got err: %v", err)
+	}
+
+	// Read range covering chunk 1 must fail (NOT zeros):
+	_, _, _, err = vol.ReadFile(ctx, ino, int64(chunkSize), int64(chunkSize))
+	if err == nil {
+		t.Fatalf("expected ReadFile on failed chunk 1 to return an error, but got nil")
+	}
+
+	// Read range spanning chunk 0 and chunk 1 must fail:
+	_, _, _, err = vol.ReadFile(ctx, ino, 0, int64(2*chunkSize))
+	if err == nil {
+		t.Fatalf("expected ReadFile spanning failed chunk 1 to return an error, but got nil")
+	}
+
+	// 3. Partial-chunk WriteFile when chunk fetch fails:
+	// Must return an error and NOT commit any changes (no data corruption).
+	origSeq, _, _ := stream.Watermarks()
+	origAttr, err := vol.GetAttr(ctx, ino)
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+
+	patch := []byte("corrupt-overwrite")
+	_, _, _, err = vol.WriteFile(ctx, ino, int64(chunkSize)+100, patch, pb.WriteMode_LAZY_WRITE)
+	if err == nil {
+		t.Fatalf("expected WriteFile to fail when chunk fetch fails, got nil")
+	}
+
+	// Assert WAL stream watermark is unchanged (no commit logged)
+	currSeq, _, _ := stream.Watermarks()
+	if currSeq != origSeq {
+		t.Fatalf("expected stream watermark to be unchanged (%d), got %d", origSeq, currSeq)
+	}
+
+	// Assert inode row is unchanged
+	afterAttr, err := vol.GetAttr(ctx, ino)
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if afterAttr.GetInode().GetSize() != origAttr.GetInode().GetSize() {
+		t.Fatalf("inode size changed: got %d, want %d", afterAttr.GetInode().GetSize(), origAttr.GetInode().GetSize())
+	}
+	if afterAttr.GetInode().GetMtime().AsTime() != origAttr.GetInode().GetMtime().AsTime() {
+		t.Fatalf("inode mtime changed after failed write")
+	}
+
+	// 4. Partial-chunk TruncateFile when chunk fetch fails:
+	// Must return an error and NOT commit any changes.
+	_, err = vol.TruncateFile(ctx, ino, int64(chunkSize)+500)
+	if err == nil {
+		t.Fatalf("expected TruncateFile to fail when chunk fetch fails, got nil")
+	}
+	currSeq, _, _ = stream.Watermarks()
+	if currSeq != origSeq {
+		t.Fatalf("expected stream watermark to be unchanged after failed truncate (%d), got %d", origSeq, currSeq)
+	}
+	afterTruncAttr, err := vol.GetAttr(ctx, ino)
+	if err != nil {
+		t.Fatalf("GetAttr failed: %v", err)
+	}
+	if afterTruncAttr.GetInode().GetSize() != origAttr.GetInode().GetSize() {
+		t.Fatalf("inode size changed after failed truncate: got %d, want %d", afterTruncAttr.GetInode().GetSize(), origAttr.GetInode().GetSize())
+	}
+
+	// 5. Restore backend and verify the file content is still completely intact.
+	backend.setFailPack(chunk1Pack, false)
+
+	fullRead, total, _, err := vol.ReadFile(ctx, ino, 0, int64(2*chunkSize))
+	if err != nil {
+		t.Fatalf("ReadFile after restoring backend failed: %v", err)
+	}
+	if total != int64(2*chunkSize) {
+		t.Fatalf("expected total %d, got %d", 2*chunkSize, total)
+	}
+	if !bytes.Equal(fullRead, fullData) {
+		t.Fatalf("data corrupted: read data does not match original data")
+	}
+
+	// 6. Legitimate hole test:
+	// Truncate file up to 48 KiB (chunk 2 is a hole, no chunk row in index).
+	// Even if backend fails all requests, reading the hole range must succeed and return zeros without error.
+	_, err = vol.TruncateFile(ctx, ino, int64(3*chunkSize))
+	if err != nil {
+		t.Fatalf("extending TruncateFile failed: %v", err)
+	}
+
+	backend.setFailAll(true)
+	holeData, holeTotal, _, err := vol.ReadFile(ctx, ino, int64(2*chunkSize), int64(chunkSize))
+	if err != nil {
+		t.Fatalf("ReadFile on legitimate hole failed when backend down: %v", err)
+	}
+	if holeTotal != int64(3*chunkSize) {
+		t.Fatalf("expected total %d, got %d", 3*chunkSize, holeTotal)
+	}
+	if !bytes.Equal(holeData, make([]byte, chunkSize)) {
+		t.Fatalf("expected zeros for hole chunk, got non-zero bytes")
+	}
+	backend.setFailAll(false)
+
+	// 7. Legacy whole-file fallback:
+	// A file with Sha256 set on the Inode row but no chunk rows.
+	legacyData := []byte("legacy-whole-file-content")
+	legacySha := fmt.Sprintf("%x", sha256.Sum256(legacyData))
+	vol.mu.Lock()
+	err = vol.blobStore.PutBlobs(ctx, map[string]blob.ByteStream{
+		legacySha: blob.NewByteStreamFromBytes(legacyData),
+	})
+	vol.mu.Unlock()
+	if err != nil {
+		t.Fatalf("PutBlobs for legacy blob failed: %v", err)
+	}
+
+	vol.mu.Lock()
+	legacyTx := vol.beginTxLocked("legacy-insert")
+	legacyIno := vol.allocInode(legacyTx)
+	_, err = legacyTx.Insert(ctx, &pb.Inode{
+		Ino:           proto.Uint64(legacyIno),
+		Size:          int64(len(legacyData)),
+		Sha256:        legacySha,
+		ContentSha256: legacySha,
+		Nlink:         1,
+	})
+	if err != nil {
+		vol.mu.Unlock()
+		t.Fatalf("Insert legacy Inode failed: %v", err)
+	}
+	commitSeq, err := legacyTx.Commit(ctx)
+	if err != nil {
+		vol.mu.Unlock()
+		t.Fatalf("Commit legacy Inode failed: %v", err)
+	}
+	vol.applyTxChangesLocked(ctx, legacyTx)
+	waitFn := vol.makeWaitFn(commitSeq, nil)
+	vol.mu.Unlock()
+	if waitFn != nil {
+		_ = waitFn(ctx)
+	}
+
+	// When backend fails, ReadFile must return an error rather than zeros:
+	backend.setFailAll(true)
+	_, _, _, err = vol.ReadFile(ctx, legacyIno, 0, int64(len(legacyData)))
+	if err == nil {
+		t.Fatalf("expected ReadFile on legacy blob to return error when backend fails, got nil")
+	}
+	backend.setFailAll(false)
+
+	// When backend succeeds, ReadFile returns the legacy content:
+	legacyRead, _, _, err := vol.ReadFile(ctx, legacyIno, 0, int64(len(legacyData)))
+	if err != nil || !bytes.Equal(legacyRead, legacyData) {
+		t.Fatalf("expected ReadFile on legacy blob to return data, got err=%v, data=%q", err, string(legacyRead))
+	}
+}
+
+func TestServerEIOOnError(t *testing.T) {
+	ctx := t.Context()
+	rawBackend := NewMemoryBackend()
+	backend := newChunkFaultBackend(rawBackend)
+	server := NewServer(backend)
+	volumeID := "test-server-eio-vol"
+
+	// Create chunked file via server across 2 flushes
+	chunkSize := 64 * 1024
+	chunk0Data := bytes.Repeat([]byte("X"), chunkSize)
+	chunk1Data := bytes.Repeat([]byte("Y"), chunkSize)
+
+	createResp, err := testCreateFile(ctx, server, volumeID, "/fail.bin", 0644, chunk0Data, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("testCreateFile failed: %v (err code %d)", err, createResp.GetError())
+	}
+	ino := createResp.GetAttr().GetInode().GetIno()
+
+	// Flush volume for chunk 0
+	vol, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	if err := vol.FlushToBackend(ctx); err != nil {
+		t.Fatalf("FlushToBackend failed: %v", err)
+	}
+
+	// Write chunk 1 and flush
+	write1Resp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     ino,
+		Offset:    int64(chunkSize),
+		Data:      chunk1Data,
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil || write1Resp.GetError() != 0 {
+		t.Fatalf("server WriteFile chunk 1 failed: %v (err %d)", err, write1Resp.GetError())
+	}
+	if err := vol.FlushToBackend(ctx); err != nil {
+		t.Fatalf("FlushToBackend chunk 1 failed: %v", err)
+	}
+
+	if len(backend.packFiles) < 2 {
+		t.Fatalf("expected at least 2 packfiles, got %d", len(backend.packFiles))
+	}
+	chunk1Pack := backend.packFiles[len(backend.packFiles)-1]
+
+	// Fail chunk 1 fetch
+	backend.setFailPack(chunk1Pack, true)
+
+	// ReadFile via server should return EIO
+	readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Offset:   int64(chunkSize),
+		Size:     int64(chunkSize),
+	})
+	if err != nil {
+		t.Fatalf("Server ReadFile RPC error: %v", err)
+	}
+	if readResp.GetError() != int32(syscall.EIO) {
+		t.Fatalf("expected ReadFile to return EIO (%d), got error %d", syscall.EIO, readResp.GetError())
+	}
+
+	// WriteFile via server on chunk 1 should return EIO
+	writeResp, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId:  volumeID,
+		Inode:     ino,
+		Offset:    int64(chunkSize) + 50,
+		Data:      []byte("mod"),
+		WriteMode: pb.WriteMode_LAZY_WRITE,
+	})
+	if err != nil {
+		t.Fatalf("Server WriteFile RPC error: %v", err)
+	}
+	if writeResp.GetError() != int32(syscall.EIO) {
+		t.Fatalf("expected WriteFile to return EIO (%d), got error %d", syscall.EIO, writeResp.GetError())
+	}
+
+	// TruncateFile via server touching chunk 1 should return EIO
+	truncResp, err := server.TruncateFile(ctx, &pb.TruncateFileRequest{
+		VolumeId: volumeID,
+		Inode:    ino,
+		Size:     int64(chunkSize) + 500,
+	})
+	if err != nil {
+		t.Fatalf("Server TruncateFile RPC error: %v", err)
+	}
+	if truncResp.GetError() != int32(syscall.EIO) {
+		t.Fatalf("expected TruncateFile to return EIO (%d), got error %d", syscall.EIO, truncResp.GetError())
 	}
 }
