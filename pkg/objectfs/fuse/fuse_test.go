@@ -2450,3 +2450,338 @@ func TestFUSEConcurrentOperationsRace(t *testing.T) {
 		}
 	}
 }
+
+type recordingClient struct {
+	pb.ObjectFSControllerClient
+	mu        sync.Mutex
+	writeReqs []*pb.WriteFileRequest
+	failWrite bool
+}
+
+func (c *recordingClient) WriteFile(ctx context.Context, in *pb.WriteFileRequest, opts ...grpc.CallOption) (*pb.WriteFileResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failWrite {
+		return nil, status.Errorf(codes.Unavailable, "injected write failure")
+	}
+	c.writeReqs = append(c.writeReqs, proto.Clone(in).(*pb.WriteFileRequest))
+	return c.ObjectFSControllerClient.WriteFile(ctx, in, opts...)
+}
+
+func TestSyncFileToServiceCoalescesContiguousChunks(t *testing.T) {
+	baseClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	rec := &recordingClient{ObjectFSControllerClient: baseClient}
+	cache := NewNodeCache(8 * 1024 * 1024)
+	fs := NewObjectFS(rec, "vol-coalesce", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := fs.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test_coalesce.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	// Write 3 full 64KB chunks sequentially
+	const cs = int64(DefaultChunkSize)
+	data := make([]byte, 3*cs)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	cache.WriteAt(fileID, 0, data, time.Now())
+
+	ctx := t.Context()
+	if err := fs.syncFileToService(ctx, fileID); err != nil {
+		t.Fatalf("syncFileToService failed: %v", err)
+	}
+
+	rec.mu.Lock()
+	reqs := rec.writeReqs
+	rec.mu.Unlock()
+
+	if len(reqs) != 1 {
+		t.Fatalf("Expected 1 coalesced WriteFile RPC, got %d", len(reqs))
+	}
+	if reqs[0].Offset != 0 {
+		t.Errorf("Expected offset 0, got %d", reqs[0].Offset)
+	}
+	if int64(len(reqs[0].Data)) != 3*cs {
+		t.Errorf("Expected data len %d, got %d", 3*cs, len(reqs[0].Data))
+	}
+	if !bytes.Equal(reqs[0].Data, data) {
+		t.Errorf("Concatenated data content mismatch")
+	}
+
+	if _, isDirty := cache.GetDirty(fileID); isDirty {
+		t.Errorf("Expected cache to be clean after sync")
+	}
+}
+
+func TestSyncFileToServiceNonContiguousRuns(t *testing.T) {
+	baseClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	rec := &recordingClient{ObjectFSControllerClient: baseClient}
+	cache := NewNodeCache(8 * 1024 * 1024)
+	fs := NewObjectFS(rec, "vol-noncontiguous", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := fs.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test_noncontiguous.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const cs = int64(DefaultChunkSize)
+	// Write chunk 0 & 1 (contiguous), chunk 4 (isolated), chunk 7 & 8 (contiguous)
+	d01 := make([]byte, 2*cs)
+	d4 := make([]byte, cs)
+	d78 := make([]byte, 2*cs)
+	cache.WriteAt(fileID, 0, d01, time.Now())
+	cache.WriteAt(fileID, 4*cs, d4, time.Now())
+	cache.WriteAt(fileID, 7*cs, d78, time.Now())
+
+	ctx := t.Context()
+	if err := fs.syncFileToService(ctx, fileID); err != nil {
+		t.Fatalf("syncFileToService failed: %v", err)
+	}
+
+	rec.mu.Lock()
+	reqs := rec.writeReqs
+	rec.mu.Unlock()
+
+	if len(reqs) != 3 {
+		t.Fatalf("Expected 3 WriteFile RPCs for 3 non-contiguous runs, got %d", len(reqs))
+	}
+
+	// Run 1: chunks 0..1
+	if reqs[0].Offset != 0 || int64(len(reqs[0].Data)) != 2*cs {
+		t.Errorf("Run 1 mismatch: offset=%d len=%d want offset=0 len=%d", reqs[0].Offset, len(reqs[0].Data), 2*cs)
+	}
+	// Run 2: chunk 4
+	if reqs[1].Offset != 4*cs || int64(len(reqs[1].Data)) != cs {
+		t.Errorf("Run 2 mismatch: offset=%d len=%d want offset=%d len=%d", reqs[1].Offset, len(reqs[1].Data), 4*cs, cs)
+	}
+	// Run 3: chunks 7..8
+	if reqs[2].Offset != 7*cs || int64(len(reqs[2].Data)) != 2*cs {
+		t.Errorf("Run 3 mismatch: offset=%d len=%d want offset=%d len=%d", reqs[2].Offset, len(reqs[2].Data), 7*cs, 2*cs)
+	}
+
+	if _, isDirty := cache.GetDirty(fileID); isDirty {
+		t.Errorf("Expected cache to be clean after sync")
+	}
+}
+
+func TestSyncFileToServiceSplitsAt32ChunksAnd2MiB(t *testing.T) {
+	baseClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	rec := &recordingClient{ObjectFSControllerClient: baseClient}
+	cache := NewNodeCache(16 * 1024 * 1024)
+	fs := NewObjectFS(rec, "vol-split-32", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := fs.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test_split.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const cs = int64(DefaultChunkSize)
+	const totalChunks = 35
+	data := make([]byte, totalChunks*cs)
+	for i := range data {
+		data[i] = byte((i * 17) & 0xFF)
+	}
+	cache.WriteAt(fileID, 0, data, time.Now())
+
+	ctx := t.Context()
+	if err := fs.syncFileToService(ctx, fileID); err != nil {
+		t.Fatalf("syncFileToService failed: %v", err)
+	}
+
+	rec.mu.Lock()
+	reqs := rec.writeReqs
+	rec.mu.Unlock()
+
+	// 35 chunks should be split into 32 chunks (2 MiB) + 3 chunks (192 KiB)
+	if len(reqs) != 2 {
+		t.Fatalf("Expected 2 WriteFile RPCs due to 32 chunk / 2 MiB cap, got %d", len(reqs))
+	}
+
+	if reqs[0].Offset != 0 || int64(len(reqs[0].Data)) != 32*cs {
+		t.Errorf("Run 1 mismatch: offset=%d len=%d want offset=0 len=%d", reqs[0].Offset, len(reqs[0].Data), 32*cs)
+	}
+	if reqs[1].Offset != 32*cs || int64(len(reqs[1].Data)) != 3*cs {
+		t.Errorf("Run 2 mismatch: offset=%d len=%d want offset=%d len=%d", reqs[1].Offset, len(reqs[1].Data), 32*cs, 3*cs)
+	}
+
+	if _, isDirty := cache.GetDirty(fileID); isDirty {
+		t.Errorf("Expected cache to be clean after sync")
+	}
+}
+
+func TestSyncFileToServicePartialChunkBoundary(t *testing.T) {
+	baseClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	rec := &recordingClient{ObjectFSControllerClient: baseClient}
+	cache := NewNodeCache(8 * 1024 * 1024)
+	fs := NewObjectFS(rec, "vol-partial", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := fs.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test_partial.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const cs = int64(DefaultChunkSize)
+	// Write 100 bytes at offset 0 (chunk 0 is partial)
+	cache.WriteAt(fileID, 0, make([]byte, 100), time.Now())
+	// Then write 64KB at offset cs (chunk 1)
+	cache.WriteAt(fileID, cs, make([]byte, cs), time.Now())
+
+	ctx := t.Context()
+	if err := fs.syncFileToService(ctx, fileID); err != nil {
+		t.Fatalf("syncFileToService failed: %v", err)
+	}
+
+	rec.mu.Lock()
+	reqs := rec.writeReqs
+	rec.mu.Unlock()
+
+	// Chunk 0 is partial (100 < 65536), so chunk 1 cannot be coalesced into it.
+	if len(reqs) != 2 {
+		t.Fatalf("Expected 2 separate WriteFile RPCs because chunk 0 was partial, got %d", len(reqs))
+	}
+	if reqs[0].Offset != 0 || len(reqs[0].Data) != 100 {
+		t.Errorf("Run 1 mismatch: offset=%d len=%d want offset=0 len=100", reqs[0].Offset, len(reqs[0].Data))
+	}
+	if reqs[1].Offset != cs || int64(len(reqs[1].Data)) != cs {
+		t.Errorf("Run 2 mismatch: offset=%d len=%d want offset=%d len=%d", reqs[1].Offset, len(reqs[1].Data), cs, cs)
+	}
+}
+
+func TestSyncFileToServiceRPCFailureLeavesChunksDirty(t *testing.T) {
+	baseClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	rec := &recordingClient{
+		ObjectFSControllerClient: baseClient,
+		failWrite:                true,
+	}
+	cache := NewNodeCache(8 * 1024 * 1024)
+	fs := NewObjectFS(rec, "vol-fail", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := fs.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test_fail.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const cs = int64(DefaultChunkSize)
+	cache.WriteAt(fileID, 0, make([]byte, 2*cs), time.Now())
+
+	ctx := t.Context()
+	err := fs.syncFileToService(ctx, fileID)
+	if err == nil {
+		t.Fatalf("Expected syncFileToService to fail when WriteFile fails, got nil")
+	}
+
+	// Verify both chunk 0 and chunk 1 remain dirty
+	dirty, _, _, _, isDirty := cache.GetDirtyChunks(fileID)
+	if !isDirty {
+		t.Fatalf("Expected inode to remain dirty after failed WriteFile")
+	}
+	if len(dirty) != 2 {
+		t.Fatalf("Expected both chunks 0 and 1 to remain dirty, got %d dirty chunks", len(dirty))
+	}
+}
+
+func TestSyncFileToServiceConcurrentWritePreservesDirtyGeneration(t *testing.T) {
+	baseClient, cleanup := createTestClient(t)
+	defer cleanup()
+
+	cache := NewNodeCache(8 * 1024 * 1024)
+	var writeHook func()
+
+	rec := &hookClient{
+		ObjectFSControllerClient: baseClient,
+		onWrite: func() {
+			if writeHook != nil {
+				writeHook()
+			}
+		},
+	}
+	fs := NewObjectFS(rec, "vol-race", pb.WriteMode_WRITE_THROUGH_FSYNC, cache)
+
+	var createOut fuse.CreateOut
+	if status := fs.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     0644,
+	}, "test_race.bin", &createOut); status != fuse.OK {
+		t.Fatalf("Create failed: %v", status)
+	}
+	fileID := createOut.EntryOut.NodeId
+
+	const cs = int64(DefaultChunkSize)
+	c0v1 := bytes.Repeat([]byte("A"), int(cs))
+	c1v1 := bytes.Repeat([]byte("B"), int(cs))
+	c1v2 := bytes.Repeat([]byte("C"), int(cs))
+
+	cache.WriteAt(fileID, 0, append(c0v1, c1v1...), time.Now())
+
+	// When WriteFile is invoked by syncFileToService, race a new write to chunk 1
+	writeHook = func() {
+		// Mutate chunk 1 to version 2
+		cache.WriteAt(fileID, cs, c1v2, time.Now())
+		writeHook = nil // only race once
+	}
+
+	ctx := t.Context()
+	if err := fs.syncFileToService(ctx, fileID); err != nil {
+		t.Fatalf("syncFileToService failed: %v", err)
+	}
+
+	// Chunk 0 was clean and should be cleared.
+	// Chunk 1 was mutated concurrently, so it must still be dirty with c1v2!
+	dirty, _, _, _, isDirty := cache.GetDirtyChunks(fileID)
+	if !isDirty {
+		t.Fatalf("Expected inode to remain dirty due to concurrent write to chunk 1")
+	}
+	if _, c0Dirty := dirty[0]; c0Dirty {
+		t.Errorf("Chunk 0 should have been marked clean")
+	}
+	c1Data, c1Dirty := dirty[1]
+	if !c1Dirty {
+		t.Fatalf("Chunk 1 should remain dirty")
+	}
+	if !bytes.Equal(c1Data, c1v2) {
+		t.Errorf("Dirty chunk 1 content should be version 2, got %q", c1Data[:10])
+	}
+}
+
+type hookClient struct {
+	pb.ObjectFSControllerClient
+	onWrite func()
+}
+
+func (h *hookClient) WriteFile(ctx context.Context, in *pb.WriteFileRequest, opts ...grpc.CallOption) (*pb.WriteFileResponse, error) {
+	if h.onWrite != nil {
+		h.onWrite()
+	}
+	return h.ObjectFSControllerClient.WriteFile(ctx, in, opts...)
+}
