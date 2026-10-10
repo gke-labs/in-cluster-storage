@@ -87,7 +87,6 @@ type Volume struct {
 	snapshotPointers []*sdsv1.SnapshotPointer
 	liveStats        *pb.VolumeStats
 	debugStatsCheck  *bool
-	activeTx         *sds.Tx
 
 	localStorageDir string
 	indexFactory    sds.IndexFactory
@@ -564,15 +563,15 @@ func (v *Volume) initMetadataStreamLocked() error {
 	return nil
 }
 
-func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *CachedInode) error {
-	v.checkReadAllowedLocked("objectfs.v1alpha1.FileChunk")
+func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, tx *sds.Tx, node *CachedInode) error {
+	v.checkReadAllowedLocked(tx, "objectfs.v1alpha1.FileChunk")
 	ino := node.Row.GetIno()
 	chunkPrefix, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(ino)}, 1)
 	if pErr != nil {
 		panic(fmt.Sprintf("objectfs: failed to encode chunk prefix for inode %d: %v", ino, pErr))
 	}
-	alreadyRecorded := v.activeTx != nil && v.activeTx.HasReadPrefix("objectfs.v1alpha1.FileChunk", chunkPrefix)
-	v.recordReadPrefixLocked("objectfs.v1alpha1.FileChunk", chunkPrefix)
+	alreadyRecorded := tx != nil && tx.HasReadPrefix("objectfs.v1alpha1.FileChunk", chunkPrefix)
+	v.recordReadPrefixLocked(tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
 
 	// Invariant: directories and 0-byte regular files never have chunk rows or inline data
 	// in the database. Recording the prefix as read establishes that any FileChunk key for
@@ -581,7 +580,7 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 		return nil
 	}
 	if node.Row.GetChunkSize() > 0 && len(node.Chunks) > 0 {
-		if v.activeTx != nil && !alreadyRecorded {
+		if tx != nil && !alreadyRecorded {
 			for idx, sha := range node.Chunks {
 				chunk := &pb.FileChunk{
 					Ino:    proto.Uint64(ino),
@@ -592,7 +591,7 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 				if err != nil {
 					panic(fmt.Sprintf("objectfs: failed to extract chunk key for inode %d index %d: %v", ino, idx, err))
 				}
-				v.recordReadLocked("objectfs.v1alpha1.FileChunk", k, chunk)
+				v.recordReadLocked(tx, "objectfs.v1alpha1.FileChunk", k, chunk)
 			}
 			if len(node.InlineData) > 0 {
 				chunk := &pb.FileChunk{
@@ -604,7 +603,7 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 				if err != nil {
 					panic(fmt.Sprintf("objectfs: failed to extract inline chunk key for inode %d: %v", ino, err))
 				}
-				v.recordReadLocked("objectfs.v1alpha1.FileChunk", k, chunk)
+				v.recordReadLocked(tx, "objectfs.v1alpha1.FileChunk", k, chunk)
 			}
 		}
 		return nil
@@ -613,7 +612,7 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 		prefixBytes, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(node.Row.GetIno())}, 1)
 		if pErr == nil {
 			// Rows returned by scanSQLiteRowsLocked are shared/immutable; only read fields here.
-			chunkMsgs, sErr := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+			chunkMsgs, sErr := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 			if sErr == nil {
 				for _, cMsg := range chunkMsgs {
 					chunk := cMsg.(*pb.FileChunk)
@@ -633,7 +632,7 @@ func (v *Volume) ensureInodeChunksLoadedLocked(ctx context.Context, node *Cached
 	return nil
 }
 
-func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkIdx int) ([]byte, error) {
+func (v *Volume) readChunkLocked(ctx context.Context, tx *sds.Tx, node *CachedInode, chunkIdx int) ([]byte, error) {
 	if chunkIdx == 0 && len(node.InlineData) > 0 {
 		res := make([]byte, len(node.InlineData))
 		copy(res, node.InlineData)
@@ -656,7 +655,7 @@ func (v *Volume) readChunkLocked(ctx context.Context, node *CachedInode, chunkId
 		}
 	}
 
-	_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+	_ = v.ensureInodeChunksLoadedLocked(ctx, tx, node)
 
 	if chunkSha, ok := node.Chunks[uint32(chunkIdx)]; ok && chunkSha != "" {
 		if v.blobStore != nil {
@@ -823,9 +822,9 @@ func (v *Volume) safeSnapshotPositionLocked() uint64 {
 	return snapPos
 }
 
-func (v *Volume) allocInode() uint64 {
+func (v *Volume) allocInode(tx *sds.Tx) uint64 {
 	ino := atomic.AddUint64(&v.nextInode, erofs.DefaultInodeStride) - erofs.DefaultInodeStride
-	if v.activeTx != nil {
+	if tx != nil {
 		// Soundness: the allocator assigns strictly monotonic inode numbers and never reuses numbers
 		// (initialized from max(max_ino, replayed) + stride). Therefore, the new inode row and all its
 		// potential FileChunk keys are guaranteed to be absent without needing view/index lookups.
@@ -833,12 +832,12 @@ func (v *Volume) allocInode() uint64 {
 		if err != nil {
 			panic(fmt.Sprintf("objectfs: failed to extract inode key for %d: %v", ino, err))
 		}
-		v.recordReadLocked("objectfs.v1alpha1.Inode", key, nil)
+		v.recordReadLocked(tx, "objectfs.v1alpha1.Inode", key, nil)
 		chunkPrefix, pErr := sds.EncodeKeyPrefix(&pb.FileChunk{Ino: proto.Uint64(ino)}, 1)
 		if pErr != nil {
 			panic(fmt.Sprintf("objectfs: failed to encode chunk prefix for inode %d: %v", ino, pErr))
 		}
-		v.recordReadPrefixLocked("objectfs.v1alpha1.FileChunk", chunkPrefix)
+		v.recordReadPrefixLocked(tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
 	}
 	return ino
 }
@@ -1033,44 +1032,39 @@ func (v *Volume) beginTxLocked(opName string) *sds.Tx {
 	}
 	tx := v.metadataStream.Begin()
 	tx.SetOpName(opName)
-	v.activeTx = tx
 	return tx
 }
 
-func (v *Volume) endTxLocked() {
-	v.activeTx = nil
-}
-
-func (v *Volume) checkReadAllowedLocked(typeName string) {
-	if v.activeTx == nil {
+func (v *Volume) checkReadAllowedLocked(tx *sds.Tx, typeName string) {
+	if tx == nil {
 		return
 	}
-	if v.activeTx.HasWrites() {
-		op := v.activeTx.OpName()
+	if tx.HasWrites() {
+		op := tx.OpName()
 		if op == "" {
 			op = "unknown"
 		}
-		panic(fmt.Sprintf("objectfs: operation %q read %q after transaction buffered write %q", op, typeName, v.activeTx.FirstWrite()))
+		panic(fmt.Sprintf("objectfs: operation %q read %q after transaction buffered write %q", op, typeName, tx.FirstWrite()))
 	}
 }
 
-func (v *Volume) recordReadLocked(typeName string, key sds.Key, msg proto.Message) {
-	if v.activeTx != nil {
-		v.activeTx.RecordRead(typeName, key, msg)
+func (v *Volume) recordReadLocked(tx *sds.Tx, typeName string, key sds.Key, msg proto.Message) {
+	if tx != nil {
+		tx.RecordRead(typeName, key, msg)
 	}
 }
 
-func (v *Volume) recordReadPrefixLocked(typeName string, prefix []byte) {
-	if v.activeTx != nil {
-		v.activeTx.RecordReadPrefix(typeName, prefix)
+func (v *Volume) recordReadPrefixLocked(tx *sds.Tx, typeName string, prefix []byte) {
+	if tx != nil {
+		tx.RecordReadPrefix(typeName, prefix)
 	}
 }
 
 // scanLimitSQLiteRowsLocked queries the view for proto rows matching prefixBytes up to limit (0 for unlimited).
 // It enforces the reads-before-writes assertion, records all returned rows into the read set, and records
 // the prefix as completely read only if the scan was not truncated by the limit.
-func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, typeName string, prefixBytes []byte, limit int) ([]proto.Message, error) {
-	v.checkReadAllowedLocked(typeName)
+func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, tx *sds.Tx, typeName string, prefixBytes []byte, limit int) ([]proto.Message, error) {
+	v.checkReadAllowedLocked(tx, typeName)
 	if v.metadataView == nil {
 		return nil, nil
 	}
@@ -1085,9 +1079,9 @@ func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, typeName string,
 		truncated = true
 	}
 	if len(prefixBytes) > 0 && !truncated {
-		v.recordReadPrefixLocked(typeName, prefixBytes)
+		v.recordReadPrefixLocked(tx, typeName, prefixBytes)
 	}
-	if v.activeTx != nil {
+	if tx != nil {
 		for _, msg := range msgs {
 			var pk *sds.PrimaryKey
 			switch typeName {
@@ -1103,7 +1097,7 @@ func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, typeName string,
 				if err != nil {
 					panic(fmt.Sprintf("objectfs: failed to extract primary key for %s: %v", typeName, err))
 				}
-				v.recordReadLocked(typeName, k, msg)
+				v.recordReadLocked(tx, typeName, k, msg)
 			}
 		}
 	}
@@ -1112,16 +1106,16 @@ func (v *Volume) scanLimitSQLiteRowsLocked(ctx context.Context, typeName string,
 
 // scanSQLiteRowsLocked queries the view for all proto rows matching prefixBytes.
 // The returned messages are shared and immutable; callers must not modify them in place.
-func (v *Volume) scanSQLiteRowsLocked(ctx context.Context, typeName string, prefixBytes []byte) ([]proto.Message, error) {
-	return v.scanLimitSQLiteRowsLocked(ctx, typeName, prefixBytes, 0)
+func (v *Volume) scanSQLiteRowsLocked(ctx context.Context, tx *sds.Tx, typeName string, prefixBytes []byte) ([]proto.Message, error) {
+	return v.scanLimitSQLiteRowsLocked(ctx, tx, typeName, prefixBytes, 0)
 }
 
 // getSQLiteRowLocked retrieves a single proto row from the view.
 // The returned message is shared and immutable; callers must not modify it in place.
-func (v *Volume) getSQLiteRowLocked(ctx context.Context, typeName string, key sds.Key) (proto.Message, bool, error) {
-	v.checkReadAllowedLocked(typeName)
+func (v *Volume) getSQLiteRowLocked(ctx context.Context, tx *sds.Tx, typeName string, key sds.Key) (proto.Message, bool, error) {
+	v.checkReadAllowedLocked(tx, typeName)
 	if v.metadataView == nil {
-		v.recordReadLocked(typeName, key, nil)
+		v.recordReadLocked(tx, typeName, key, nil)
 		return nil, false, nil
 	}
 	msg, ok, err := v.metadataView.Get(ctx, typeName, key)
@@ -1129,9 +1123,9 @@ func (v *Volume) getSQLiteRowLocked(ctx context.Context, typeName string, key sd
 		return nil, false, err
 	}
 	if ok {
-		v.recordReadLocked(typeName, key, msg)
+		v.recordReadLocked(tx, typeName, key, msg)
 	} else {
-		v.recordReadLocked(typeName, key, nil)
+		v.recordReadLocked(tx, typeName, key, nil)
 	}
 	return msg, ok, nil
 }
@@ -1148,13 +1142,12 @@ func (v *Volume) normalizeInodeID(id uint64) uint64 {
 
 func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 	tx := v.beginTxLocked("cleanOrphanInodes")
-	defer v.endTxLocked()
 
 	prefix, err := sds.EncodeKeyPrefix(&pb.Inode{}, 0)
 	if err != nil {
 		return fmt.Errorf("failed to encode inode key prefix: %w", err)
 	}
-	msgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.Inode", prefix)
+	msgs, err := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.Inode", prefix)
 	if err != nil {
 		return fmt.Errorf("failed to scan orphan inodes: %w", err)
 	}
@@ -1176,7 +1169,7 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", ino, err)
 		}
-		chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
+		chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
 		if err != nil {
 			return fmt.Errorf("failed to scan chunk rows for orphan inode %d: %w", ino, err)
 		}
@@ -1208,7 +1201,7 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) error {
 	return nil
 }
 
-func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*CachedInode, error) {
+func (v *Volume) getOrLoadInodeLocked(ctx context.Context, tx *sds.Tx, inodeID uint64) (*CachedInode, error) {
 	inodeID = v.normalizeInodeID(inodeID)
 
 	key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(inodeID)})
@@ -1216,7 +1209,7 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 		return nil, err
 	}
 	// Loaded Inode message is shared/immutable; CachedInode.mutate must be used for any writes.
-	msg, ok, err := v.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.Inode", key)
+	msg, ok, err := v.getSQLiteRowLocked(ctx, tx, "objectfs.v1alpha1.Inode", key)
 	if err != nil {
 		return nil, err
 	}
@@ -1234,12 +1227,12 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, inodeID uint64) (*Cac
 		Row: inode,
 	}
 
-	_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+	_ = v.ensureInodeChunksLoadedLocked(ctx, tx, node)
 
 	return node, nil
 }
 
-func (v *Volume) getDirEntrySQLiteLocked(ctx context.Context, parentInodeID uint64, name string) (*pb.DirEntry, bool, error) {
+func (v *Volume) getDirEntrySQLiteLocked(ctx context.Context, tx *sds.Tx, parentInodeID uint64, name string) (*pb.DirEntry, bool, error) {
 	if v.metadataView == nil {
 		return nil, false, nil
 	}
@@ -1251,7 +1244,7 @@ func (v *Volume) getDirEntrySQLiteLocked(ctx context.Context, parentInodeID uint
 		return nil, false, err
 	}
 	// Loaded DirEntry message is shared/immutable.
-	msg, ok, err := v.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.DirEntry", key)
+	msg, ok, err := v.getSQLiteRowLocked(ctx, tx, "objectfs.v1alpha1.DirEntry", key)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1274,7 +1267,7 @@ func (v *Volume) resolvePathLocked(ctx context.Context, p string) (uint64, uint6
 		if len(part) > MaxNameLength {
 			return 0, 0, "", fmt.Errorf("path component %q exceeds maximum length: %w", part, syscall.ENAMETOOLONG)
 		}
-		de, ok, err := v.getDirEntrySQLiteLocked(ctx, currInodeID, part)
+		de, ok, err := v.getDirEntrySQLiteLocked(ctx, nil, currInodeID, part)
 		if err != nil {
 			return 0, 0, "", fmt.Errorf("directory for inode %d not found: %w", currInodeID, err)
 		}
@@ -1317,8 +1310,8 @@ func toEntryAttr(row *pb.Inode, name, redirectURL string, rootInodeID uint64) *p
 	}
 }
 
-func (v *Volume) toEntryAttrLocked(ctx context.Context, inodeID uint64, name string) (*pb.EntryAttr, error) {
-	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+func (v *Volume) toEntryAttrLocked(ctx context.Context, tx *sds.Tx, inodeID uint64, name string) (*pb.EntryAttr, error) {
+	node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1330,7 +1323,7 @@ func (v *Volume) GetAttr(ctx context.Context, inodeID uint64) (*pb.EntryAttr, er
 	defer v.mu.RUnlock()
 
 	inodeID = v.normalizeInodeID(inodeID)
-	return v.toEntryAttrLocked(ctx, inodeID, "")
+	return v.toEntryAttrLocked(ctx, nil, inodeID, "")
 }
 
 func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, atimeNow bool, mtime *time.Time, mtimeNow bool, ctime *time.Time, ctimeNow bool) (*pb.EntryAttr, error) {
@@ -1339,7 +1332,6 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("SetAttr")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -1347,7 +1339,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 
 		inodeID = v.normalizeInodeID(inodeID)
 
-		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+		node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1356,7 +1348,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 		modified := (mode != nil) || (uid != nil) || (gid != nil) || atimeNow || (atime != nil) || mtimeNow || (mtime != nil) || ctimeNow || (ctime != nil)
 
 		if !modified {
-			attr, err := v.toEntryAttrLocked(ctx, inodeID, "")
+			attr, err := v.toEntryAttrLocked(ctx, tx, inodeID, "")
 			return attr, nil, err
 		}
 
@@ -1435,13 +1427,13 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 	parentInodeID = v.normalizeInodeID(parentInodeID)
 
 	if name == "." {
-		return v.toEntryAttrLocked(ctx, parentInodeID, ".")
+		return v.toEntryAttrLocked(ctx, nil, parentInodeID, ".")
 	}
 	if name == ".." {
 		if parentInodeID == v.rootInodeID || parentInodeID == 1 {
-			return v.toEntryAttrLocked(ctx, v.rootInodeID, "..")
+			return v.toEntryAttrLocked(ctx, nil, v.rootInodeID, "..")
 		}
-		parentNode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		parentNode, err := v.getOrLoadInodeLocked(ctx, nil, parentInodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -1455,17 +1447,17 @@ func (v *Volume) Lookup(ctx context.Context, parentInodeID uint64, name string) 
 		if pIno == 0 {
 			pIno = v.rootInodeID
 		}
-		return v.toEntryAttrLocked(ctx, pIno, "..")
+		return v.toEntryAttrLocked(ctx, nil, pIno, "..")
 	}
 
-	de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+	de, ok, err := v.getDirEntrySQLiteLocked(ctx, nil, parentInodeID, name)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return nil, fmt.Errorf("child %s not found in inode %d: %w", name, parentInodeID, syscall.ENOENT)
 	}
-	return v.toEntryAttrLocked(ctx, de.GetIno(), name)
+	return v.toEntryAttrLocked(ctx, nil, de.GetIno(), name)
 }
 
 func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAttr, error) {
@@ -1474,7 +1466,7 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 
 	dirInodeID = v.normalizeInodeID(dirInodeID)
 
-	dirNode, err := v.getOrLoadInodeLocked(ctx, dirInodeID)
+	dirNode, err := v.getOrLoadInodeLocked(ctx, nil, dirInodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1486,7 +1478,7 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 	if pErr != nil {
 		return nil, pErr
 	}
-	entryMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes)
+	entryMsgs, err := v.scanSQLiteRowsLocked(ctx, nil, "objectfs.v1alpha1.DirEntry", prefixBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -1503,7 +1495,7 @@ func (v *Volume) ReadDir(ctx context.Context, dirInodeID uint64) ([]*pb.EntryAtt
 	var entries []*pb.EntryAttr
 	for _, name := range names {
 		de := entriesMap[name]
-		attr, err := v.toEntryAttrLocked(ctx, de.GetIno(), name)
+		attr, err := v.toEntryAttrLocked(ctx, nil, de.GetIno(), name)
 		if err == nil {
 			entries = append(entries, attr)
 		}
@@ -1561,7 +1553,6 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("Mkdir")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -1572,7 +1563,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			return nil, nil, fmt.Errorf("invalid directory name %q: %w", name, syscall.EINVAL)
 		}
 
-		parentInode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1580,7 +1571,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
-		_, exists, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+		_, exists, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1599,7 +1590,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 		}
 
 		now := time.Now()
-		childInodeID := v.allocInode()
+		childInodeID := v.allocInode(tx)
 
 		parentInode.mutate(func(row *pb.Inode) {
 			if row.GetNlink() < 2 {
@@ -1691,7 +1682,6 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("CreateFile")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -1707,7 +1697,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("invalid file name %q: %w", name, syscall.EINVAL)
 		}
 
-		parentInode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1717,7 +1707,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 
 		var existingChildIno uint64
 		var exists bool
-		de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+		de, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1759,7 +1749,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 		}
 
 		if exists {
-			childInode, err := v.getOrLoadInodeLocked(ctx, existingChildIno)
+			childInode, err := v.getOrLoadInodeLocked(ctx, tx, existingChildIno)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1805,7 +1795,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			if pErr != nil {
 				return nil, nil, fmt.Errorf("failed to encode chunk prefix for inode %d: %w", childInode.Row.GetIno(), pErr)
 			}
-			chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", prefixBytes)
+			chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", prefixBytes)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to scan chunk rows for inode %d: %w", childInode.Row.GetIno(), err)
 			}
@@ -1897,7 +1887,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return attr, waitFn, nil
 		}
 
-		childInodeID := v.allocInode()
+		childInodeID := v.allocInode(tx)
 
 		parentInode.mutate(func(row *pb.Inode) {
 			row.Mtime = timestamppb.New(now)
@@ -2029,7 +2019,6 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("Symlink")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -2040,7 +2029,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			return nil, nil, fmt.Errorf("invalid symlink name %q: %w", name, syscall.EINVAL)
 		}
 
-		parentInode, err := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		parentInode, err := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2048,7 +2037,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", parentInodeID, syscall.ENOTDIR)
 		}
 
-		_, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+		_, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2062,7 +2051,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 		}
 
 		now := time.Now()
-		childInodeID := v.allocInode()
+		childInodeID := v.allocInode(tx)
 		parentInode.mutate(func(row *pb.Inode) {
 			row.Mtime = timestamppb.New(now)
 			row.Ctime = timestamppb.New(now)
@@ -2137,7 +2126,7 @@ func (v *Volume) Readlink(ctx context.Context, inodeID uint64) (string, error) {
 	defer v.mu.RUnlock()
 
 	inodeID = v.normalizeInodeID(inodeID)
-	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+	node, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
 	if err != nil {
 		return "", err
 	}
@@ -2157,7 +2146,6 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("Link")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -2170,7 +2158,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			return nil, nil, fmt.Errorf("invalid link name %q: %w", newName, syscall.EINVAL)
 		}
 
-		oldNode, err := v.getOrLoadInodeLocked(ctx, oldInodeID)
+		oldNode, err := v.getOrLoadInodeLocked(ctx, tx, oldInodeID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2178,7 +2166,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			return nil, nil, syscall.EPERM // POSIX: directories cannot be hard-linked
 		}
 
-		newParentInode, err := v.getOrLoadInodeLocked(ctx, newParentInodeID)
+		newParentInode, err := v.getOrLoadInodeLocked(ctx, tx, newParentInodeID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2186,7 +2174,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			return nil, nil, fmt.Errorf("parent inode %d is not a directory: %w", newParentInodeID, syscall.ENOTDIR)
 		}
 
-		_, ok, err := v.getDirEntrySQLiteLocked(ctx, newParentInodeID, newName)
+		_, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, newParentInodeID, newName)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2265,7 +2253,7 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 	_ = v.waitForInodeUploads(ctx, inodeID)
 
 	v.mu.RLock()
-	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+	node, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
 	v.mu.RUnlock()
 	if err != nil {
 		return nil, 0, "", err
@@ -2306,7 +2294,7 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 	}
 
 	if node.Row.GetManifestSha256() != "" || node.Row.GetChunkSize() > 0 || len(node.Chunks) > 0 || len(node.StagedChunks) > 0 {
-		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+		_ = v.ensureInodeChunksLoadedLocked(ctx, nil, node)
 		cs := int64(node.Row.GetChunkSize())
 		if cs == 0 {
 			cs = int64(v.chunkSize)
@@ -2319,7 +2307,7 @@ func (v *Volume) ReadFile(ctx context.Context, inodeID uint64, offset, length in
 
 		var res bytes.Buffer
 		for i := startChunk; i <= endChunk; i++ {
-			chunkData, _ := v.readChunkLocked(ctx, node, i)
+			chunkData, _ := v.readChunkLocked(ctx, nil, node, i)
 			chunkLen := cs
 			if int64(i+1)*cs > total {
 				chunkLen = total - int64(i)*cs
@@ -2378,7 +2366,6 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("WriteFile")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return 0, 0, time.Time{}, nil, err
@@ -2388,7 +2375,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 			inodeID = v.rootInodeID
 		}
 
-		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+		node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
 		if err != nil {
 			return 0, 0, time.Time{}, nil, err
 		}
@@ -2435,7 +2422,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 					newInline = make([]byte, len(data))
 					copy(newInline, data)
 				} else {
-					chunk0, _ := v.readChunkLocked(ctx, node, 0)
+					chunk0, _ := v.readChunkLocked(ctx, tx, node, 0)
 					newInline = make([]byte, neededLen)
 					copy(newInline, chunk0)
 					copy(newInline[offset:], data)
@@ -2503,7 +2490,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 		if node.StagedChunks == nil {
 			node.StagedChunks = make(map[int][]byte)
 		}
-		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+		_ = v.ensureInodeChunksLoadedLocked(ctx, tx, node)
 
 		cs := int64(effectiveChunkSize)
 		startChunk := int(offset / cs)
@@ -2533,7 +2520,7 @@ func (v *Volume) WriteFile(ctx context.Context, inodeID uint64, offset int64, da
 				dataEnd = int64(len(data))
 			}
 
-			chunkData, _ := v.readChunkLocked(ctx, node, i)
+			chunkData, _ := v.readChunkLocked(ctx, tx, node, i)
 			expectedChunkLen := cs
 			if int64(i+1)*cs > calculatedSize {
 				expectedChunkLen = calculatedSize - int64(i)*cs
@@ -2666,7 +2653,6 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("TruncateFile")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -2674,7 +2660,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 
 		inodeID = v.normalizeInodeID(inodeID)
 
-		node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+		node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2689,7 +2675,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 
 		now := time.Now()
 		node.IsDirty = true
-		_ = v.ensureInodeChunksLoadedLocked(ctx, node)
+		_ = v.ensureInodeChunksLoadedLocked(ctx, tx, node)
 		oldChunks := node.Chunks
 
 		if size == 0 {
@@ -2721,7 +2707,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 				}
 			}
 		} else if size <= v.maxInlineLen && len(oldChunks) <= 1 {
-			chunk0, _ := v.readChunkLocked(ctx, node, 0)
+			chunk0, _ := v.readChunkLocked(ctx, tx, node, 0)
 			newBuf := make([]byte, size)
 			copy(newBuf, chunk0)
 			node.InlineData = newBuf
@@ -2770,7 +2756,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 					lastChunkData = chunkData
 					hasLastChunkData = true
 				} else if _, exists := node.Chunks[uint32(lastIdx)]; exists {
-					chunkData, _ := v.readChunkLocked(ctx, node, lastIdx)
+					chunkData, _ := v.readChunkLocked(ctx, tx, node, lastIdx)
 					lastChunkData = chunkData
 					hasLastChunkData = true
 				}
@@ -2866,7 +2852,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	parentInodeID = v.normalizeInodeID(parentInodeID)
 
 	var childInodeID uint64
-	de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+	de, ok, err := v.getDirEntrySQLiteLocked(ctx, nil, parentInodeID, name)
 	if err != nil {
 		v.mu.Unlock()
 		return err
@@ -2875,7 +2861,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		v.mu.Unlock()
 		return fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 	}
-	childInode, err := v.getOrLoadInodeLocked(ctx, de.GetIno())
+	childInode, err := v.getOrLoadInodeLocked(ctx, nil, de.GetIno())
 	if err != nil {
 		v.mu.Unlock()
 		return err
@@ -2896,13 +2882,12 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("Unlink")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, err
 		}
 
-		_, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+		_, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, err
 		}
@@ -2910,7 +2895,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			return nil, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 		}
 
-		childInode, err := v.getOrLoadInodeLocked(ctx, childInodeID)
+		childInode, err := v.getOrLoadInodeLocked(ctx, tx, childInodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -2932,7 +2917,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			row.Ctime = timestamppb.New(now)
 		})
 
-		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		parentInode, _ := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
 		if parentInode != nil {
 			parentInode.mutate(func(row *pb.Inode) {
 				row.Mtime = timestamppb.New(now)
@@ -2947,7 +2932,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			if err != nil {
 				return nil, fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", childInodeID, err)
 			}
-			chunkMsgs, err = v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
+			chunkMsgs, err = v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
 			if err != nil {
 				return nil, fmt.Errorf("failed to scan chunk rows for inode %d: %w", childInodeID, err)
 			}
@@ -3017,7 +3002,6 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("Rmdir")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, err
@@ -3026,7 +3010,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		parentInodeID = v.normalizeInodeID(parentInodeID)
 
 		var childInodeID uint64
-		de, ok, err := v.getDirEntrySQLiteLocked(ctx, parentInodeID, name)
+		de, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, parentInodeID, name)
 		if err != nil {
 			return nil, err
 		}
@@ -3034,7 +3018,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 			return nil, fmt.Errorf("directory %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
 		}
 		childInodeID = de.GetIno()
-		childInode, err := v.getOrLoadInodeLocked(ctx, childInodeID)
+		childInode, err := v.getOrLoadInodeLocked(ctx, tx, childInodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -3047,7 +3031,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		if pErr != nil {
 			return nil, pErr
 		}
-		subEntries, err := v.scanLimitSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes, 1)
+		subEntries, err := v.scanLimitSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.DirEntry", prefixBytes, 1)
 		if err != nil {
 			return nil, err
 		}
@@ -3058,7 +3042,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) e
 		delete(v.dirParents, childInodeID)
 
 		now := time.Now()
-		parentInode, _ := v.getOrLoadInodeLocked(ctx, parentInodeID)
+		parentInode, _ := v.getOrLoadInodeLocked(ctx, tx, parentInodeID)
 		if parentInode != nil {
 			parentInode.mutate(func(row *pb.Inode) {
 				if row.GetNlink() > 2 {
@@ -3119,7 +3103,6 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		defer v.mu.Unlock()
 
 		tx := v.beginTxLocked("Rename")
-		defer v.endTxLocked()
 
 		if err := v.checkBackpressureLocked(ctx); err != nil {
 			return nil, nil, err
@@ -3135,7 +3118,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 		var targetExists bool
 		var targetInodeID uint64
 
-		oldDe, ok, err := v.getDirEntrySQLiteLocked(ctx, oldParentInodeID, oldName)
+		oldDe, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, oldParentInodeID, oldName)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -3143,7 +3126,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			return nil, nil, fmt.Errorf("source %s not found in parent %d: %w", oldName, oldParentInodeID, syscall.ENOENT)
 		}
 
-		newParentInode, err := v.getOrLoadInodeLocked(ctx, newParentInodeID)
+		newParentInode, err := v.getOrLoadInodeLocked(ctx, tx, newParentInodeID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -3151,7 +3134,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			return nil, nil, fmt.Errorf("target parent %d is not a directory: %w", newParentInodeID, syscall.ENOTDIR)
 		}
 
-		targetDe, ok, err := v.getDirEntrySQLiteLocked(ctx, newParentInodeID, newName)
+		targetDe, ok, err := v.getDirEntrySQLiteLocked(ctx, tx, newParentInodeID, newName)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -3160,17 +3143,17 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			targetInodeID = targetDe.GetIno()
 		}
 
-		childInode, err := v.getOrLoadInodeLocked(ctx, oldDe.GetIno())
+		childInode, err := v.getOrLoadInodeLocked(ctx, tx, oldDe.GetIno())
 		if err != nil {
 			return nil, nil, err
 		}
 
-		oldParentInode, _ := v.getOrLoadInodeLocked(ctx, oldParentInodeID)
+		oldParentInode, _ := v.getOrLoadInodeLocked(ctx, tx, oldParentInodeID)
 
 		var targetInode *CachedInode
 		var targetChunkMsgs []proto.Message
 		if targetExists {
-			targetInode, err = v.getOrLoadInodeLocked(ctx, targetInodeID)
+			targetInode, err = v.getOrLoadInodeLocked(ctx, tx, targetInodeID)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -3180,7 +3163,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 					return nil, nil, pErr
 				}
 				var sErr error
-				targetChunkMsgs, sErr = v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
+				targetChunkMsgs, sErr = v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
 				if sErr != nil {
 					return nil, nil, sErr
 				}
@@ -3197,7 +3180,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 				if pErr != nil {
 					return nil, nil, pErr
 				}
-				subEntries, sErr := v.scanLimitSQLiteRowsLocked(ctx, "objectfs.v1alpha1.DirEntry", prefixBytes, 1)
+				subEntries, sErr := v.scanLimitSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.DirEntry", prefixBytes, 1)
 				if sErr != nil {
 					return nil, nil, sErr
 				}
@@ -3395,7 +3378,7 @@ func (v *Volume) Fsync(ctx context.Context, inodeID uint64) error {
 	if inodeID == 0 {
 		inodeID = v.rootInodeID
 	}
-	_, err := v.getOrLoadInodeLocked(ctx, inodeID)
+	_, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
 	isRoot := (inodeID == v.rootInodeID)
 	v.mu.RUnlock()
 	if err != nil {
@@ -3445,7 +3428,7 @@ func (v *Volume) hasOpenHandlesLocked(inodeID uint64) bool {
 func (v *Volume) Open(ctx context.Context, inodeID uint64, flags uint32) (uint64, error) {
 	v.mu.RLock()
 	inodeID = v.normalizeInodeID(inodeID)
-	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+	node, err := v.getOrLoadInodeLocked(ctx, nil, inodeID)
 	v.mu.RUnlock()
 	if err != nil {
 		return 0, err
@@ -3462,7 +3445,6 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 	defer v.mu.Unlock()
 
 	tx := v.beginTxLocked("Release")
-	defer v.endTxLocked()
 
 	inodeID = v.normalizeInodeID(inodeID)
 
@@ -3483,7 +3465,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 	}
 	v.handlesMu.Unlock()
 
-	node, err := v.getOrLoadInodeLocked(ctx, inodeID)
+	node, err := v.getOrLoadInodeLocked(ctx, tx, inodeID)
 	if err != nil || node == nil {
 		return nil
 	}
@@ -3493,7 +3475,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 		if err != nil {
 			return fmt.Errorf("failed to encode chunk key prefix for inode %d: %w", inodeID, err)
 		}
-		chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
+		chunkMsgs, err := v.scanSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.FileChunk", chunkPrefix)
 		if err != nil {
 			return fmt.Errorf("failed to scan chunk rows for inode %d: %w", inodeID, err)
 		}

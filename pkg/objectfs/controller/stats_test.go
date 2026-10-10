@@ -806,16 +806,23 @@ func TestVolume_ReadsBeforeWritesAssertionPanicsInAllModes(t *testing.T) {
 	defer vol.mu.Unlock()
 
 	tx := vol.beginTxLocked("TestOp")
-	defer vol.endTxLocked()
 
 	// Buffer a write first
 	key, err := pkInode.Extract(&pb.Inode{Ino: proto.Uint64(1234)})
 	if err != nil {
 		t.Fatalf("pkInode.Extract failed: %v", err)
 	}
-	vol.recordReadLocked("objectfs.v1alpha1.Inode", key, nil)
+	vol.recordReadLocked(tx, "objectfs.v1alpha1.Inode", key, nil)
 	if _, err := tx.Insert(ctx, &pb.Inode{Ino: proto.Uint64(1234), Mode: 0644}); err != nil {
 		t.Fatalf("tx.Insert failed: %v", err)
+	}
+
+	// Verify that a read with tx == nil does NOT enforce the assertion and does NOT panic
+	if _, _, err := vol.getSQLiteRowLocked(ctx, nil, "objectfs.v1alpha1.Inode", key); err != nil {
+		t.Fatalf("getSQLiteRowLocked with nil tx failed: %v", err)
+	}
+	if _, err := vol.scanLimitSQLiteRowsLocked(ctx, nil, "objectfs.v1alpha1.Inode", nil, 1); err != nil {
+		t.Fatalf("scanLimitSQLiteRowsLocked with nil tx failed: %v", err)
 	}
 
 	// Now attempt a read after write has been buffered
@@ -830,7 +837,7 @@ func TestVolume_ReadsBeforeWritesAssertionPanicsInAllModes(t *testing.T) {
 				}
 			}
 		}()
-		_, _, _ = vol.getSQLiteRowLocked(ctx, "objectfs.v1alpha1.Inode", key)
+		_, _, _ = vol.getSQLiteRowLocked(ctx, tx, "objectfs.v1alpha1.Inode", key)
 	}()
 
 	if !didPanic {
@@ -849,7 +856,7 @@ func TestVolume_ReadsBeforeWritesAssertionPanicsInAllModes(t *testing.T) {
 				}
 			}
 		}()
-		_, _ = vol.scanLimitSQLiteRowsLocked(ctx, "objectfs.v1alpha1.Inode", nil, 1)
+		_, _ = vol.scanLimitSQLiteRowsLocked(ctx, tx, "objectfs.v1alpha1.Inode", nil, 1)
 	}()
 
 	if !didPanicLimit {
