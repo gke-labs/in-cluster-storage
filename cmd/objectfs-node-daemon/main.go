@@ -51,6 +51,7 @@ var (
 	controllerSyncTimeout  = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for sync RPCs (fsync, flush, write) to ObjectFS controller")
 	syncOnClose            = flag.Bool("sync-on-close", true, "Schedule non-blocking sync on file release")
 	backgroundSyncInterval = flag.Duration("background-sync-interval", 30*time.Second, "Background sync interval for dirty volumes")
+	debug                  = flag.Bool("debug", false, "Log every FUSE request (for test/CI gates)")
 )
 
 func main() {
@@ -84,6 +85,7 @@ func main() {
 	if err != nil {
 		klog.Fatalf("failed to initialize driver: %v", err)
 	}
+	driver.debug = *debug
 	defer func() {
 		if closeErr := driver.Close(); closeErr != nil {
 			klog.V(4).Infof("driver close error: %v", closeErr)
@@ -134,6 +136,7 @@ type objectFSDriver struct {
 	syncTimeout            time.Duration
 	syncOnClose            bool
 	backgroundSyncInterval time.Duration
+	debug                  bool
 
 	clientConn *grpc.ClientConn
 	client     pb.ObjectFSControllerClient
@@ -318,6 +321,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		FsName:     "objectfs",
 		Name:       "objectfs",
 		Options:    []string{"default_permissions", "allow_other"},
+		Debug:      d.debug,
 	}
 
 	server, err := gofuse.NewServer(rawFS, targetPath, mountOpts)

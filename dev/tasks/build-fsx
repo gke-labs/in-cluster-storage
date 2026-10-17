@@ -1,0 +1,74 @@
+#!/bin/bash
+
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# build-fsx: fetch xfstests and build the fsx binary.
+#
+# Usage: dev/tasks/build-fsx [output_binary_path]
+#
+# If output_binary_path is not specified, defaults to .build/bin/fsx.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TARGET_BIN="${1:-${REPO_ROOT}/.build/bin/fsx}"
+
+mkdir -p "$(dirname "${TARGET_BIN}")"
+
+CACHE_DIR="${XFSTESTS_CACHE_DIR:-/tmp/xfstests-cache}"
+XFSTESTS_COMMIT="3e1ee800e52a0f53d7d9a7809be1ffc80ec1788f"
+
+if [[ ! -d "${CACHE_DIR}/.git" ]]; then
+  echo "Fetching fsx from xfstests at commit ${XFSTESTS_COMMIT}..."
+  mkdir -p "${CACHE_DIR}"
+  if ! git clone --quiet --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "${CACHE_DIR}" 2>/dev/null; then
+    git clone --quiet https://github.com/kdave/xfstests.git "${CACHE_DIR}"
+  fi
+fi
+
+(
+  cd "${CACHE_DIR}"
+  git checkout --quiet "${XFSTESTS_COMMIT}" 2>/dev/null || true
+  cat << 'EOF' > config.h
+#define _GNU_SOURCE 1
+#define HAVE_SYS_PARAM_H 1
+#define HAVE_SYS_TYPES_H 1
+#define HAVE_SYS_STAT_H 1
+#define HAVE_SYS_TIME_H 1
+#define HAVE_SYS_MMAN_H 1
+#define HAVE_MALLOC_H 1
+#define HAVE_DIRENT_H 1
+#define HAVE_STDLIB_H 1
+#define HAVE_UNISTD_H 1
+#define HAVE_ERRNO_H 1
+#define HAVE_STRING_H 1
+#define HAVE_SYS_FCNTL_H 1
+#define HAVE_ASSERT_H 1
+#define STDC_HEADERS 1
+#define HAVE_LINUX_FALLOC_H 1
+#define HAVE_FALLOCATE 1
+#include <getopt.h>
+EOF
+  # Try static build first so the binary is portable across container distributions (e.g. alpine and debian)
+  if ! gcc -static -Wall -O2 -I. -Isrc -Iinclude -o "${TARGET_BIN}" ltp/fsx.c 2>/dev/null; then
+    gcc -Wall -O2 -I. -Isrc -Iinclude -o "${TARGET_BIN}" ltp/fsx.c
+  fi
+  strip "${TARGET_BIN}" 2>/dev/null || true
+  chmod +x "${TARGET_BIN}"
+)
+
+echo "fsx built successfully at ${TARGET_BIN}"
