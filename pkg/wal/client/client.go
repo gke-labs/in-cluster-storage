@@ -746,7 +746,9 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 		s.cleanupS3AckedLocked(helloAck.S3AckedStreamSeq)
 	}
 
-	s.cond.Broadcast()
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
 	s.initialHelloAckOnce.Do(func() {
 		close(s.initialHelloAckDone)
 	})

@@ -19,6 +19,7 @@ package buffer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -85,14 +86,23 @@ func ListSegmentsFromBackend(ctx context.Context, backend objectstore.Backend) (
 }
 
 // ReadSegmentFromBackend reads and decodes all LogRecords from a segment path in object storage.
-func ReadSegmentFromBackend(ctx context.Context, backend objectstore.Backend, segPath string) ([]*wal.LogRecord, error) {
+func ReadSegmentFromBackend(ctx context.Context, backend objectstore.Backend, segPath string, opts ...wal.ScanOption) ([]*wal.LogRecord, error) {
 	var buf bytes.Buffer
 	if err := backend.GetObject(ctx, "", segPath, 0, 0, &buf); err != nil {
 		return nil, fmt.Errorf("failed to fetch segment %s: %w", segPath, err)
 	}
 
+	var opt wal.ScanOptions
+	for _, o := range opts {
+		o(&opt)
+	}
+
 	var records []*wal.LogRecord
 	r := bytes.NewReader(buf.Bytes())
+	if _, _, err := wal.ReadSegmentHeader(r, opt.AcceptUnversioned); err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("failed to read segment header in %s: %w", segPath, err)
+	}
+
 	for {
 		rec, err := wal.DecodeLogRecord(r)
 		if err != nil {

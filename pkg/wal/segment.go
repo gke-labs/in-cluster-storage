@@ -68,15 +68,28 @@ func backupCorruptedSegment(path string) {
 // ScanClientSegmentFile reads a client segment file from disk, validating all records.
 // If a torn trailing record is detected at the end of the file, it backs up the file,
 // truncates to the last valid record boundary, and returns only the valid records.
-func ScanClientSegmentFile(path string) (records []*ClientRecord, meta *SegmentMeta, err error) {
+func ScanClientSegmentFile(path string, opts ...ScanOption) (records []*ClientRecord, meta *SegmentMeta, err error) {
+	var opt ScanOptions
+	for _, o := range opts {
+		o(&opt)
+	}
+
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open segment file %s: %w", path, err)
 	}
 	defer errutil.CloseWithErr(f, &err)
 
+	_, hdrOffset, err := ReadSegmentHeader(f, opt.AcceptUnversioned)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, &SegmentMeta{Path: path, Size: 0, RecordCount: 0}, nil
+		}
+		return nil, nil, fmt.Errorf("failed to read segment header %s: %w", path, err)
+	}
+
 	var validRecords []*ClientRecord
-	var validOffset int64 = 0
+	validOffset := hdrOffset
 
 	for {
 		rec, decErr := DecodeClientRecord(f)
@@ -117,15 +130,28 @@ func ScanClientSegmentFile(path string) (records []*ClientRecord, meta *SegmentM
 
 // ScanLogSegmentFile reads a witness log segment file from disk, validating all records.
 // If a torn trailing record is detected, it backs up the file, truncates, and returns valid records.
-func ScanLogSegmentFile(path string) (records []*LogRecord, meta *SegmentMeta, err error) {
+func ScanLogSegmentFile(path string, opts ...ScanOption) (records []*LogRecord, meta *SegmentMeta, err error) {
+	var opt ScanOptions
+	for _, o := range opts {
+		o(&opt)
+	}
+
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open segment file %s: %w", path, err)
 	}
 	defer errutil.CloseWithErr(f, &err)
 
+	_, hdrOffset, err := ReadSegmentHeader(f, opt.AcceptUnversioned)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, &SegmentMeta{Path: path, Size: 0, RecordCount: 0}, nil
+		}
+		return nil, nil, fmt.Errorf("failed to read segment header %s: %w", path, err)
+	}
+
 	var validRecords []*LogRecord
-	var validOffset int64 = 0
+	validOffset := hdrOffset
 
 	for {
 		rec, decErr := DecodeLogRecord(f)
@@ -166,10 +192,11 @@ func ScanLogSegmentFile(path string) (records []*LogRecord, meta *SegmentMeta, e
 
 // ClientSegmentStore manages local segment files for a client.
 type ClientSegmentStore struct {
-	mu             sync.RWMutex
-	dir            string
-	maxSegmentSize int64
-	filePrefix     string
+	mu                sync.RWMutex
+	dir               string
+	maxSegmentSize    int64
+	filePrefix        string
+	acceptUnversioned bool
 
 	activeFile *os.File
 	activeMeta *SegmentMeta
@@ -177,7 +204,12 @@ type ClientSegmentStore struct {
 }
 
 // NewClientSegmentStore initializes or reopens a client segment store.
-func NewClientSegmentStore(dir string, filePrefix string, maxSegmentSize int64) (*ClientSegmentStore, []*ClientRecord, error) {
+func NewClientSegmentStore(dir string, filePrefix string, maxSegmentSize int64, opts ...ScanOption) (*ClientSegmentStore, []*ClientRecord, error) {
+	var opt ScanOptions
+	for _, o := range opts {
+		o(&opt)
+	}
+
 	if maxSegmentSize <= 0 {
 		maxSegmentSize = DefaultMaxSegmentSize
 	}
@@ -202,15 +234,16 @@ func NewClientSegmentStore(dir string, filePrefix string, maxSegmentSize int64) 
 	sort.Strings(walFiles)
 
 	store := &ClientSegmentStore{
-		dir:            dir,
-		maxSegmentSize: maxSegmentSize,
-		filePrefix:     filePrefix,
+		dir:               dir,
+		maxSegmentSize:    maxSegmentSize,
+		filePrefix:        filePrefix,
+		acceptUnversioned: opt.AcceptUnversioned,
 	}
 
 	var allRecords []*ClientRecord
 	var removeErrs []error
 	for _, file := range walFiles {
-		records, meta, err := ScanClientSegmentFile(file)
+		records, meta, err := ScanClientSegmentFile(file, opts...)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -282,11 +315,17 @@ func (s *ClientSegmentStore) rotateLocked(firstSeq uint64) error {
 		return fmt.Errorf("failed to create new segment file %s: %w", path, err)
 	}
 
+	hdr := DefaultSegmentHeader().Encode()
+	if _, err := f.Write(hdr); err != nil {
+		errutil.CloseAndLog(f, fmt.Sprintf("segment file %s", path))
+		return fmt.Errorf("failed to write header to segment file %s: %w", path, err)
+	}
+
 	meta := &SegmentMeta{
 		Path:     path,
 		FirstSeq: firstSeq,
 		LastSeq:  firstSeq,
-		Size:     0,
+		Size:     int64(len(hdr)),
 	}
 
 	s.activeFile = f
@@ -336,7 +375,15 @@ func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
 			continue
 		}
 
-		var validOffset int64
+		_, hdrOffset, err := ReadSegmentHeader(f, s.acceptUnversioned)
+		if err != nil {
+			errutil.CloseAndLog(f, fmt.Sprintf("segment file %s", seg.Path))
+			errs = append(errs, fmt.Errorf("failed to read segment header %s: %w", seg.Path, err))
+			remaining = append(remaining, seg)
+			continue
+		}
+
+		validOffset := hdrOffset
 		var validCount int
 		var firstSeq, lastSeq uint64
 
@@ -431,10 +478,11 @@ func (s *ClientSegmentStore) Close() error {
 
 // LogSegmentStore manages local segment cache for the buffer service.
 type LogSegmentStore struct {
-	mu             sync.RWMutex
-	dir            string
-	maxSegmentSize int64
-	filePrefix     string
+	mu                sync.RWMutex
+	dir               string
+	maxSegmentSize    int64
+	filePrefix        string
+	acceptUnversioned bool
 
 	activeFile *os.File
 	activeMeta *SegmentMeta
@@ -443,7 +491,12 @@ type LogSegmentStore struct {
 
 // NewLogSegmentStore initializes a log segment store with a fixed prefix.
 // Any segment files from previous incarnations in dir are cleaned up on startup.
-func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64) (*LogSegmentStore, error) {
+func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64, opts ...ScanOption) (*LogSegmentStore, error) {
+	var opt ScanOptions
+	for _, o := range opts {
+		o(&opt)
+	}
+
 	if maxSegmentSize <= 0 {
 		maxSegmentSize = DefaultMaxSegmentSize
 	}
@@ -473,9 +526,10 @@ func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64) (*L
 	}
 
 	store := &LogSegmentStore{
-		dir:            dir,
-		maxSegmentSize: maxSegmentSize,
-		filePrefix:     filePrefix,
+		dir:               dir,
+		maxSegmentSize:    maxSegmentSize,
+		filePrefix:        filePrefix,
+		acceptUnversioned: opt.AcceptUnversioned,
 	}
 
 	return store, nil
@@ -541,11 +595,17 @@ func (s *LogSegmentStore) rotateLocked(firstPos uint64) error {
 		return fmt.Errorf("failed to create new segment file %s: %w", path, err)
 	}
 
+	hdr := DefaultSegmentHeader().Encode()
+	if _, err := f.Write(hdr); err != nil {
+		errutil.CloseAndLog(f, fmt.Sprintf("segment file %s", path))
+		return fmt.Errorf("failed to write header to segment file %s: %w", path, err)
+	}
+
 	meta := &SegmentMeta{
 		Path:     path,
 		FirstSeq: firstPos,
 		LastSeq:  firstPos,
-		Size:     0,
+		Size:     int64(len(hdr)),
 	}
 
 	s.activeFile = f
@@ -587,6 +647,10 @@ func (s *LogSegmentStore) ReadFrom(position uint64, fn func(*LogRecord) error) e
 				return fmt.Errorf("failed to open segment %s: %w", seg.Path, err)
 			}
 			defer errutil.CloseAndLog(f, fmt.Sprintf("segment %s", seg.Path))
+
+			if _, _, err := ReadSegmentHeader(f, s.acceptUnversioned); err != nil && !errors.Is(err, io.EOF) {
+				return fmt.Errorf("failed to read segment header %s: %w", seg.Path, err)
+			}
 
 			for {
 				rec, err := DecodeLogRecord(f)

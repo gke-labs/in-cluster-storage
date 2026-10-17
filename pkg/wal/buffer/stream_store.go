@@ -92,12 +92,16 @@ func (w *streamWriter) flushPendingLocked() error {
 	}
 
 	openPath := filepath.Join(w.dir, wal.FormatStreamFileName(w.openFrom, 0, false))
+	stat, statErr := os.Stat(openPath)
 	f, err := os.OpenFile(openPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open stream file %s: %w", openPath, err)
 	}
 
 	var buf bytes.Buffer
+	if statErr != nil || stat.Size() == 0 {
+		buf.Write(wal.DefaultSegmentHeader().Encode())
+	}
 	for _, rec := range w.pending {
 		buf.Write(rec.Encode())
 		if rec.StreamSeq > w.lastSeq {
@@ -247,7 +251,7 @@ func (w *streamWriter) getSealedMetas(ctx context.Context, backend objectstore.B
 	return res
 }
 
-func (w *streamWriter) recoverStream(ctx context.Context, backend objectstore.Backend, aggRecords []*wal.LogRecord) error {
+func (w *streamWriter) recoverStream(ctx context.Context, backend objectstore.Backend, aggRecords []*wal.LogRecord, opts ...wal.ScanOption) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -271,7 +275,7 @@ func (w *streamWriter) recoverStream(ctx context.Context, backend objectstore.Ba
 				w.lastSeq = to
 			}
 		} else {
-			recs, meta, err := wal.ScanLogSegmentFile(filePath)
+			recs, meta, err := wal.ScanLogSegmentFile(filePath, opts...)
 			if err != nil {
 				return fmt.Errorf("failed to scan open segment file %s: %w", filePath, err)
 			}
@@ -304,7 +308,12 @@ func (w *streamWriter) recoverStream(ctx context.Context, backend objectstore.Ba
 }
 
 // ReadRecordsFromOffset reads valid LogRecords from path starting at startOffset, returning records and nextOffset.
-func ReadRecordsFromOffset(path string, startOffset int64) ([]*wal.LogRecord, int64, error) {
+func ReadRecordsFromOffset(path string, startOffset int64, opts ...wal.ScanOption) ([]*wal.LogRecord, int64, error) {
+	var opt wal.ScanOptions
+	for _, o := range opts {
+		o(&opt)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -314,13 +323,22 @@ func ReadRecordsFromOffset(path string, startOffset int64) ([]*wal.LogRecord, in
 	}
 	defer errutil.CloseAndLog(f, fmt.Sprintf("stream file %s", path))
 
-	if startOffset > 0 {
+	nextOffset := startOffset
+	if startOffset == 0 {
+		_, hdrOffset, err := wal.ReadSegmentHeader(f, opt.AcceptUnversioned)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, 0, nil
+			}
+			return nil, 0, err
+		}
+		nextOffset = hdrOffset
+	} else {
 		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
 			return nil, startOffset, err
 		}
 	}
 
-	nextOffset := startOffset
 	var records []*wal.LogRecord
 	for {
 		rec, err := wal.DecodeLogRecord(f)
@@ -335,11 +353,12 @@ func ReadRecordsFromOffset(path string, startOffset int64) ([]*wal.LogRecord, in
 
 // StreamStore manages per-stream WAL files on local disk and object storage.
 type StreamStore struct {
-	mu           sync.RWMutex
-	dataDir      string
-	backend      objectstore.Backend
-	sealInterval time.Duration
-	sealBytes    int64
+	mu                sync.RWMutex
+	dataDir           string
+	backend           objectstore.Backend
+	sealInterval      time.Duration
+	sealBytes         int64
+	acceptUnversioned bool
 
 	streams     map[string]*streamWriter
 	writeNotify chan struct{}
@@ -348,6 +367,13 @@ type StreamStore struct {
 
 	stopChan chan struct{}
 	wg       sync.WaitGroup
+}
+
+// SetAcceptUnversioned configures whether unversioned segments/streams are accepted during recovery.
+func (s *StreamStore) SetAcceptUnversioned(accept bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.acceptUnversioned = accept
 }
 
 // NewStreamStore creates and initializes a StreamStore.
@@ -609,7 +635,7 @@ func (s *StreamStore) Recover(ctx context.Context, aggRecords []*wal.LogRecord) 
 	var errs []error
 	for id := range streamIDs {
 		w := s.getOrCreateStream(id)
-		if err := w.recoverStream(ctx, s.backend, aggRecords); err != nil {
+		if err := w.recoverStream(ctx, s.backend, aggRecords, wal.WithAcceptUnversioned(s.acceptUnversioned)); err != nil {
 			errs = append(errs, err)
 		}
 	}

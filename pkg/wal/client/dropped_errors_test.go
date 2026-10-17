@@ -159,7 +159,7 @@ func TestHandleHelloAck_TruncateFailureReturnsError(t *testing.T) {
 	streamID := uuid.New()
 	dir := t.TempDir()
 
-	store, _, err := wal.NewClientSegmentStore(dir, fmt.Sprintf("stream-%s", streamID.String()), 100)
+	store, _, err := wal.NewClientSegmentStore(dir, fmt.Sprintf("stream-%s", streamID.String()), 120)
 	if err != nil {
 		t.Fatalf("failed to create client segment store: %v", err)
 	}

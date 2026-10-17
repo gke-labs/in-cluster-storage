@@ -56,6 +56,7 @@ type ServerConfig struct {
 	BatchMaxSize       int64
 	StreamSealInterval time.Duration
 	StreamSealBytes    int64
+	AcceptUnversioned  bool
 }
 
 type incomingItem struct {
@@ -154,6 +155,9 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 	dataDir := cfg.DataDir
 	streamStore := NewStreamStore(dataDir, cfg.Backend, cfg.StreamSealInterval, cfg.StreamSealBytes)
+	if cfg.AcceptUnversioned {
+		streamStore.SetAcceptUnversioned(true)
+	}
 
 	// 1. Discover existing segments from backend
 	discoveredSegments, lastFlushedPos, err := ListSegmentsFromBackend(ctx, cfg.Backend)
@@ -164,7 +168,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	var allDiscoveredRecords []*wal.LogRecord
 	streamWatermarks := make(map[string]uint64)
 	for _, segPath := range discoveredSegments {
-		records, err := ReadSegmentFromBackend(ctx, cfg.Backend, segPath)
+		records, err := ReadSegmentFromBackend(ctx, cfg.Backend, segPath, wal.WithAcceptUnversioned(cfg.AcceptUnversioned))
 		if err != nil {
 			return nil, fmt.Errorf("failed to recover stream watermarks from segment %s: %w", segPath, err)
 		}
@@ -186,7 +190,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	klog.Infof("WAL Buffer initializing: assigning positions starting at %d (last_flushed_position=%d, segments=%d, streams=%d)", nextPosition, lastFlushedPos, len(discoveredSegments), len(streamWatermarks))
 
 	// 2. Setup local segment store with a fixed prefix
-	localStore, err := wal.NewLogSegmentStore(dataDir, "log", cfg.FlushBytes)
+	localStore, err := wal.NewLogSegmentStore(dataDir, "log", cfg.FlushBytes, wal.WithAcceptUnversioned(cfg.AcceptUnversioned))
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize local segment store: %w", err)
 	}
@@ -724,6 +728,7 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 
 	// 1. Encode all records into segment byte buffer
 	var segBuf bytes.Buffer
+	segBuf.Write(wal.DefaultSegmentHeader().Encode())
 	streamMaxSeq := make(map[string]uint64)
 
 	for _, rec := range records {
@@ -998,14 +1003,14 @@ func (s *Server) tailPerStream(ctx context.Context, streamID uuid.UUID, req *pb.
 		}
 		var records []*wal.LogRecord
 		if sm.Path != "" {
-			if recs, _, err := ReadRecordsFromOffset(sm.Path, 0); err == nil && len(recs) > 0 {
+			if recs, _, err := ReadRecordsFromOffset(sm.Path, 0, wal.WithAcceptUnversioned(s.cfg.AcceptUnversioned)); err == nil && len(recs) > 0 {
 				records = recs
 			} else if err != nil {
 				klog.Warningf("failed to read local sealed file %s: %v, falling back to backend", sm.Path, err)
 			}
 		}
 		if records == nil && sm.Key != "" && s.backend != nil {
-			recs, err := ReadSegmentFromBackend(ctx, s.backend, sm.Key)
+			recs, err := ReadSegmentFromBackend(ctx, s.backend, sm.Key, wal.WithAcceptUnversioned(s.cfg.AcceptUnversioned))
 			if err != nil {
 				return fmt.Errorf("failed to read sealed segment %s from backend: %w", sm.Key, err)
 			}
@@ -1027,7 +1032,7 @@ func (s *Server) tailPerStream(ctx context.Context, streamID uuid.UUID, req *pb.
 	var openOffset int64
 	if curOpenFrom > 0 {
 		openPath := filepath.Join(openDir, wal.FormatStreamFileName(curOpenFrom, 0, false))
-		recs, nextOffset, err := ReadRecordsFromOffset(openPath, 0)
+		recs, nextOffset, err := ReadRecordsFromOffset(openPath, 0, wal.WithAcceptUnversioned(s.cfg.AcceptUnversioned))
 		if err != nil {
 			return fmt.Errorf("failed to read open stream file %s: %w", openPath, err)
 		}
