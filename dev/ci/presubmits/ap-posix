@@ -109,36 +109,8 @@ EOF
 )
 
 XFSTESTS_DIR="${WORK_DIR}/xfstests"
-XFSTESTS_COMMIT="3e1ee800e52a0f53d7d9a7809be1ffc80ec1788f"
-echo "Fetching fsx from xfstests at commit ${XFSTESTS_COMMIT}..."
-if ! git clone --quiet --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "${XFSTESTS_DIR}" 2>/dev/null; then
-  git clone --quiet https://github.com/kdave/xfstests.git "${XFSTESTS_DIR}"
-fi
-(
-  cd "${XFSTESTS_DIR}"
-  git checkout --quiet "${XFSTESTS_COMMIT}" 2>/dev/null || true
-  cat << 'EOF' > config.h
-#define _GNU_SOURCE 1
-#define HAVE_SYS_PARAM_H 1
-#define HAVE_SYS_TYPES_H 1
-#define HAVE_SYS_STAT_H 1
-#define HAVE_SYS_TIME_H 1
-#define HAVE_SYS_MMAN_H 1
-#define HAVE_MALLOC_H 1
-#define HAVE_DIRENT_H 1
-#define HAVE_STDLIB_H 1
-#define HAVE_UNISTD_H 1
-#define HAVE_ERRNO_H 1
-#define HAVE_STRING_H 1
-#define HAVE_SYS_FCNTL_H 1
-#define HAVE_ASSERT_H 1
-#define STDC_HEADERS 1
-#define HAVE_LINUX_FALLOC_H 1
-#define HAVE_FALLOCATE 1
-#include <getopt.h>
-EOF
-  gcc -Wall -O2 -I. -Isrc -Iinclude -o fsx ltp/fsx.c
-)
+mkdir -p "${XFSTESTS_DIR}"
+"${REPO_ROOT}/dev/tasks/build-fsx" "${XFSTESTS_DIR}/fsx"
 
 echo "Compiling mmap shared write coherency test..."
 gcc -Wall -O2 -o "${WORK_DIR}/test_mmap" "${REPO_ROOT}/tests/posix/test_mmap.c"
