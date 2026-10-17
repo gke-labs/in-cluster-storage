@@ -657,10 +657,10 @@ func TestPublishedSnapshotCompactedTableInvariant(t *testing.T) {
 		lastKey = append([]byte(nil), kv.K.UserKey...)
 	}
 
-	// Exactly 3 metadata keys + 8 live rows = 11 entries
-	const expectedEntries = 3 + 8
+	// Exactly 5 metadata keys (format_version, created_by, position, registry, stream_id) + 8 live rows = 13 entries
+	const expectedEntries = 5 + 8
 	if entryCount != expectedEntries {
-		t.Fatalf("total sstable entry count = %d, want %d (3 metadata + 8 live rows)", entryCount, expectedEntries)
+		t.Fatalf("total sstable entry count = %d, want %d (5 metadata + 8 live rows)", entryCount, expectedEntries)
 	}
 
 	// 2. Open with standalone SnapshotReader

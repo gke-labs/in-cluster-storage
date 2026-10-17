@@ -90,18 +90,26 @@ type DB struct {
 }
 
 type options struct {
-	streamID     string
-	disableWAL   bool
-	cacheSize    int64
-	cache        *pebble.Cache
-	memTableSize uint64
-	sync         bool
-	decoderOpts  []record.DecoderOption
-	pebbleOpts   *pebble.Options
+	streamID          string
+	disableWAL        bool
+	cacheSize         int64
+	cache             *pebble.Cache
+	memTableSize      uint64
+	sync              bool
+	decoderOpts       []record.DecoderOption
+	pebbleOpts        *pebble.Options
+	acceptUnversioned bool
 }
 
 // Option configures table DB behavior.
 type Option func(*options)
+
+// WithAcceptUnversioned configures whether unversioned snapshots are accepted on restore.
+func WithAcceptUnversioned(accept bool) Option {
+	return func(o *options) {
+		o.acceptUnversioned = accept
+	}
+}
 
 // WithStreamID configures the stream ID associated with the table DB.
 func WithStreamID(streamID string) Option {
@@ -274,6 +282,7 @@ func Open(ctx context.Context, dir string, opts ...Option) (*DB, error) {
 		opts:         o,
 		writeOpts:    pebble.NoSync,
 	}
+	d.changeReader.SetAcceptUnversioned(o.acceptUnversioned)
 	if o.sync {
 		d.writeOpts = pebble.Sync
 	}
@@ -287,6 +296,41 @@ func Open(ctx context.Context, dir string, opts ...Option) (*DB, error) {
 }
 
 func (d *DB) loadMetadataLocked() error {
+	// 0. Format Version
+	valVer, closerVer, err := d.db.Get(KeyFormatVersion)
+	if err == nil {
+		ver, decErr := DecodeFormatVersion(valVer)
+		errutil.CloseAndLog(closerVer, "format_version closer")
+		if decErr != nil {
+			return fmt.Errorf("failed to decode format_version from db: %w", decErr)
+		}
+		if ver > SnapshotFormatVersion {
+			return fmt.Errorf("%w: version %d > current %d", ErrUnsupportedSnapshotVersion, ver, SnapshotFormatVersion)
+		}
+	} else if errors.Is(err, pebble.ErrNotFound) {
+		// KeyFormatVersion not found.
+		// Check if KeyPosition exists to distinguish unversioned snapshot from a brand new empty DB.
+		_, posCloser, posErr := d.db.Get(KeyPosition)
+		if posErr == nil {
+			errutil.CloseAndLog(posCloser, "position closer")
+			if !d.opts.acceptUnversioned {
+				return ErrUnversionedSnapshot
+			}
+			klog.Warning("accepting unversioned table snapshot (--accept-unversioned-segments)")
+		} else if !errors.Is(posErr, pebble.ErrNotFound) {
+			return fmt.Errorf("failed to check position in db: %w", posErr)
+		}
+
+		if err := d.db.Set(KeyFormatVersion, EncodeFormatVersion(SnapshotFormatVersion), d.writeOpts); err != nil {
+			return fmt.Errorf("failed to persist format version: %w", err)
+		}
+		if err := d.db.Set(KeyCreatedBy, []byte(DefaultCreatedBy), d.writeOpts); err != nil {
+			return fmt.Errorf("failed to persist created by: %w", err)
+		}
+	} else {
+		return fmt.Errorf("failed to read format_version from db: %w", err)
+	}
+
 	// 1. Stream ID
 	valSID, closer, err := d.db.Get(KeyStreamID)
 	if err == nil {

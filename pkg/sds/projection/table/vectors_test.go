@@ -80,7 +80,7 @@ func TestSnapshotGoldenVectors(t *testing.T) {
 			}
 
 			// 1. Read via standalone SnapshotReader
-			sr, err := table.OpenSnapshotBytes(sstBytes)
+			sr, err := table.OpenSnapshotBytes(sstBytes, table.WithReaderAcceptUnversioned(true))
 			if err != nil {
 				t.Fatalf("OpenSnapshotBytes failed: %v", err)
 			}
@@ -126,7 +126,7 @@ func TestSnapshotGoldenVectors(t *testing.T) {
 			}
 
 			restoreDir := t.TempDir()
-			restoredDB, restoredPos, err := table.RestoreSnapshotKey(ctx, backend, vec.StreamID, snapKey, restoreDir)
+			restoredDB, restoredPos, err := table.RestoreSnapshotKey(ctx, backend, vec.StreamID, snapKey, restoreDir, table.WithAcceptUnversioned(true))
 			if err != nil {
 				t.Fatalf("RestoreSnapshotKey failed: %v", err)
 			}
