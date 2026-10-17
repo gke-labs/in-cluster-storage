@@ -221,7 +221,77 @@ spec:
 	}
 
 	h.DeletePod(pod3Name, "default")
-	t.Logf("Successfully verified ObjectFS multi-writer FUSE CSI driver!")
+	t.Logf("Successfully verified ObjectFS multi-writer FUSE CSI driver with node daemon authentication!")
+
+	// Step 4: Verify authentication & admin path:
+	// Launch test client pod with access to CA cert
+	clientPodName := "auth-client-test-pod"
+	clientPodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: objectfs-controller:e2e
+      imagePullPolicy: Never
+      command: ["sleep", "3600"]
+      volumeMounts:
+        - name: objectfs-tls
+          mountPath: /etc/objectfs/tls
+          readOnly: true
+  volumes:
+    - name: objectfs-tls
+      secret:
+        secretName: objectfs-tls
+`, clientPodName)
+
+	h.KubectlApplyContent(clientPodName, clientPodYaml)
+	if err := h.WaitForPodReady(clientPodName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Client test pod failed to start: %v", err)
+	}
+	defer deletePodBounded(t, h, clientPodName, "default", 1*time.Minute)
+
+	// A pod without a valid token is refused
+	t.Logf("Verifying request with invalid token is refused")
+	_, err = h.RunInPod(clientPodName, "default", "objectfsctl", "--server", "objectfs-controller:50051", "--ca", "/etc/objectfs/tls/ca.crt", "--token", "bogus-invalid-token", "volumes", "list")
+	if err == nil {
+		t.Fatalf("expected request with invalid token to be refused, but it succeeded")
+	}
+	t.Logf("Invalid token was correctly refused: %v", err)
+
+	// Token for unauthorized service account (default SA) is refused
+	t.Logf("Verifying token for unauthorized service account is refused")
+	tokenOut, err := exec.Command("kubectl", "create", "token", "default", "-n", "default", "--audience=objectfs-controller").CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to create token for default serviceaccount: %v (out: %s)", err, tokenOut)
+	}
+	defaultSAToken := strings.TrimSpace(string(tokenOut))
+
+	_, err = h.RunInPod(clientPodName, "default", "objectfsctl", "--server", "objectfs-controller:50051", "--ca", "/etc/objectfs/tls/ca.crt", "--token", defaultSAToken, "volumes", "list")
+	if err == nil {
+		t.Fatalf("expected request with default serviceaccount token to be refused with PermissionDenied, but it succeeded")
+	}
+	t.Logf("Default serviceaccount token was correctly refused: %v", err)
+
+	// objectfsctl works through the admin path with objectfs-admin token
+	t.Logf("Verifying admin path: objectfsctl with objectfs-admin token succeeds")
+	adminTokenOut, err := exec.Command("kubectl", "create", "token", "objectfs-admin", "-n", "default", "--audience=objectfs-controller").CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to create token for objectfs-admin: %v (out: %s)", err, adminTokenOut)
+	}
+	adminToken := strings.TrimSpace(string(adminTokenOut))
+
+	volsOut, err := h.RunInPod(clientPodName, "default", "objectfsctl", "--server", "objectfs-controller:50051", "--ca", "/etc/objectfs/tls/ca.crt", "--token", adminToken, "volumes", "list")
+	if err != nil {
+		t.Fatalf("admin objectfsctl volumes list failed: %v (out: %s)", err, volsOut)
+	}
+	if !strings.Contains(volsOut, volumeID) {
+		t.Fatalf("expected volume %s in volumes list, got: %s", volumeID, volsOut)
+	}
+	t.Logf("Admin path successfully listed volumes: %s", strings.TrimSpace(volsOut))
 }
 
 func TestObjectFSStatefulSetE2E(t *testing.T) {
@@ -2265,7 +2335,7 @@ spec:
 	}
 
 	t.Logf("Executing objectfsctl checkpoint for volume %s", actualVolumeID)
-	h.RunCommand("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "checkpoint", actualVolumeID)
+	h.RunCommand("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "--ca", "/etc/objectfs/tls/ca.crt", "--token", "/var/run/secrets/tokens/token", "checkpoint", actualVolumeID)
 
 	// Pod A writes more files AFTER the checkpoint
 	t.Logf("Pod A writing files after checkpoint")
