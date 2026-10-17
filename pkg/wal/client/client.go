@@ -137,6 +137,7 @@ type streamImpl struct {
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
 	initialHelloAckErr  error
+	terminalErr         error
 
 	// Retained in-memory records queue for network sending & replay
 	retainedMu      sync.RWMutex
@@ -267,15 +268,22 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		return 0, errors.New("stream closed")
 	}
 
+	s.mu.RLock()
+	termErr := s.terminalErr
+	s.mu.RUnlock()
+	if termErr != nil {
+		return 0, termErr
+	}
+
 	recordSize := int64(wal.ClientHeaderSize + len(payload))
 
 	// Degraded mode / backpressure check: block if retained bytes exceed maxRetainedBytes
 	s.mu.Lock()
-	for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() {
+	for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.terminalErr == nil {
 		doneCh := make(chan struct{})
 		go func() {
 			s.mu.Lock()
-			for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() {
+			for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.terminalErr == nil {
 				s.cond.Wait()
 			}
 			s.mu.Unlock()
@@ -291,6 +299,12 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		case <-doneCh:
 		}
 		s.mu.Lock()
+	}
+
+	if s.terminalErr != nil {
+		termErr := s.terminalErr
+		s.mu.Unlock()
+		return 0, termErr
 	}
 
 	s.localSeq++
@@ -336,8 +350,12 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 	s.mu.RLock()
 	witness := s.witnessSeq
 	s3 := s.s3Seq
+	termErr := s.terminalErr
 	s.mu.RUnlock()
 
+	if termErr != nil {
+		return termErr
+	}
 	if level == Witness && witness >= seq {
 		return nil
 	}
@@ -349,7 +367,7 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 		waitChan := make(chan struct{})
 		go func() {
 			s.mu.Lock()
-			for !s.closed.Load() {
+			for !s.closed.Load() && s.terminalErr == nil {
 				if level == Witness && s.witnessSeq >= seq {
 					break
 				}
@@ -370,7 +388,11 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 		case <-waitChan:
 			s.mu.RLock()
 			w, s3w := s.witnessSeq, s.s3Seq
+			termErr := s.terminalErr
 			s.mu.RUnlock()
+			if termErr != nil {
+				return termErr
+			}
 			if level == Witness && w >= seq {
 				return nil
 			}
@@ -392,8 +414,13 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 	}
 
 	s.mu.RLock()
+	termErr := s.terminalErr
 	local := s.localSeq
 	s.mu.RUnlock()
+
+	if termErr != nil {
+		return termErr
+	}
 
 	if seq > local {
 		return fmt.Errorf("seq %d has not been appended locally (local=%d)", seq, local)
@@ -518,6 +545,7 @@ func (s *streamImpl) backgroundReplicationLoop() {
 
 	backoff := 50 * time.Millisecond
 	maxBackoff := 2 * time.Second
+	loggedFirst := false
 
 	for {
 		select {
@@ -526,9 +554,32 @@ func (s *streamImpl) backgroundReplicationLoop() {
 		default:
 		}
 
+		s.mu.RLock()
+		termErr := s.terminalErr
+		s.mu.RUnlock()
+		if termErr != nil {
+			return
+		}
+
 		err := s.runStreamSession()
 		if err != nil && !s.closed.Load() {
-			klog.V(4).Infof("WAL client replication session ended: %v, reconnecting in %v", err, backoff)
+			s.mu.RLock()
+			termErr := s.terminalErr
+			s.mu.RUnlock()
+			if termErr != nil {
+				klog.Errorf("Stream %s entered terminal failed state: %v", s.streamID, termErr)
+				return
+			}
+
+			if !loggedFirst {
+				klog.Warningf("Stream %s: WAL client replication session failed: %v, reconnecting in %v", s.streamID, err, backoff)
+				loggedFirst = true
+			} else if backoff >= maxBackoff {
+				klog.Warningf("Stream %s: WAL client replication session failed: %v, reconnecting in %v", s.streamID, err, backoff)
+			} else {
+				klog.V(4).Infof("Stream %s: WAL client replication session ended: %v, reconnecting in %v", s.streamID, err, backoff)
+			}
+
 			select {
 			case <-s.cancelCtx.Done():
 				return
@@ -540,6 +591,7 @@ func (s *streamImpl) backgroundReplicationLoop() {
 			}
 		} else {
 			backoff = 50 * time.Millisecond
+			loggedFirst = false
 		}
 	}
 }
@@ -660,6 +712,19 @@ func (s *streamImpl) runStreamSession() error {
 	}
 }
 
+func (s *streamImpl) setTerminalErrorLocked(err error) {
+	if s.terminalErr == nil {
+		s.terminalErr = err
+		s.initialHelloAckOnce.Do(func() {
+			s.initialHelloAckErr = err
+			close(s.initialHelloAckDone)
+		})
+		if s.cond != nil {
+			s.cond.Broadcast()
+		}
+	}
+}
+
 func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -686,8 +751,10 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 			// Query buffer for record at witnessHead.
 			// Release s.mu while tailing buffer to avoid blocking callers/cond.
 			s.mu.Unlock()
-			tailIter, err := s.Tail(s.cancelCtx, witnessHead-1)
+			tailCtx, tailCancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
+			tailIter, err := s.Tail(tailCtx, witnessHead-1)
 			if err != nil {
+				tailCancel()
 				s.mu.Lock()
 				return fmt.Errorf("failed to tail buffer at witness head %d: %w", witnessHead, err)
 			}
@@ -699,7 +766,11 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 					found = true
 					break
 				}
+				if seq > witnessHead {
+					break
+				}
 			}
+			tailCancel()
 			s.mu.Lock()
 			if !found {
 				return fmt.Errorf("record at witness head %d not found in buffer stream tail", witnessHead)
@@ -726,7 +797,9 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 
 				if s.store != nil {
 					if err := s.store.TruncateAfter(witnessHead); err != nil {
-						return fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err)
+						storeErr := fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err)
+						s.setTerminalErrorLocked(storeErr)
+						return storeErr
 					}
 				}
 
@@ -746,7 +819,9 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 		s.cleanupS3AckedLocked(helloAck.S3AckedStreamSeq)
 	}
 
-	s.cond.Broadcast()
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
 	s.initialHelloAckOnce.Do(func() {
 		close(s.initialHelloAckDone)
 	})

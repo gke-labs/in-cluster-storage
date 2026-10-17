@@ -144,6 +144,45 @@ func TestClientSegmentStore_TruncateAfterRemovalFailure(t *testing.T) {
 	}
 }
 
+func TestClientSegmentStore_TruncateAfter_MissingPartialSegmentFile(t *testing.T) {
+	dir := t.TempDir()
+	store, _, err := NewClientSegmentStore(dir, "stream", 100)
+	if err != nil {
+		t.Fatalf("failed to create client segment store: %v", err)
+	}
+
+	streamID := uuid.New()
+	for i := uint64(1); i <= 10; i++ {
+		rec := &ClientRecord{
+			StreamID:  streamID,
+			StreamSeq: i,
+			Payload:   []byte(fmt.Sprintf("rec-%d", i)),
+		}
+		if err := store.Append(rec); err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+	}
+
+	// Remove the active segment file on disk before TruncateAfter
+	targetSeg := store.segments[len(store.segments)-1]
+	if err := os.Remove(targetSeg.Path); err != nil {
+		t.Fatalf("failed to remove target seg file: %v", err)
+	}
+
+	// Truncate to seq targetSeg.FirstSeq (where targetSeg is considered a partial segment)
+	err = store.TruncateAfter(targetSeg.FirstSeq)
+	if err != nil {
+		t.Fatalf("expected TruncateAfter to succeed when missing partial segment is already gone, got: %v", err)
+	}
+
+	// Verify targetSeg is no longer in remaining
+	for _, s := range store.segments {
+		if s.Path == targetSeg.Path {
+			t.Errorf("missing segment %s should not remain in segments list", s.Path)
+		}
+	}
+}
+
 func TestScanSegmentFile_Errors(t *testing.T) {
 	dir := t.TempDir()
 	nonexistent := filepath.Join(dir, "nonexistent.wal")

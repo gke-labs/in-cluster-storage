@@ -211,6 +211,23 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		s.streams[sid] = newStreamState(seq, seq)
 	}
 
+	// Also incorporate streams recovered from per-stream storage
+	for sid, wm := range streamStore.StreamWatermarks() {
+		st, exists := s.streams[sid]
+		if !exists {
+			s.streams[sid] = newStreamState(wm.WitnessSeq, wm.S3Seq)
+		} else {
+			st.mu.Lock()
+			if wm.WitnessSeq > st.witnessSeq {
+				st.witnessSeq = wm.WitnessSeq
+			}
+			if wm.S3Seq > st.s3Seq {
+				st.s3Seq = wm.S3Seq
+			}
+			st.mu.Unlock()
+		}
+	}
+
 	s.checkAggregatedSegmentGC(ctx)
 
 	// Start background group commit worker

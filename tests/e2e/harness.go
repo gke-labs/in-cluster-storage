@@ -233,6 +233,26 @@ func (h *Harness) DeletePodWithTimeout(t *testing.T, name, namespace string, tim
 	}
 }
 
+// RunInPodWithTimeout executes a command inside a pod within a timeout duration.
+func (h *Harness) RunInPodWithTimeout(timeout time.Duration, name, namespace string, cmd ...string) (string, error) {
+	h.t.Helper()
+	type result struct {
+		out string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		out, err := h.RunInPod(name, namespace, cmd...)
+		ch <- result{out: out, err: err}
+	}()
+	select {
+	case res := <-ch:
+		return res.out, res.err
+	case <-time.After(timeout):
+		return "", fmt.Errorf("timed out running command in pod %s/%s after %v: %v", namespace, name, timeout, cmd)
+	}
+}
+
 // GetPVForPVC returns the volume name (PV name) bound to the given PVC.
 func (h *Harness) GetPVForPVC(pvcName, namespace string) (string, error) {
 	h.t.Helper()

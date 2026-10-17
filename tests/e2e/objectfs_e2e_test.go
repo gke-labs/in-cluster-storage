@@ -1796,6 +1796,15 @@ func TestObjectFSWalBufferRestartE2E(t *testing.T) {
 	h, node1, _ := setupObjectFSMultiNodeCluster(t, "objectfs-wal-restart-e2e")
 	volumeID := "wal-restart-vol"
 
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+			t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+			t.Logf("WAL Buffer Logs:\n%s\n", h.GetPodLogsByName("wal-buffer-0", "default"))
+		}
+	})
+
 	writerPodName := "wal-writer-pod"
 	writerPodYaml := fmt.Sprintf(`
 apiVersion: v1
@@ -1846,7 +1855,7 @@ hash3=$(sha256sum /tmp/src/waldir/nested.txt | awk '{print $1}')
 dd if=/tmp/src/waldir/nested.txt of=/data/waldir/nested.txt conv=fsync 2>/dev/null
 echo "$hash3" > /tmp/manifest/waldir_nested.txt.sha
 `
-	_, err := h.RunInPod(writerPodName, "default", "/bin/sh", "-c", initialScript)
+	_, err := h.RunInPodWithTimeout(3*time.Minute, writerPodName, "default", "/bin/sh", "-c", initialScript)
 	if err != nil {
 		t.Fatalf("Failed to write initial files: %v", err)
 	}
@@ -1866,13 +1875,13 @@ echo "$hash3" > /tmp/manifest/waldir_nested.txt.sha
 		{"/data/large1.bin", "large1.bin.sha"},
 		{"/data/waldir/nested.txt", "waldir_nested.txt.sha"},
 	} {
-		expectedHashRaw, err := h.RunInPod(writerPodName, "default", "cat", "/tmp/manifest/"+check.manifestName)
+		expectedHashRaw, err := h.RunInPodWithTimeout(1*time.Minute, writerPodName, "default", "cat", "/tmp/manifest/"+check.manifestName)
 		if err != nil {
 			t.Fatalf("Failed to read manifest for %s: %v", check.path, err)
 		}
 		expectedHash := strings.TrimSpace(expectedHashRaw)
 
-		hashOut, err := h.RunInPod(writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("sha256sum %s | awk '{print $1}'", check.path))
+		hashOut, err := h.RunInPodWithTimeout(1*time.Minute, writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("sha256sum %s | awk '{print $1}'", check.path))
 		if err != nil {
 			t.Fatalf("Failed to compute sha256 for %s: %v (out: %s)", check.path, err, hashOut)
 		}
@@ -1905,7 +1914,7 @@ for i in $(seq 1 10); do
   sleep 0.1
 done
 `
-	_, err = h.RunInPod(writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/wal_workload.sh\n%s\nEOF\nchmod +x /tmp/wal_workload.sh", workloadScript))
+	_, err = h.RunInPodWithTimeout(1*time.Minute, writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/wal_workload.sh\n%s\nEOF\nchmod +x /tmp/wal_workload.sh", workloadScript))
 	if err != nil {
 		t.Fatalf("Failed to write mid-workload script: %v", err)
 	}
@@ -1913,7 +1922,7 @@ done
 	runnerScript := `/tmp/wal_workload.sh > /tmp/wal_workload.log 2>&1
 echo $? > /tmp/wal_workload.status
 `
-	_, err = h.RunInPod(writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/wal_runner.sh\n%s\nEOF\nchmod +x /tmp/wal_runner.sh\n/tmp/wal_runner.sh &", runnerScript))
+	_, err = h.RunInPodWithTimeout(3*time.Minute, writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/wal_runner.sh\n%s\nEOF\nchmod +x /tmp/wal_runner.sh\n(/tmp/wal_runner.sh) </dev/null >/dev/null 2>&1 &", runnerScript))
 	if err != nil {
 		t.Fatalf("Failed to start mid-workload in writer pod: %v", err)
 	}
@@ -1929,7 +1938,7 @@ echo $? > /tmp/wal_workload.status
 	workloadFinished := false
 	var exitCodeStr string
 	for time.Now().Before(deadline) {
-		out, err := h.RunInPod(writerPodName, "default", "cat", "/tmp/wal_workload.status")
+		out, err := h.RunInPodWithTimeout(30*time.Second, writerPodName, "default", "cat", "/tmp/wal_workload.status")
 		if err == nil && strings.TrimSpace(out) != "" {
 			exitCodeStr = strings.TrimSpace(out)
 			workloadFinished = true
@@ -1938,15 +1947,15 @@ echo $? > /tmp/wal_workload.status
 		time.Sleep(1 * time.Second)
 	}
 	if !workloadFinished {
-		wLogs, _ := h.RunInPod(writerPodName, "default", "cat", "/tmp/wal_workload.log")
+		wLogs, _ := h.RunInPodWithTimeout(30*time.Second, writerPodName, "default", "cat", "/tmp/wal_workload.log")
 		t.Fatalf("WAL mid-workload did not complete in time. Logs:\n%s", wLogs)
 	}
 	if exitCodeStr != "0" {
-		wLogs, _ := h.RunInPod(writerPodName, "default", "cat", "/tmp/wal_workload.log")
+		wLogs, _ := h.RunInPodWithTimeout(30*time.Second, writerPodName, "default", "cat", "/tmp/wal_workload.log")
 		t.Fatalf("WAL mid-workload exited with code %s. Logs:\n%s", exitCodeStr, wLogs)
 	}
 
-	manifestListRaw, err := h.RunInPod(writerPodName, "default", "/bin/sh", "-c", "for f in /tmp/manifest/*.sha; do [ -f \"$f\" ] || continue; echo \"$(cat \"$f\") $(basename \"$f\" .sha)\"; done")
+	manifestListRaw, err := h.RunInPodWithTimeout(1*time.Minute, writerPodName, "default", "/bin/sh", "-c", "for f in /tmp/manifest/*.sha; do [ -f \"$f\" ] || continue; echo \"$(cat \"$f\") $(basename \"$f\" .sha)\"; done")
 	if err != nil {
 		t.Fatalf("Failed to read manifest list from writer pod: %v", err)
 	}
@@ -1967,7 +1976,7 @@ echo $? > /tmp/wal_workload.status
 			relativePath = escapedName
 		}
 
-		out, err := h.RunInPod(writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("sha256sum /data/%s | awk '{print $1}'", relativePath))
+		out, err := h.RunInPodWithTimeout(1*time.Minute, writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("sha256sum /data/%s | awk '{print $1}'", relativePath))
 		if err != nil {
 			t.Fatalf("Failed to calculate sha256 for /data/%s: %v (out: %s)", relativePath, err, out)
 		}
@@ -1977,7 +1986,7 @@ echo $? > /tmp/wal_workload.status
 	}
 
 	t.Logf("Writing final post-restart file")
-	_, err = h.RunInPod(writerPodName, "default", "/bin/sh", "-c", "echo 'final-wal-buffer-data' > /data/final_wal.txt && sync /data/final_wal.txt")
+	_, err = h.RunInPodWithTimeout(3*time.Minute, writerPodName, "default", "/bin/sh", "-c", "echo 'final-wal-buffer-data' > /tmp/final_wal.src && dd if=/tmp/final_wal.src of=/data/final_wal.txt conv=fsync")
 	if err != nil {
 		t.Fatalf("Failed to write final post-restart file: %v", err)
 	}
@@ -1986,7 +1995,7 @@ echo $? > /tmp/wal_workload.status
 		t.Fatalf("Failed to read final_wal.txt: %v (out: %s)", err, outFinal)
 	}
 
-	h.DeletePod(writerPodName, "default")
+	deletePodBounded(t, h, writerPodName, "default", 3*time.Minute)
 	t.Logf("Successfully verified WAL buffer restart durability, mid-workload restart, and continued writes!")
 }
 
@@ -2015,6 +2024,7 @@ func deletePodBounded(t *testing.T, h *Harness, podName, namespace string, timeo
 	}
 	t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", namespace))
 	t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", namespace))
+	t.Logf("WAL Buffer Logs:\n%s\n", h.GetPodLogsByName("wal-buffer-0", namespace))
 	t.Fatalf("Timed out waiting %v for pod %s to be deleted", timeout, podName)
 }
 

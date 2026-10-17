@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +31,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -56,6 +59,10 @@ func (h *testServerHandle) StopWithoutClose() {
 }
 
 func startBufferServer(t *testing.T, backend objectstore.Backend, dataDir string) *testServerHandle {
+	return startBufferServerOnAddr(t, backend, dataDir, "127.0.0.1:0")
+}
+
+func startBufferServerOnAddr(t *testing.T, backend objectstore.Backend, dataDir string, addr string) *testServerHandle {
 	ctx := t.Context()
 	srv, err := buffer.NewServer(ctx, buffer.ServerConfig{
 		Backend:       backend,
@@ -67,9 +74,9 @@ func startBufferServer(t *testing.T, backend objectstore.Backend, dataDir string
 		t.Fatalf("failed to start buffer server: %v", err)
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
+		t.Fatalf("failed to listen on %s: %v", addr, err)
 	}
 
 	grpcServer := grpc.NewServer()
@@ -1329,5 +1336,170 @@ func TestDivergentLocalTailAboveWitnessWatermarkDiscarded(t *testing.T) {
 	}
 	if err := stream1Reopened.Wait(ctx, seq4, Witness, false); err != nil {
 		t.Fatalf("wait for seq 4 failed: %v", err)
+	}
+}
+
+// TestClientStream_LiveReconnectAcrossBufferRestart verifies that an actively open client stream
+// survives a buffer crash and restart with persistent buffer dataDir, reconnects via background loop,
+// and continues appending and witness-acknowledging records without hanging.
+func TestClientStream_LiveReconnectAcrossBufferRestart(t *testing.T) {
+	backend := inmemorystorage.New()
+	bufDataDir := t.TempDir()
+
+	handle1 := startBufferServer(t, backend, bufDataDir)
+	defer func() {
+		if handle1 != nil {
+			handle1.StopGraceful()
+		}
+	}()
+
+	clientDir := t.TempDir()
+	streamID := uuid.New()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	stream, err := Open(ctx, clientDir, streamID, handle1.addr)
+	if err != nil {
+		t.Fatalf("failed to open stream: %v", err)
+	}
+	defer stream.Close()
+
+	// Append initial 5 records and wait for witness ack
+	for i := 1; i <= 5; i++ {
+		seq, err := stream.Append(ctx, []byte(fmt.Sprintf("msg-pre-restart-%d", i)))
+		if err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+		if err := stream.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("wait witness %d failed: %v", seq, err)
+		}
+	}
+
+	// Crash stop buffer server 1 WITHOUT close (no graceful shutdown)
+	savedAddr := handle1.addr
+	handle1.StopWithoutClose()
+	handle1 = nil
+
+	// Restart buffer server 2 on the exact same address and persistent dataDir
+	handle2 := startBufferServerOnAddr(t, backend, bufDataDir, savedAddr)
+	defer handle2.StopGraceful()
+
+	// Append records post-restart through the same client stream instance.
+	// The client's background replication loop must reconnect, exchange Hello/HelloAck,
+	// and witness-acknowledge new records without hanging.
+	for i := 6; i <= 10; i++ {
+		seq, err := stream.Append(ctx, []byte(fmt.Sprintf("msg-post-restart-%d", i)))
+		if err != nil {
+			t.Fatalf("append post-restart %d failed: %v", i, err)
+		}
+		if err := stream.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("wait witness post-restart %d failed: %v", seq, err)
+		}
+	}
+
+	_, witness, _ := stream.Watermarks()
+	if witness < 10 {
+		t.Errorf("expected witness watermark >= 10, got %d", witness)
+	}
+}
+
+// TestClientStream_TerminalErrorOnStoreTruncateFailure verifies that when handleHelloAck
+// fails due to a store error (e.g. TruncateAfter fails), the stream enters a terminal failed state,
+// unblocks waiters, causes Append and Wait to return the terminal error immediately, and stops
+// the replication loop instead of retrying forever.
+func TestClientStream_TerminalErrorOnStoreTruncateFailure(t *testing.T) {
+	ctx := t.Context()
+	streamID := uuid.New()
+	dir := t.TempDir()
+
+	store, _, err := wal.NewClientSegmentStore(dir, "stream", 100)
+	if err != nil {
+		t.Fatalf("failed to create client segment store: %v", err)
+	}
+
+	for i := uint64(1); i <= 10; i++ {
+		rec := &wal.ClientRecord{
+			StreamID:  streamID,
+			StreamSeq: i,
+			Payload:   []byte(fmt.Sprintf("local-rec-%d", i)),
+		}
+		if err := store.Append(rec); err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+	}
+
+	// Make the last segment unremovable by replacing it with a directory containing a child file
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir failed: %v", err)
+	}
+	var lastSegPath string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".wal") && !strings.Contains(e.Name(), "0000000000000000001") {
+			lastSegPath = filepath.Join(dir, e.Name())
+			break
+		}
+	}
+	if lastSegPath == "" {
+		t.Fatalf("did not find second segment file")
+	}
+	if err := os.Remove(lastSegPath); err != nil {
+		t.Fatalf("remove seg file failed: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(lastSegPath, "child"), 0755); err != nil {
+		t.Fatalf("mkdir child failed: %v", err)
+	}
+
+	cancelCtx, cancelFunc := context.WithCancel(context.Background())
+	defer cancelFunc()
+
+	impl := &streamImpl{
+		streamID:            streamID,
+		store:               store,
+		localSeq:            5,
+		retainedRecords:     []*wal.ClientRecord{{StreamSeq: 2, Payload: []byte("local-rec-2")}},
+		initialHelloAckDone: make(chan struct{}),
+		cancelCtx:           cancelCtx,
+		cancelFunc:          cancelFunc,
+		replicationLevel:    Witness,
+	}
+	impl.cond = sync.NewCond(&impl.mu)
+
+	helloAck := &pb.HelloAck{
+		WitnessAckedStreamSeq: 2,
+	}
+
+	// Buffer tail returns different payload for seq 2 (divergence path)
+	mockClient := &mockBufferClientWithTail{
+		records: []*pb.LogRecord{
+			{StreamSeq: 2, Payload: []byte("authoritative-buffer-payload-2")},
+		},
+	}
+	impl.grpcClient = mockClient
+
+	err = impl.handleHelloAck(helloAck)
+	if err == nil {
+		t.Fatalf("expected handleHelloAck to fail, got nil")
+	}
+
+	// Verify terminal error is set
+	impl.mu.RLock()
+	termErr := impl.terminalErr
+	impl.mu.RUnlock()
+	if termErr == nil {
+		t.Fatalf("expected terminalErr to be set, got nil")
+	}
+
+	// Append must return terminalErr immediately
+	_, appendErr := impl.Append(ctx, []byte("should-fail"))
+	if !errors.Is(appendErr, termErr) && !strings.Contains(appendErr.Error(), termErr.Error()) {
+		t.Fatalf("expected Append to return terminal error, got: %v", appendErr)
+	}
+
+	// Wait must return terminalErr immediately without blocking
+	waitErr := impl.Wait(ctx, 3, Witness, false)
+	if !errors.Is(waitErr, termErr) && !strings.Contains(waitErr.Error(), termErr.Error()) {
+		t.Fatalf("expected Wait to return terminal error, got: %v", waitErr)
 	}
 }

@@ -405,6 +405,28 @@ func (s *StreamStore) periodicWorker() {
 	}
 }
 
+// StreamWatermarks describes the witness and S3 watermark sequence numbers for a stream.
+type StreamWatermarks struct {
+	WitnessSeq uint64
+	S3Seq      uint64
+}
+
+// StreamWatermarks returns a snapshot of watermarks for all tracked streams.
+func (s *StreamStore) StreamWatermarks() map[string]StreamWatermarks {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[string]StreamWatermarks, len(s.streams))
+	for sid, w := range s.streams {
+		w.mu.Lock()
+		res[sid] = StreamWatermarks{
+			WitnessSeq: w.lastSeq,
+			S3Seq:      w.uploadedTo,
+		}
+		w.mu.Unlock()
+	}
+	return res
+}
+
 func (s *StreamStore) allWriters() []*streamWriter {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
