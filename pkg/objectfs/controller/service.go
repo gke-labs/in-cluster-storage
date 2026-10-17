@@ -148,6 +148,41 @@ type Server struct {
 
 	checkpointMu      sync.Mutex
 	checkpointWaiters map[string]chan uint64
+
+	exclusiveHoldsMu  sync.RWMutex
+	exclusiveHolds    map[string]*ExclusiveHold
+	exclusiveLeaseTTL time.Duration
+}
+
+// ExclusiveHold tracks an active exclusive-local hold on a volume.
+// An in-memory lease table is enough: the stream is the source of truth for data,
+// and a controller restart simply forgets holds, which the next renew re-establishes.
+type ExclusiveHold struct {
+	VolumeID    string
+	NodeID      string
+	MountID     string
+	AcquiredAt  time.Time
+	LeaseExpiry time.Time
+}
+
+func (h *ExclusiveHold) toProto() *pb.ExclusiveHold {
+	if h == nil {
+		return nil
+	}
+	return &pb.ExclusiveHold{
+		VolumeId:    h.VolumeID,
+		NodeId:      h.NodeID,
+		MountId:     h.MountID,
+		AcquiredAt:  timestamppb.New(h.AcquiredAt),
+		LeaseExpiry: timestamppb.New(h.LeaseExpiry),
+	}
+}
+
+// WithExclusiveLeaseTTL configures the lease duration for exclusive-local holds.
+func WithExclusiveLeaseTTL(ttl time.Duration) ServerOption {
+	return func(s *Server) {
+		s.exclusiveLeaseTTL = ttl
+	}
 }
 
 // ServerOption configures the controller Server.
@@ -282,6 +317,8 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		blobStore:         blob.NewStore(backend, 0),
 		broadcaster:       NewEventBroadcaster(),
 		checkpointWaiters: make(map[string]chan uint64),
+		exclusiveHolds:    make(map[string]*ExclusiveHold),
+		exclusiveLeaseTTL: 30 * time.Second,
 		syncTimeout:       10 * time.Minute,
 		defaultDurability: walclient.Local,
 	}
@@ -1190,4 +1227,170 @@ func (s *Server) AckCheckpoint(ctx context.Context, req *pb.AckCheckpointRequest
 		}
 	}
 	return &pb.AckCheckpointResponse{}, nil
+}
+
+// AcquireExclusive records an exclusive-local hold on the volume for a specific node and mount.
+// If another holder exists and its lease is live, it returns codes.Aborted with the holder's node id,
+// allowing the node daemon to surface this as a retryable CSI error so kubelet retries with backoff.
+func (s *Server) AcquireExclusive(ctx context.Context, req *pb.AcquireExclusiveRequest) (*pb.AcquireExclusiveResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	if !isValidVolumeID(req.GetVolumeId()) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", req.GetVolumeId())
+	}
+	if req.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id is required")
+	}
+	if req.GetMountId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "mount_id is required")
+	}
+
+	volumeID := req.GetVolumeId()
+	s.exclusiveHoldsMu.Lock()
+	defer s.exclusiveHoldsMu.Unlock()
+
+	now := time.Now()
+	ttl := s.exclusiveLeaseTTL
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+
+	if hold, exists := s.exclusiveHolds[volumeID]; exists && now.Before(hold.LeaseExpiry) {
+		// If held by the same node and mount, this is an idempotent re-acquire / lease extension.
+		if hold.NodeID == req.GetNodeId() && hold.MountID == req.GetMountId() {
+			hold.LeaseExpiry = now.Add(ttl)
+			return &pb.AcquireExclusiveResponse{
+				Hold: hold.toProto(),
+			}, nil
+		}
+		return nil, status.Errorf(codes.Aborted, "volume %s is held by node %s (mount %s) until %s",
+			volumeID, hold.NodeID, hold.MountID, hold.LeaseExpiry.Format(time.RFC3339))
+	}
+
+	newHold := &ExclusiveHold{
+		VolumeID:    volumeID,
+		NodeID:      req.GetNodeId(),
+		MountID:     req.GetMountId(),
+		AcquiredAt:  now,
+		LeaseExpiry: now.Add(ttl),
+	}
+	s.exclusiveHolds[volumeID] = newHold
+
+	return &pb.AcquireExclusiveResponse{
+		Hold: newHold.toProto(),
+	}, nil
+}
+
+// RenewExclusive renews the lease on an exclusive-local hold for the holding node and mount.
+// If the controller restarted and holds were lost, the periodic renew re-establishes the hold.
+func (s *Server) RenewExclusive(ctx context.Context, req *pb.RenewExclusiveRequest) (*pb.RenewExclusiveResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	if !isValidVolumeID(req.GetVolumeId()) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q", req.GetVolumeId())
+	}
+	if req.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id is required")
+	}
+	if req.GetMountId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "mount_id is required")
+	}
+
+	volumeID := req.GetVolumeId()
+	s.exclusiveHoldsMu.Lock()
+	defer s.exclusiveHoldsMu.Unlock()
+
+	now := time.Now()
+	ttl := s.exclusiveLeaseTTL
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+
+	hold, exists := s.exclusiveHolds[volumeID]
+	if !exists {
+		// Controller restart: in-memory lease table was lost, renew re-establishes it.
+		newHold := &ExclusiveHold{
+			VolumeID:    volumeID,
+			NodeID:      req.GetNodeId(),
+			MountID:     req.GetMountId(),
+			AcquiredAt:  now,
+			LeaseExpiry: now.Add(ttl),
+		}
+		s.exclusiveHolds[volumeID] = newHold
+		return &pb.RenewExclusiveResponse{
+			Hold: newHold.toProto(),
+		}, nil
+	}
+
+	if hold.NodeID == req.GetNodeId() && hold.MountID == req.GetMountId() {
+		hold.LeaseExpiry = now.Add(ttl)
+		return &pb.RenewExclusiveResponse{
+			Hold: hold.toProto(),
+		}, nil
+	}
+
+	// Held by a different node or mount
+	if now.Before(hold.LeaseExpiry) {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot renew hold for volume %s: held by node %s (mount %s) until %s",
+			volumeID, hold.NodeID, hold.MountID, hold.LeaseExpiry.Format(time.RFC3339))
+	}
+
+	// Previous hold has expired, caller re-establishes
+	newHold := &ExclusiveHold{
+		VolumeID:    volumeID,
+		NodeID:      req.GetNodeId(),
+		MountID:     req.GetMountId(),
+		AcquiredAt:  now,
+		LeaseExpiry: now.Add(ttl),
+	}
+	s.exclusiveHolds[volumeID] = newHold
+	return &pb.RenewExclusiveResponse{
+		Hold: newHold.toProto(),
+	}, nil
+}
+
+// ReleaseExclusive releases an active exclusive-local hold after the final unmount checkpoint has committed.
+func (s *Server) ReleaseExclusive(ctx context.Context, req *pb.ReleaseExclusiveRequest) (*pb.ReleaseExclusiveResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	if req.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id is required")
+	}
+
+	volumeID := req.GetVolumeId()
+	s.exclusiveHoldsMu.Lock()
+	defer s.exclusiveHoldsMu.Unlock()
+
+	if hold, exists := s.exclusiveHolds[volumeID]; exists {
+		if hold.NodeID == req.GetNodeId() && (req.GetMountId() == "" || hold.MountID == req.GetMountId()) {
+			delete(s.exclusiveHolds, volumeID)
+		} else if time.Now().After(hold.LeaseExpiry) {
+			delete(s.exclusiveHolds, volumeID)
+		}
+	}
+
+	return &pb.ReleaseExclusiveResponse{}, nil
+}
+
+// GetExclusiveHold returns the current exclusive-local hold for a volume, or empty if no active hold exists.
+func (s *Server) GetExclusiveHold(ctx context.Context, req *pb.GetExclusiveHoldRequest) (*pb.GetExclusiveHoldResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+
+	volumeID := req.GetVolumeId()
+	s.exclusiveHoldsMu.RLock()
+	defer s.exclusiveHoldsMu.RUnlock()
+
+	hold, exists := s.exclusiveHolds[volumeID]
+	if !exists || time.Now().After(hold.LeaseExpiry) {
+		return &pb.GetExclusiveHoldResponse{}, nil
+	}
+
+	return &pb.GetExclusiveHoldResponse{
+		Hold: hold.toProto(),
+	}, nil
 }

@@ -50,6 +50,8 @@ import (
 	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -5700,5 +5702,256 @@ func TestControllerCheckpointRPC(t *testing.T) {
 		t.Fatalf("Checkpoint request failed: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Timed out waiting for Checkpoint caller to unblock")
+	}
+}
+
+func TestExclusiveHold_AcquireRenewRelease(t *testing.T) {
+	ctx := context.Background()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithExclusiveLeaseTTL(10*time.Second))
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-hold-vol"
+
+	// 1. Initial GetExclusiveHold should return nil
+	getResp, err := server.GetExclusiveHold(ctx, &pb.GetExclusiveHoldRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("GetExclusiveHold failed: %v", err)
+	}
+	if getResp.GetHold() != nil {
+		t.Fatalf("Expected nil hold initially, got: %v", getResp.GetHold())
+	}
+
+	// 2. Node 1 acquires exclusive hold
+	acqResp, err := server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/mnt/target1",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive failed: %v", err)
+	}
+	if acqResp.GetHold().GetNodeId() != "node-1" || acqResp.GetHold().GetMountId() != "/mnt/target1" {
+		t.Fatalf("Unexpected hold in response: %v", acqResp.GetHold())
+	}
+	initialExpiry := acqResp.GetHold().GetLeaseExpiry().AsTime()
+
+	// 3. Re-acquire by same node/mount (idempotent)
+	reacqResp, err := server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/mnt/target1",
+	})
+	if err != nil {
+		t.Fatalf("Idempotent AcquireExclusive failed: %v", err)
+	}
+	if !reacqResp.GetHold().GetLeaseExpiry().AsTime().After(initialExpiry) && !reacqResp.GetHold().GetLeaseExpiry().AsTime().Equal(initialExpiry) {
+		t.Fatalf("Expected lease to be extended or equal, was %v vs %v", reacqResp.GetHold().GetLeaseExpiry().AsTime(), initialExpiry)
+	}
+
+	// 4. Renew hold by node-1
+	renewResp, err := server.RenewExclusive(ctx, &pb.RenewExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/mnt/target1",
+	})
+	if err != nil {
+		t.Fatalf("RenewExclusive failed: %v", err)
+	}
+	if renewResp.GetHold().GetNodeId() != "node-1" {
+		t.Fatalf("Unexpected renew hold: %v", renewResp.GetHold())
+	}
+
+	// 5. GetExclusiveHold verifies hold is active
+	getResp, err = server.GetExclusiveHold(ctx, &pb.GetExclusiveHoldRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("GetExclusiveHold failed: %v", err)
+	}
+	if getResp.GetHold() == nil || getResp.GetHold().GetNodeId() != "node-1" {
+		t.Fatalf("Expected active hold for node-1, got: %v", getResp.GetHold())
+	}
+
+	// 6. Release hold
+	_, err = server.ReleaseExclusive(ctx, &pb.ReleaseExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/mnt/target1",
+	})
+	if err != nil {
+		t.Fatalf("ReleaseExclusive failed: %v", err)
+	}
+
+	// 7. GetExclusiveHold verifies hold is gone
+	getResp, err = server.GetExclusiveHold(ctx, &pb.GetExclusiveHoldRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("GetExclusiveHold failed: %v", err)
+	}
+	if getResp.GetHold() != nil {
+		t.Fatalf("Expected nil hold after release, got: %v", getResp.GetHold())
+	}
+}
+
+func TestExclusiveHold_ConflictRejection(t *testing.T) {
+	ctx := context.Background()
+	backend := NewMemoryBackend()
+	server := NewServer(backend, WithExclusiveLeaseTTL(10*time.Second))
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-conflict-vol"
+
+	// Node 1 acquires hold
+	_, err := server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/mnt/target1",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive node-1 failed: %v", err)
+	}
+
+	// Node 2 attempts to acquire -> should be rejected with codes.Aborted
+	_, err = server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-2",
+		MountId:  "/mnt/target2",
+	})
+	if err == nil {
+		t.Fatalf("Expected AcquireExclusive by node-2 to fail while node-1 holds lease")
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.Aborted {
+		t.Fatalf("Expected codes.Aborted, got: %v (st=%v)", err, st)
+	}
+	if !strings.Contains(st.Message(), "node-1") || !strings.Contains(st.Message(), "/mnt/target1") {
+		t.Fatalf("Expected error message to mention holder node-1 and mount /mnt/target1, got: %s", st.Message())
+	}
+
+	// Node 2 attempts to renew -> should be rejected with codes.FailedPrecondition
+	_, err = server.RenewExclusive(ctx, &pb.RenewExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-2",
+		MountId:  "/mnt/target2",
+	})
+	if err == nil {
+		t.Fatalf("Expected RenewExclusive by node-2 to fail")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("Expected codes.FailedPrecondition, got: %v (st=%v)", err, st)
+	}
+
+	// Node 1 releases hold
+	_, err = server.ReleaseExclusive(ctx, &pb.ReleaseExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/mnt/target1",
+	})
+	if err != nil {
+		t.Fatalf("ReleaseExclusive failed: %v", err)
+	}
+
+	// Node 2 can now acquire hold
+	acqResp2, err := server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-2",
+		MountId:  "/mnt/target2",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive by node-2 failed after node-1 released: %v", err)
+	}
+	if acqResp2.GetHold().GetNodeId() != "node-2" {
+		t.Fatalf("Expected hold to belong to node-2, got: %v", acqResp2.GetHold())
+	}
+}
+
+func TestExclusiveHold_LeaseExpiry(t *testing.T) {
+	ctx := context.Background()
+	backend := NewMemoryBackend()
+	// Configure short lease TTL (50ms) to test expiry
+	server := NewServer(backend, WithExclusiveLeaseTTL(50*time.Millisecond))
+	defer func() { _ = server.Close() }()
+
+	volumeID := "test-expiry-vol"
+
+	// Node 1 acquires hold
+	_, err := server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/mnt/target1",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive failed: %v", err)
+	}
+
+	// Node 2 rejected immediately
+	_, err = server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-2",
+		MountId:  "/mnt/target2",
+	})
+	if err == nil {
+		t.Fatalf("Expected immediate acquire by node-2 to fail")
+	}
+
+	// Wait for lease to expire
+	time.Sleep(80 * time.Millisecond)
+
+	// Node 2 can now acquire hold because Node 1's lease expired
+	acqResp2, err := server.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-2",
+		MountId:  "/mnt/target2",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive by node-2 failed after lease expiry: %v", err)
+	}
+	if acqResp2.GetHold().GetNodeId() != "node-2" {
+		t.Fatalf("Expected node-2 to be holder, got: %v", acqResp2.GetHold())
+	}
+}
+
+func TestExclusiveHold_ControllerRestart_RenewReestablishes(t *testing.T) {
+	ctx := context.Background()
+	backend := NewMemoryBackend()
+	// Server 1
+	server1 := NewServer(backend, WithExclusiveLeaseTTL(10*time.Second))
+	defer func() { _ = server1.Close() }()
+
+	volumeID := "test-restart-vol"
+
+	_, err := server1.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/mnt/target1",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive server1 failed: %v", err)
+	}
+
+	// Simulate controller restart: new server instance with same backend, but empty memory lease table
+	server2 := NewServer(backend, WithExclusiveLeaseTTL(10*time.Second))
+	defer func() { _ = server2.Close() }()
+
+	// Periodic renew from node-1 arrives at restarted controller: must re-establish hold
+	renewResp, err := server2.RenewExclusive(ctx, &pb.RenewExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-1",
+		MountId:  "/mnt/target1",
+	})
+	if err != nil {
+		t.Fatalf("RenewExclusive on restarted server failed: %v", err)
+	}
+	if renewResp.GetHold().GetNodeId() != "node-1" {
+		t.Fatalf("Expected re-established hold for node-1, got: %v", renewResp.GetHold())
+	}
+
+	// Node 2 must now be rejected by restarted controller because Node 1 re-established hold
+	_, err = server2.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-2",
+		MountId:  "/mnt/target2",
+	})
+	if err == nil {
+		t.Fatalf("Expected node-2 acquire to be rejected after renew re-established hold")
 	}
 }

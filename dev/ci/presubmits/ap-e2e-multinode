@@ -28,6 +28,6 @@ if [[ "${GOTOOLCHAIN:-}" == "local" || -z "${GOTOOLCHAIN:-}" ]]; then
   export GOTOOLCHAIN=auto
 fi
 
-RUN_E2E=1 go test -v -count=1 -timeout 15m -run '^(TestObjectFSMultiNodeFailoverE2E|TestObjectFSCrossNodeVisibilityE2E|TestObjectFSExclusiveLocalE2E|TestObjectFSExclusiveLocalKillE2E|TestObjectFSExclusiveLocalIntervalE2E)$' -json ./tests/e2e/ | \
+RUN_E2E=1 go test -v -count=1 -timeout 15m -run '^(TestObjectFSMultiNodeFailoverE2E|TestObjectFSCrossNodeVisibilityE2E|TestObjectFSExclusiveLocalE2E|TestObjectFSExclusiveLocalKillE2E|TestObjectFSExclusiveLocalIntervalE2E|TestObjectFSExclusiveLocalDaemonKillE2E)$' -json ./tests/e2e/ | \
   tee "${ARTIFACTS}/test-results/go/e2e-multinode.json" | \
   go run gotest.tools/gotestsum@latest --format testname --raw-command cat
