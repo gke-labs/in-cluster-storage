@@ -28,14 +28,30 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/klog/v2"
 )
+
+type snapshotReaderOptions struct {
+	acceptUnversioned bool
+}
+
+// SnapshotReaderOption configures a SnapshotReader.
+type SnapshotReaderOption func(*snapshotReaderOptions)
+
+// WithReaderAcceptUnversioned configures whether unversioned snapshot SSTables are accepted.
+func WithReaderAcceptUnversioned(accept bool) SnapshotReaderOption {
+	return func(o *snapshotReaderOptions) {
+		o.acceptUnversioned = accept
+	}
+}
 
 // SnapshotReader provides standalone reading of an SSTable snapshot file without requiring a running Pebble LSM engine.
 type SnapshotReader struct {
-	reader   *sstable.Reader
-	streamID string
-	position uint64
-	registry *record.Registry
+	reader            *sstable.Reader
+	streamID          string
+	position          uint64
+	registry          *record.Registry
+	acceptUnversioned bool
 }
 
 func defaultReaderOptions() sstable.ReaderOptions {
@@ -48,7 +64,12 @@ func defaultReaderOptions() sstable.ReaderOptions {
 }
 
 // OpenSnapshotFile opens an SSTable snapshot from a file path using a standalone table reader.
-func OpenSnapshotFile(path string) (*SnapshotReader, error) {
+func OpenSnapshotFile(path string, opts ...SnapshotReaderOption) (*SnapshotReader, error) {
+	var o snapshotReaderOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	rf, err := vfs.Default.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open snapshot file %q: %w", path, err)
@@ -66,22 +87,28 @@ func OpenSnapshotFile(path string) (*SnapshotReader, error) {
 		return nil, fmt.Errorf("failed to create sstable reader for %q: %w", path, err)
 	}
 
-	return newSnapshotReader(r)
+	return newSnapshotReader(r, o.acceptUnversioned)
 }
 
 // OpenSnapshotBytes opens an SSTable snapshot directly from an in-memory byte buffer.
-func OpenSnapshotBytes(buf []byte) (*SnapshotReader, error) {
+func OpenSnapshotBytes(buf []byte, opts ...SnapshotReaderOption) (*SnapshotReader, error) {
+	var o snapshotReaderOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	r, err := sstable.NewMemReader(buf, defaultReaderOptions())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open in-memory sstable reader: %w", err)
 	}
-	return newSnapshotReader(r)
+	return newSnapshotReader(r, o.acceptUnversioned)
 }
 
-func newSnapshotReader(r *sstable.Reader) (*SnapshotReader, error) {
+func newSnapshotReader(r *sstable.Reader, acceptUnversioned bool) (*SnapshotReader, error) {
 	sr := &SnapshotReader{
-		reader:   r,
-		registry: record.NewRegistry(),
+		reader:            r,
+		registry:          record.NewRegistry(),
+		acceptUnversioned: acceptUnversioned,
 	}
 
 	iter, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
@@ -92,6 +119,30 @@ func newSnapshotReader(r *sstable.Reader) (*SnapshotReader, error) {
 	defer func() {
 		errutil.CloseAndLog(iter, "metadata iterator")
 	}()
+
+	// Read KeyFormatVersion
+	if kv := iter.SeekGE(KeyFormatVersion, 0); kv != nil && bytes.Equal(kv.K.UserKey, KeyFormatVersion) {
+		val, _, err := kv.Value(nil)
+		if err != nil {
+			errutil.CloseAndLog(r, "sstable reader")
+			return nil, fmt.Errorf("failed to read format_version value from snapshot: %w", err)
+		}
+		ver, err := DecodeFormatVersion(val)
+		if err != nil {
+			errutil.CloseAndLog(r, "sstable reader")
+			return nil, fmt.Errorf("failed to decode format_version from snapshot: %w", err)
+		}
+		if ver > SnapshotFormatVersion {
+			errutil.CloseAndLog(r, "sstable reader")
+			return nil, fmt.Errorf("%w: version %d > current %d", ErrUnsupportedSnapshotVersion, ver, SnapshotFormatVersion)
+		}
+	} else {
+		if !acceptUnversioned {
+			errutil.CloseAndLog(r, "sstable reader")
+			return nil, ErrUnversionedSnapshot
+		}
+		klog.Warning("accepting unversioned table snapshot (--accept-unversioned-segments)")
+	}
 
 	// Read KeyPosition
 	if kv := iter.SeekGE(KeyPosition, 0); kv != nil && bytes.Equal(kv.K.UserKey, KeyPosition) {

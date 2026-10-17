@@ -162,17 +162,41 @@ func TableName(fullName string) string {
 	return strings.ReplaceAll(trimmed, ".", "_")
 }
 
+const (
+	// SnapshotFormatVersion is the current format version of SQLite snapshots.
+	SnapshotFormatVersion = 1
+
+	// DefaultCreatedBy is the default creator version string.
+	DefaultCreatedBy = "in-cluster-storage/1.0"
+)
+
+var (
+	// ErrUnsupportedSnapshotVersion is returned when a snapshot has a format version greater than current.
+	ErrUnsupportedSnapshotVersion = errors.New("unsupported snapshot format version")
+
+	// ErrUnversionedSnapshot is returned when a SQLite snapshot lacks the _meta table and unversioned restore is not enabled.
+	ErrUnversionedSnapshot = errors.New("unversioned SQLite snapshot: missing _meta table (use --accept-unversioned-segments to restore)")
+)
+
 // Option configures a SQLite projection DB.
 type Option func(*options)
 
 type options struct {
-	streamID       string
-	lockingMode    string
-	journalMode    string
-	synchronous    string
-	busyTimeout    int
-	autoCheckpoint *int
-	decoderOpts    []record.DecoderOption
+	streamID          string
+	lockingMode       string
+	journalMode       string
+	synchronous       string
+	busyTimeout       int
+	autoCheckpoint    *int
+	decoderOpts       []record.DecoderOption
+	acceptUnversioned bool
+}
+
+// WithAcceptUnversioned configures whether unversioned snapshots are accepted on restore.
+func WithAcceptUnversioned(accept bool) Option {
+	return func(o *options) {
+		o.acceptUnversioned = accept
+	}
 }
 
 // WithAutoCheckpoint sets the SQLite PRAGMA wal_autocheckpoint.
@@ -267,15 +291,16 @@ func (ts *tableStmts) Close() error {
 
 // DB represents a SQLite projection database for a structured data stream.
 type DB struct {
-	mu           sync.RWMutex
-	sqlDB        *sql.DB
-	path         string
-	streamID     string
-	position     uint64
-	changeReader *sds.ChangeReader
-	knownTables  map[string]bool   // tableName -> table created
-	knownTypes   map[uint32]string // typeID -> fingerprint string
-	stmts        map[string]*tableStmts
+	mu                sync.RWMutex
+	sqlDB             *sql.DB
+	path              string
+	streamID          string
+	position          uint64
+	changeReader      *sds.ChangeReader
+	knownTables       map[string]bool   // tableName -> table created
+	knownTypes        map[uint32]string // typeID -> fingerprint string
+	stmts             map[string]*tableStmts
+	acceptUnversioned bool
 }
 
 // Open opens an existing SQLite projection database or creates a new one if it does not exist.
@@ -320,14 +345,16 @@ func Open(ctx context.Context, path string, opts ...Option) (*DB, error) {
 	sqlDB.SetMaxOpenConns(1)
 
 	db := &DB{
-		sqlDB:        sqlDB,
-		path:         path,
-		streamID:     opt.streamID,
-		changeReader: sds.NewChangeReader(opt.decoderOpts...),
-		knownTables:  make(map[string]bool),
-		knownTypes:   make(map[uint32]string),
-		stmts:        make(map[string]*tableStmts),
+		sqlDB:             sqlDB,
+		path:              path,
+		streamID:          opt.streamID,
+		changeReader:      sds.NewChangeReader(opt.decoderOpts...),
+		knownTables:       make(map[string]bool),
+		knownTypes:        make(map[uint32]string),
+		stmts:             make(map[string]*tableStmts),
+		acceptUnversioned: opt.acceptUnversioned,
 	}
+	db.changeReader.SetAcceptUnversioned(opt.acceptUnversioned)
 
 	if err := db.initBookkeeping(ctx); err != nil {
 		errutil.CloseAndLog(sqlDB, "sqlite connection")
@@ -485,6 +512,17 @@ func (d *DB) ensureTableStmtsLocked(ctx context.Context, tableName string) (*tab
 }
 
 func (d *DB) initBookkeeping(ctx context.Context) error {
+	createMetaTable := `
+CREATE TABLE IF NOT EXISTS _meta (
+    format_version INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    stream_id TEXT PRIMARY KEY,
+    position INTEGER NOT NULL
+);`
+	if _, err := d.sqlDB.ExecContext(ctx, createMetaTable); err != nil {
+		return fmt.Errorf("failed to create _meta table: %w", err)
+	}
+
 	createTypesTable := `
 CREATE TABLE IF NOT EXISTS _stream_types (
     id INTEGER PRIMARY KEY,
@@ -578,6 +616,30 @@ func (d *DB) loadPosition(ctx context.Context) (string, uint64, bool, error) {
 }
 
 func (d *DB) loadState(ctx context.Context) error {
+	// 1. Check _meta table
+	var hasMeta bool
+	var formatVer uint32
+	var createdBy string
+	var metaStreamID string
+	var metaPos uint64
+
+	metaRows, err := d.sqlDB.QueryContext(ctx, "SELECT format_version, created_by, stream_id, position FROM _meta LIMIT 1")
+	if err != nil {
+		return fmt.Errorf("failed to query _meta: %w", err)
+	}
+	if metaRows.Next() {
+		hasMeta = true
+		if err := metaRows.Scan(&formatVer, &createdBy, &metaStreamID, &metaPos); err != nil {
+			errutil.CloseAndLog(metaRows, "meta rows")
+			return fmt.Errorf("failed to scan _meta row: %w", err)
+		}
+	}
+	err = metaRows.Err()
+	errutil.CloseAndLog(metaRows, "meta rows")
+	if err != nil {
+		return fmt.Errorf("error reading _meta: %w", err)
+	}
+
 	defs, err := d.loadTypes(ctx)
 	if err != nil {
 		return err
@@ -593,16 +655,50 @@ func (d *DB) loadState(ctx context.Context) error {
 		}
 	}
 
-	sID, pos, found, err := d.loadPosition(ctx)
+	sID, pos, foundPos, err := d.loadPosition(ctx)
 	if err != nil {
 		return err
 	}
-	if found {
-		if d.streamID == "" {
+
+	if hasMeta {
+		if formatVer > SnapshotFormatVersion {
+			return fmt.Errorf("%w: version %d > current %d", ErrUnsupportedSnapshotVersion, formatVer, SnapshotFormatVersion)
+		}
+		if d.streamID == "" && metaStreamID != "" {
+			d.streamID = metaStreamID
+		}
+		d.position = metaPos
+		if d.position == 0 && foundPos && pos > 0 {
+			d.position = pos
+		}
+		if d.streamID == "" && foundPos && sID != "" {
 			d.streamID = sID
 		}
-		d.position = pos
+	} else {
+		// No _meta row found.
+		if foundPos || len(defs) > 0 {
+			// Existing database / restored snapshot without _meta
+			if !d.acceptUnversioned {
+				return ErrUnversionedSnapshot
+			}
+			klog.Warning("accepting unversioned SQLite snapshot (--accept-unversioned-segments)")
+			if d.streamID == "" && sID != "" {
+				d.streamID = sID
+			}
+			d.position = pos
+			insertMeta := `INSERT OR REPLACE INTO _meta (format_version, created_by, stream_id, position) VALUES (?, ?, ?, ?);`
+			if _, err := d.sqlDB.ExecContext(ctx, insertMeta, SnapshotFormatVersion, DefaultCreatedBy, d.streamID, d.position); err != nil {
+				return fmt.Errorf("failed to initialize _meta for unversioned snapshot: %w", err)
+			}
+		} else {
+			// Brand new empty database
+			insertMeta := `INSERT OR REPLACE INTO _meta (format_version, created_by, stream_id, position) VALUES (?, ?, ?, ?);`
+			if _, err := d.sqlDB.ExecContext(ctx, insertMeta, SnapshotFormatVersion, DefaultCreatedBy, d.streamID, 0); err != nil {
+				return fmt.Errorf("failed to initialize _meta: %w", err)
+			}
+		}
 	}
+
 	return nil
 }
 
@@ -839,6 +935,10 @@ func (d *DB) updatePositionInTx(ctx context.Context, tx *sql.Tx, seq uint64) err
 	sqlStr := `INSERT OR REPLACE INTO _stream_position (stream_id, position, snapshot_time) VALUES (?, ?, ?);`
 	if _, err := tx.ExecContext(cctx, sqlStr, d.streamID, seq, nowMicros); err != nil {
 		return fmt.Errorf("failed to update _stream_position to %d: %w", seq, err)
+	}
+	metaSQL := `INSERT OR REPLACE INTO _meta (format_version, created_by, stream_id, position) VALUES (?, ?, ?, ?);`
+	if _, err := tx.ExecContext(cctx, metaSQL, SnapshotFormatVersion, DefaultCreatedBy, d.streamID, seq); err != nil {
+		return fmt.Errorf("failed to update _meta to %d: %w", seq, err)
 	}
 	return nil
 }

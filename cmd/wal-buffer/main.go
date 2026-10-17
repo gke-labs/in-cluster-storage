@@ -34,14 +34,15 @@ import (
 )
 
 var (
-	port           = flag.Int("port", 50051, "gRPC server port")
-	dataDir        = flag.String("data-dir", "/data", "Local directory for caching WAL segments")
-	backendType    = flag.String("backend", "", "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
-	flushInterval  = flag.Duration("flush-interval", 60*time.Second, "Periodic flush interval to backend object storage")
-	flushBytes     = flag.Int64("flush-bytes", 64*1024*1024, "Unflushed bytes threshold to trigger S3 flush")
-	tailCacheBytes = flag.Int64("tail-cache-bytes", 64*1024*1024, "Retained bytes in local cache for tailing")
-	batchMaxDelay  = flag.Duration("batch-max-delay", 5*time.Millisecond, "Maximum delay for group commit batching")
-	batchMaxSize   = flag.Int64("batch-max-size", 1024*1024, "Maximum byte size for group commit batching")
+	port                      = flag.Int("port", 50051, "gRPC server port")
+	dataDir                   = flag.String("data-dir", "/data", "Local directory for caching WAL segments")
+	backendType               = flag.String("backend", "", "Object storage backend URL (e.g. gs://bucket/prefix, s3://bucket/prefix, memory://)")
+	flushInterval             = flag.Duration("flush-interval", 60*time.Second, "Periodic flush interval to backend object storage")
+	flushBytes                = flag.Int64("flush-bytes", 64*1024*1024, "Unflushed bytes threshold to trigger S3 flush")
+	tailCacheBytes            = flag.Int64("tail-cache-bytes", 64*1024*1024, "Retained bytes in local cache for tailing")
+	batchMaxDelay             = flag.Duration("batch-max-delay", 5*time.Millisecond, "Maximum delay for group commit batching")
+	batchMaxSize              = flag.Int64("batch-max-size", 1024*1024, "Maximum byte size for group commit batching")
+	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments and streams for one-time upgrade")
 )
 
 func main() {
@@ -64,13 +65,14 @@ func main() {
 	}
 
 	cfg := buffer.ServerConfig{
-		Backend:        backend,
-		DataDir:        *dataDir,
-		FlushInterval:  *flushInterval,
-		FlushBytes:     *flushBytes,
-		TailCacheBytes: *tailCacheBytes,
-		BatchMaxDelay:  *batchMaxDelay,
-		BatchMaxSize:   *batchMaxSize,
+		Backend:           backend,
+		DataDir:           *dataDir,
+		FlushInterval:     *flushInterval,
+		FlushBytes:        *flushBytes,
+		TailCacheBytes:    *tailCacheBytes,
+		BatchMaxDelay:     *batchMaxDelay,
+		BatchMaxSize:      *batchMaxSize,
+		AcceptUnversioned: *acceptUnversionedSegments,
 	}
 
 	srv, err := buffer.NewServer(ctx, cfg)

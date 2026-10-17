@@ -104,6 +104,7 @@ func TestReadSegmentFromBackend(t *testing.T) {
 	}
 
 	var segBuf bytes.Buffer
+	segBuf.Write(wal.DefaultSegmentHeader().Encode())
 	for _, r := range recs {
 		segBuf.Write(r.Encode())
 	}

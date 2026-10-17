@@ -444,6 +444,9 @@ func TestCrashRecoveryAndSplitResumption(t *testing.T) {
 
 	// Decode all records from the sealed object: must contain all 10 records without corruption
 	r := bytes.NewReader(sealedBuf.Bytes())
+	if _, _, err := wal.ReadSegmentHeader(r, false); err != nil {
+		t.Fatalf("ReadSegmentHeader failed: %v", err)
+	}
 	var decodedSeqs []uint64
 	for {
 		rec, err := wal.DecodeLogRecord(r)
@@ -664,6 +667,9 @@ func TestSealUploadFailurePreservesFileSequenceAndRetries(t *testing.T) {
 
 	// Decode both objects and verify record counts
 	r1 := bytes.NewReader(buf1.Bytes())
+	if _, _, err := wal.ReadSegmentHeader(r1, false); err != nil {
+		t.Fatalf("ReadSegmentHeader failed on file 1..5: %v", err)
+	}
 	var recs1 []*wal.LogRecord
 	for {
 		rec, err := wal.DecodeLogRecord(r1)
@@ -677,6 +683,9 @@ func TestSealUploadFailurePreservesFileSequenceAndRetries(t *testing.T) {
 	}
 
 	r2 := bytes.NewReader(buf2.Bytes())
+	if _, _, err := wal.ReadSegmentHeader(r2, false); err != nil {
+		t.Fatalf("ReadSegmentHeader failed on file 6..7: %v", err)
+	}
 	var recs2 []*wal.LogRecord
 	for {
 		rec, err := wal.DecodeLogRecord(r2)

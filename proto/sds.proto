@@ -57,6 +57,12 @@ message SnapshotPointer {
   string restored_from = 7;
 }
 
+message StreamHeader {
+  uint32 format_version = 1;
+  string creator_version = 2;
+  google.protobuf.Timestamp created_at = 3;
+}
+
 message Registry {
   repeated TypeDefinition types = 1;
 }

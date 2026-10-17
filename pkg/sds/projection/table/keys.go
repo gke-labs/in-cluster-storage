@@ -37,7 +37,44 @@ var (
 
 	// KeyStreamID stores the UTF-8 bytes of the stream ID.
 	KeyStreamID = []byte{0x00, 's', 't', 'r', 'e', 'a', 'm', '_', 'i', 'd'}
+
+	// KeyFormatVersion stores the 4-byte big-endian format version of the table snapshot.
+	KeyFormatVersion = []byte{0x00, 'f', 'o', 'r', 'm', 'a', 't', '_', 'v', 'e', 'r', 's', 'i', 'o', 'n'}
+
+	// KeyCreatedBy stores the UTF-8 bytes of the creator version string.
+	KeyCreatedBy = []byte{0x00, 'c', 'r', 'e', 'a', 't', 'e', 'd', '_', 'b', 'y'}
 )
+
+const (
+	// SnapshotFormatVersion is the current format version of table snapshots.
+	SnapshotFormatVersion uint32 = 1
+
+	// DefaultCreatedBy is the default creator version string.
+	DefaultCreatedBy = "in-cluster-storage/1.0"
+)
+
+var (
+	// ErrUnsupportedSnapshotVersion is returned when a table snapshot has a format version greater than current.
+	ErrUnsupportedSnapshotVersion = errors.New("unsupported table snapshot format version")
+
+	// ErrUnversionedSnapshot is returned when a table snapshot lacks format_version and unversioned restore is not enabled.
+	ErrUnversionedSnapshot = errors.New("unversioned table snapshot: missing format_version key (use --accept-unversioned-segments to restore)")
+)
+
+// EncodeFormatVersion encodes a 32-bit format version into a 4-byte big-endian slice.
+func EncodeFormatVersion(version uint32) []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, version)
+	return b
+}
+
+// DecodeFormatVersion decodes a 32-bit format version from a big-endian byte slice.
+func DecodeFormatVersion(b []byte) (uint32, error) {
+	if len(b) < 4 {
+		return 0, errors.New("format_version bytes too short (expected at least 4 bytes)")
+	}
+	return binary.BigEndian.Uint32(b[:4]), nil
+}
 
 // EncodeTypePrefix returns the varint-encoded type prefix for a table type ID.
 func EncodeTypePrefix(typeID uint32) []byte {

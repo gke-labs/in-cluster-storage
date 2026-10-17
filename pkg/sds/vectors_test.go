@@ -851,7 +851,7 @@ func TestGoldenVectors(t *testing.T) {
 				t.Fatalf("failed to parse JSON from %s: %v", file, err)
 			}
 
-			reader := sds.NewChangeReader()
+			reader := sds.NewChangeReaderWithOptions(true)
 			store := memtable.New()
 
 			var actualRecords []DecodedRecordVector

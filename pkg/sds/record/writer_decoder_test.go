@@ -56,7 +56,7 @@ func (m *memoryAppender) Payloads() [][]byte {
 func TestWriterAndDecoderEndToEnd(t *testing.T) {
 	ctx := t.Context()
 	appender := &memoryAppender{}
-	writer := NewWriter(appender)
+	writer := NewWriter(appender, WithoutStreamHeader())
 
 	// Appending a compiled Go type: sdsv1.SnapshotPointer
 	ptr := &sdsv1.SnapshotPointer{
@@ -158,7 +158,7 @@ func appendOp(ctx context.Context, w *Writer, op sdsv1.OpRecord_Op, tableTypeID 
 func TestWriterAutomaticTypeAnnouncementAndRestart(t *testing.T) {
 	ctx := t.Context()
 	appender := &memoryAppender{}
-	writer1 := NewWriter(appender)
+	writer1 := NewWriter(appender, WithoutStreamHeader())
 
 	// Build dynamic message Order V1
 	fieldsV1 := []*descriptorpb.FieldDescriptorProto{
@@ -211,7 +211,7 @@ func TestWriterAutomaticTypeAnnouncementAndRestart(t *testing.T) {
 	}
 
 	// --- Simulate Writer Restart (new Writer instance) ---
-	writer2 := NewWriter(appender)
+	writer2 := NewWriter(appender, WithoutStreamHeader())
 	// On restart, writer2 registers the same descriptor (rule 4)
 	if _, err := writer2.RegisterDescriptor(orderDescV1, 1); err != nil {
 		t.Fatalf("writer2 RegisterDescriptor error: %v", err)

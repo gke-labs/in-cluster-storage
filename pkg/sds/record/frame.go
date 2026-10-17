@@ -29,9 +29,10 @@ const (
 	TypeIDSnapshotPointer uint32 = 3
 	TypeIDPadding         uint32 = 4
 	TypeIDOpRecord        uint32 = 5
+	TypeIDStreamHeader    uint32 = 6
 
-	// MinReservedTypeID and MaxReservedTypeID define the reserved framework range [6, 15].
-	MinReservedTypeID uint32 = 6
+	// MinReservedTypeID and MaxReservedTypeID define the reserved framework range [7, 15].
+	MinReservedTypeID uint32 = 7
 	MaxReservedTypeID uint32 = 15
 
 	// MinAppTypeID is the minimum type ID for application-defined types.
@@ -42,8 +43,8 @@ var (
 	// ErrInvalidTypeID is returned when a type ID is 0.
 	ErrInvalidTypeID = errors.New("invalid type ID 0 (zeroed or torn data)")
 
-	// ErrReservedTypeID is returned when a type ID is within the reserved range [6, 15].
-	ErrReservedTypeID = errors.New("reserved type ID (6..15 are reserved for framework)")
+	// ErrReservedTypeID is returned when a type ID is within the reserved range [7, 15].
+	ErrReservedTypeID = errors.New("reserved type ID (7..15 are reserved for framework)")
 
 	// ErrEmptyPayload is returned when attempting to split an empty payload buffer.
 	ErrEmptyPayload = errors.New("empty payload")

@@ -96,6 +96,13 @@ func (d *Decoder) Decode(payload []byte) (Record, error) {
 	case TypeIDPadding:
 		return Record{TypeID: TypeIDPadding, Message: nil, Raw: body}, nil
 
+	case TypeIDStreamHeader:
+		hdr := &sdsv1.StreamHeader{}
+		if err := proto.Unmarshal(body, hdr); err != nil {
+			return Record{}, fmt.Errorf("failed to unmarshal StreamHeader: %w", err)
+		}
+		return Record{TypeID: TypeIDStreamHeader, Message: hdr, Raw: body}, nil
+
 	case TypeIDOpRecord:
 		opRec := &sdsv1.OpRecord{}
 		if err := proto.Unmarshal(body, opRec); err != nil {

@@ -175,6 +175,21 @@ func RestoreSnapshotKey(ctx context.Context, backend objectstore.Backend, stream
 	tmpFile = nil
 	defer removeAndLog(tmpSST, "downloaded snapshot file")
 
+	// Validate the snapshot SST before creating or ingesting into the database
+	var readerOpts []SnapshotReaderOption
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.acceptUnversioned {
+		readerOpts = append(readerOpts, WithReaderAcceptUnversioned(true))
+	}
+	sr, err := OpenSnapshotFile(tmpSST, readerOpts...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to validate snapshot %q: %w", key, err)
+	}
+	errutil.CloseAndLog(sr, "snapshot reader")
+
 	dbDir := filepath.Join(targetDir, "table.db")
 	removeAllAndLog(dbDir, "table db dir")
 

@@ -33,11 +33,12 @@ import (
 )
 
 type catOptions struct {
-	server   string
-	stream   string
-	fromSeq  uint64
-	segment  string
-	registry string
+	server            string
+	stream            string
+	fromSeq           uint64
+	segment           string
+	registry          string
+	acceptUnversioned bool
 }
 
 func formatRecord(seq uint64, payload []byte, reg *record.Registry) (string, error) {
@@ -47,6 +48,17 @@ func formatRecord(seq uint64, payload []byte, reg *record.Registry) (string, err
 	}
 
 	switch typeID {
+	case record.TypeIDStreamHeader:
+		hdr := &sdsv1.StreamHeader{}
+		if err := proto.Unmarshal(body, hdr); err != nil {
+			return "", fmt.Errorf("failed to unmarshal StreamHeader: %w", err)
+		}
+		b, err := protojson.Marshal(hdr)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%d\t%d\tsds.v1.StreamHeader\t%s", seq, typeID, string(b)), nil
+
 	case record.TypeIDTypeDefinition:
 		def := &sdsv1.TypeDefinition{}
 		if err := proto.Unmarshal(body, def); err != nil {
@@ -204,15 +216,27 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 		}
 		defer errutil.CloseAndLog(f, fmt.Sprintf("segment file %s", opts.segment))
 
-		var magic [4]byte
-		if _, err := io.ReadFull(f, magic[:]); err != nil {
+		if _, _, err := wal.ReadSegmentHeader(f, opts.acceptUnversioned); err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return fmt.Errorf("failed to read segment header: %w", err)
 		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("failed to seek segment file: %w", err)
+
+		// Peek at the record magic to determine whether this contains LogRecords ("WALL") or ClientRecords ("WALC")
+		var recordMagic [4]byte
+		curPos, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return fmt.Errorf("failed to get current file position: %w", err)
+		}
+		if _, err := io.ReadFull(f, recordMagic[:]); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("failed to read record magic: %w", err)
+		}
+		if _, err := f.Seek(curPos, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to seek back to record start: %w", err)
 		}
 
 		// Segment files can come from two sources:
@@ -220,7 +244,7 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 		//    which use the LogRecord format (magic "WALL", 44-byte header including global position).
 		// 2. Local client WAL segments written directly to disk by client writers before/during buffer ingestion,
 		//    which use the ClientRecord format (magic "WALC", 36-byte header with stream-level fields).
-		if magic == wal.LogMagicBytes {
+		if recordMagic == wal.LogMagicBytes {
 			var decodeErrors int
 			for {
 				rec, err := wal.DecodeLogRecord(f)
@@ -249,7 +273,7 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 				return fmt.Errorf("%d records could not be decoded", decodeErrors)
 			}
 			return nil
-		} else if magic == wal.ClientMagicBytes {
+		} else if recordMagic == wal.ClientMagicBytes {
 			var decodeErrors int
 			for {
 				rec, err := wal.DecodeClientRecord(f)
@@ -279,7 +303,7 @@ func runCat(cmd *cobra.Command, opts *catOptions) error {
 			}
 			return nil
 		}
-		return fmt.Errorf("unrecognized segment format magic %q", string(magic[:]))
+		return fmt.Errorf("unrecognized segment format magic %q", string(recordMagic[:]))
 	}
 
 	return errors.New("either --server or --segment must be specified")
@@ -308,6 +332,7 @@ func NewRootCommand() *cobra.Command {
 	catCmd.Flags().Uint64Var(&opts.fromSeq, "from-seq", 0, "Lower bound stream sequence number (exclusive)")
 	catCmd.Flags().StringVar(&opts.segment, "segment", "", "Offline sealed segment file path")
 	catCmd.Flags().StringVar(&opts.registry, "registry", "", "Path to serialized sds.v1.Registry file")
+	catCmd.Flags().BoolVar(&opts.acceptUnversioned, "accept-unversioned-segments", false, "Accept unversioned WAL segments and streams for one-time upgrade")
 
 	rootCmd.AddCommand(catCmd)
 	return rootCmd

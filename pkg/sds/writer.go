@@ -51,6 +51,11 @@ func (w *Writer) RecordWriter() *record.Writer {
 	return w.recordWriter
 }
 
+// AppendStreamHeader writes an explicit StreamHeader framework record (TypeID = 6).
+func (w *Writer) AppendStreamHeader(ctx context.Context, hdr *sdsv1.StreamHeader) (uint64, error) {
+	return w.recordWriter.AppendStreamHeader(ctx, hdr)
+}
+
 // RegisterType registers a Go proto.Message type with optional primary key field numbers.
 func (w *Writer) RegisterType(msg proto.Message, keyFields ...int32) (uint32, error) {
 	return w.recordWriter.RegisterType(msg, keyFields...)

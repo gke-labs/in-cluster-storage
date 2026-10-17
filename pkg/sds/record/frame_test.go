@@ -32,7 +32,8 @@ func TestValidateTypeID(t *testing.T) {
 		{name: "SnapshotPointer (3)", typeID: 3, wantErr: nil},
 		{name: "Padding (4)", typeID: 4, wantErr: nil},
 		{name: "OpRecord (5)", typeID: 5, wantErr: nil},
-		{name: "reserved 6", typeID: 6, wantErr: ErrReservedTypeID},
+		{name: "StreamHeader (6)", typeID: 6, wantErr: nil},
+		{name: "reserved 7", typeID: 7, wantErr: ErrReservedTypeID},
 		{name: "reserved 10", typeID: 10, wantErr: ErrReservedTypeID},
 		{name: "reserved 15", typeID: 15, wantErr: ErrReservedTypeID},
 		{name: "app type min (16)", typeID: 16, wantErr: nil},
@@ -99,8 +100,8 @@ func TestFrameRejections(t *testing.T) {
 		t.Errorf("EncodeFrame(0) got error %v, want ErrInvalidTypeID", err)
 	}
 
-	// Encode reserved IDs 6..15
-	for id := uint32(6); id <= 15; id++ {
+	// Encode reserved IDs 7..15
+	for id := uint32(7); id <= 15; id++ {
 		if _, err := EncodeFrame(id, []byte("body")); !errors.Is(err, ErrReservedTypeID) {
 			t.Errorf("EncodeFrame(%d) got error %v, want ErrReservedTypeID", id, err)
 		}
@@ -117,10 +118,10 @@ func TestFrameRejections(t *testing.T) {
 		t.Errorf("SplitFrame([0]) got error %v, want ErrInvalidTypeID", err)
 	}
 
-	// SplitFrame on reserved type_id 6 wire
-	reservedFrame := []byte{0x06, 0x01, 0x02}
+	// SplitFrame on reserved type_id 7 wire
+	reservedFrame := []byte{0x07, 0x01, 0x02}
 	if _, _, err := SplitFrame(reservedFrame); !errors.Is(err, ErrReservedTypeID) {
-		t.Errorf("SplitFrame([6]) got error %v, want ErrReservedTypeID", err)
+		t.Errorf("SplitFrame([7]) got error %v, want ErrReservedTypeID", err)
 	}
 
 	// SplitFrame on malformed varint (overflowing varint)
