@@ -4,24 +4,48 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package sds
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
+	"k8s.io/klog/v2"
 )
+
+const (
+	// StreamFormatVersion is the current stream format version.
+	StreamFormatVersion uint32 = 1
+)
+
+var (
+	// ErrMissingStreamHeader is returned when the first record of a stream is not a StreamHeader.
+	ErrMissingStreamHeader = errors.New("missing stream header record as first stream record")
+
+	// ErrUnsupportedStreamVersion is returned when a stream format version is greater than StreamFormatVersion.
+	ErrUnsupportedStreamVersion = errors.New("unsupported stream format version")
+)
+
+// ChangeReaderOption configures a ChangeReader.
+type ChangeReaderOption func(*ChangeReader)
+
+// WithAcceptUnversioned configures whether ChangeReader tolerates the absence of a StreamHeader on the first record.
+func WithAcceptUnversioned(accept bool) ChangeReaderOption {
+	return func(r *ChangeReader) {
+		r.acceptUnversioned = accept
+	}
+}
 
 // ChangeReader decodes stream payloads in order, groups multi-record transactions,
 // and yields committed changes in stream order.
@@ -30,6 +54,10 @@ type ChangeReader struct {
 	decoder              *record.Decoder
 	pendingTx            map[uint64][]Change
 	safeSnapshotPosition uint64
+	acceptUnversioned    bool
+	headerSeen           bool
+	firstRecordSeen      bool
+	streamHeader         *sdsv1.StreamHeader
 }
 
 // NewChangeReader creates a new ChangeReader.
@@ -38,6 +66,27 @@ func NewChangeReader(opts ...record.DecoderOption) *ChangeReader {
 		decoder:   record.NewDecoder(opts...),
 		pendingTx: make(map[uint64][]Change),
 	}
+}
+
+// NewChangeReaderWithOptions creates a ChangeReader with unversioned acceptance setting.
+func NewChangeReaderWithOptions(acceptUnversioned bool, opts ...record.DecoderOption) *ChangeReader {
+	r := NewChangeReader(opts...)
+	r.acceptUnversioned = acceptUnversioned
+	return r
+}
+
+// SetAcceptUnversioned configures whether unversioned streams are tolerated.
+func (r *ChangeReader) SetAcceptUnversioned(accept bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.acceptUnversioned = accept
+}
+
+// StreamHeader returns the decoded StreamHeader, or nil if none.
+func (r *ChangeReader) StreamHeader() *sdsv1.StreamHeader {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.streamHeader
 }
 
 // Decoder returns the underlying record.Decoder.
@@ -107,7 +156,35 @@ func (r *ChangeReader) Feed(seq uint64, payload []byte) ([]Change, error) {
 		return nil, err
 	}
 
+	if !r.firstRecordSeen {
+		r.firstRecordSeen = true
+		if seq == 1 {
+			if rec.TypeID == record.TypeIDStreamHeader {
+				r.headerSeen = true
+			} else {
+				if !r.acceptUnversioned {
+					return nil, fmt.Errorf("%w: first record type is %d (use --accept-unversioned-segments to allow)", ErrMissingStreamHeader, rec.TypeID)
+				}
+				klog.Warningf("accepting stream without stream header record (first record type %d, --accept-unversioned-segments)", rec.TypeID)
+			}
+		}
+	}
+
 	switch rec.TypeID {
+	case record.TypeIDStreamHeader:
+		hdr, ok := rec.Message.(*sdsv1.StreamHeader)
+		if !ok || hdr == nil {
+			return nil, fmt.Errorf("expected *sdsv1.StreamHeader for TypeIDStreamHeader, got %T", rec.Message)
+		}
+		if hdr.GetFormatVersion() > StreamFormatVersion {
+			return nil, fmt.Errorf("%w: version %d > current %d", ErrUnsupportedStreamVersion, hdr.GetFormatVersion(), StreamFormatVersion)
+		}
+		r.streamHeader = hdr
+		if len(r.pendingTx) == 0 {
+			r.safeSnapshotPosition = seq
+		}
+		return nil, nil
+
 	case record.TypeIDTypeDefinition, record.TypeIDSnapshotPointer, record.TypeIDPadding:
 		if len(r.pendingTx) == 0 {
 			r.safeSnapshotPosition = seq

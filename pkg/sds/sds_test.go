@@ -329,8 +329,8 @@ func TestInterleavedTransactions(t *testing.T) {
 	}
 
 	// Safe position must NOT advance to commit1Seq because Tx2 is still open!
-	// (Safe position should be the position before Tx1 started, which was the TypeDefinition at seq 1)
-	if reader.SafeSnapshotPosition() > 1 {
+	// (Safe position should be the position before Tx1 started, which was the TypeDefinition at seq 2)
+	if reader.SafeSnapshotPosition() > 2 {
 		t.Errorf("SafeSnapshotPosition advanced while Tx2 was still pending! got %d", reader.SafeSnapshotPosition())
 	}
 
@@ -404,9 +404,9 @@ func TestUncommittedTailDiscarded(t *testing.T) {
 		t.Fatalf("expected 1 committed change, got %d", len(committed))
 	}
 
-	// Safe snapshot position must be at the autocommit record (seq 2)
-	if reader.SafeSnapshotPosition() != 2 {
-		t.Errorf("SafeSnapshotPosition = %d, want 2", reader.SafeSnapshotPosition())
+	// Safe snapshot position must be at the autocommit record (seq 3)
+	if reader.SafeSnapshotPosition() != 3 {
+		t.Errorf("SafeSnapshotPosition = %d, want 3", reader.SafeSnapshotPosition())
 	}
 
 	// Verify pending transactions
@@ -442,7 +442,7 @@ func TestSafePositionNeverInsideTransaction(t *testing.T) {
 
 	reader := NewChangeReader()
 
-	// Step 1: Autocommit insert at seq 1 (TypeDef) & seq 2 (record)
+	// Step 1: Autocommit insert at seq 1 (StreamHeader), seq 2 (TypeDef) & seq 3 (record)
 	d1 := dynamicpb.NewMessage(md)
 	d1.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(1))
 	writer.Insert(ctx, d1)
@@ -450,56 +450,56 @@ func TestSafePositionNeverInsideTransaction(t *testing.T) {
 	for i := 0; i < len(appender.Payloads()); i++ {
 		reader.Feed(uint64(i+1), appender.Payloads()[i])
 	}
-	if reader.SafeSnapshotPosition() != 2 {
-		t.Errorf("step 1 safe pos = %d, want 2", reader.SafeSnapshotPosition())
+	if reader.SafeSnapshotPosition() != 3 {
+		t.Errorf("step 1 safe pos = %d, want 3", reader.SafeSnapshotPosition())
 	}
 
-	// Step 2: Open Tx1 and write record at seq 3
+	// Step 2: Open Tx1 and write record at seq 4
 	tx1 := writer.Begin()
 	d2 := dynamicpb.NewMessage(md)
 	d2.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(2))
 	tx1.Insert(ctx, d2)
 
-	reader.Feed(3, appender.Payloads()[2])
-	if reader.SafeSnapshotPosition() != 2 {
-		t.Errorf("step 2 safe pos inside tx1 = %d, want 2", reader.SafeSnapshotPosition())
+	reader.Feed(4, appender.Payloads()[3])
+	if reader.SafeSnapshotPosition() != 3 {
+		t.Errorf("step 2 safe pos inside tx1 = %d, want 3", reader.SafeSnapshotPosition())
 	}
 
-	// Step 3: Open Tx2 and write record at seq 4
+	// Step 3: Open Tx2 and write record at seq 5
 	tx2 := writer.Begin()
 	d3 := dynamicpb.NewMessage(md)
 	d3.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(3))
 	tx2.Insert(ctx, d3)
 
-	reader.Feed(4, appender.Payloads()[3])
-	if reader.SafeSnapshotPosition() != 2 {
-		t.Errorf("step 3 safe pos inside tx2 = %d, want 2", reader.SafeSnapshotPosition())
+	reader.Feed(5, appender.Payloads()[4])
+	if reader.SafeSnapshotPosition() != 3 {
+		t.Errorf("step 3 safe pos inside tx2 = %d, want 3", reader.SafeSnapshotPosition())
 	}
 
-	// Step 4: Write another record for Tx1 at seq 5
+	// Step 4: Write another record for Tx1 at seq 6
 	d4 := dynamicpb.NewMessage(md)
 	d4.Set(md.Fields().ByName("id"), protoreflect.ValueOfInt64(4))
 	tx1.Insert(ctx, d4)
 
-	reader.Feed(5, appender.Payloads()[4])
-	if reader.SafeSnapshotPosition() != 2 {
-		t.Errorf("step 4 safe pos inside tx1 = %d, want 2", reader.SafeSnapshotPosition())
-	}
-
-	// Step 5: Commit Tx1 at seq 6
-	tx1.Commit(ctx)
 	reader.Feed(6, appender.Payloads()[5])
-	// Tx2 is still open! Safe pos must STILL be 2.
-	if reader.SafeSnapshotPosition() != 2 {
-		t.Errorf("step 5 safe pos with Tx2 still open = %d, want 2", reader.SafeSnapshotPosition())
+	if reader.SafeSnapshotPosition() != 3 {
+		t.Errorf("step 4 safe pos inside tx1 = %d, want 3", reader.SafeSnapshotPosition())
 	}
 
-	// Step 6: Commit Tx2 at seq 7
-	tx2.Commit(ctx)
+	// Step 5: Commit Tx1 at seq 7
+	tx1.Commit(ctx)
 	reader.Feed(7, appender.Payloads()[6])
-	// All open transactions closed! Safe pos jumps to 7.
-	if reader.SafeSnapshotPosition() != 7 {
-		t.Errorf("step 6 safe pos after all tx committed = %d, want 7", reader.SafeSnapshotPosition())
+	// Tx2 is still open! Safe pos must STILL be 3.
+	if reader.SafeSnapshotPosition() != 3 {
+		t.Errorf("step 5 safe pos with Tx2 still open = %d, want 3", reader.SafeSnapshotPosition())
+	}
+
+	// Step 6: Commit Tx2 at seq 8
+	tx2.Commit(ctx)
+	reader.Feed(8, appender.Payloads()[7])
+	// All open transactions closed! Safe pos jumps to 8.
+	if reader.SafeSnapshotPosition() != 8 {
+		t.Errorf("step 6 safe pos after all tx committed = %d, want 8", reader.SafeSnapshotPosition())
 	}
 }
 
@@ -604,7 +604,7 @@ func TestFrameworkRecordsPassthrough(t *testing.T) {
 		}
 	}
 
-	if reader.SafeSnapshotPosition() != 2 {
-		t.Errorf("SafeSnapshotPosition = %d, want 2", reader.SafeSnapshotPosition())
+	if reader.SafeSnapshotPosition() != 3 {
+		t.Errorf("SafeSnapshotPosition = %d, want 3", reader.SafeSnapshotPosition())
 	}
 }

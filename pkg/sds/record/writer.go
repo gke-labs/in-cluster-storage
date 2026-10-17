@@ -23,6 +23,15 @@ import (
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+const (
+	// StreamFormatVersion is the current stream format version.
+	StreamFormatVersion uint32 = 1
+
+	// DefaultCreatorVersion is the default creator version string.
+	DefaultCreatorVersion = "in-cluster-storage/1.0"
 )
 
 // Appender is the minimal transport interface required by Writer.
@@ -40,13 +49,30 @@ func WithRegistry(reg *Registry) WriterOption {
 	}
 }
 
+// WithoutStreamHeader disables automatic emission of a StreamHeader on the first write.
+func WithoutStreamHeader() WriterOption {
+	return func(w *Writer) {
+		w.skipHeader = true
+	}
+}
+
+// WithStreamHeader sets a custom StreamHeader for automatic emission.
+func WithStreamHeader(hdr *sdsv1.StreamHeader) WriterOption {
+	return func(w *Writer) {
+		w.customHeader = hdr
+	}
+}
+
 // Writer provides high-level structured stream writing over an Appender transport.
 // It manages type registrations and in-band TypeDefinition announcements.
 type Writer struct {
-	mu        sync.Mutex
-	appender  Appender
-	registry  *Registry
-	announced map[uint32][]byte // typeID -> last announced fingerprint
+	mu            sync.Mutex
+	appender      Appender
+	registry      *Registry
+	announced     map[uint32][]byte // typeID -> last announced fingerprint
+	headerEmitted bool
+	skipHeader    bool
+	customHeader  *sdsv1.StreamHeader
 }
 
 // NewWriter creates a new Writer wrapping the given Appender.
@@ -65,6 +91,56 @@ func NewWriter(appender Appender, opts ...WriterOption) *Writer {
 // Registry returns the Writer's Registry.
 func (w *Writer) Registry() *Registry {
 	return w.registry
+}
+
+func (w *Writer) ensureStreamHeaderLocked(ctx context.Context) error {
+	if w.headerEmitted || w.skipHeader {
+		return nil
+	}
+	hdr := w.customHeader
+	if hdr == nil {
+		hdr = &sdsv1.StreamHeader{
+			FormatVersion:  StreamFormatVersion,
+			CreatorVersion: DefaultCreatorVersion,
+			CreatedAt:      timestamppb.Now(),
+		}
+	}
+	body, err := proto.Marshal(hdr)
+	if err != nil {
+		return fmt.Errorf("failed to marshal StreamHeader: %w", err)
+	}
+	payload, err := EncodeFrame(TypeIDStreamHeader, body)
+	if err != nil {
+		return err
+	}
+	if _, err := w.appender.Append(ctx, payload); err != nil {
+		return fmt.Errorf("failed to append StreamHeader: %w", err)
+	}
+	w.headerEmitted = true
+	return nil
+}
+
+// AppendStreamHeader explicitly writes a StreamHeader framework record (TypeID = 6).
+func (w *Writer) AppendStreamHeader(ctx context.Context, hdr *sdsv1.StreamHeader) (uint64, error) {
+	if hdr == nil {
+		return 0, fmt.Errorf("nil StreamHeader")
+	}
+	body, err := proto.Marshal(hdr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal StreamHeader: %w", err)
+	}
+	payload, err := EncodeFrame(TypeIDStreamHeader, body)
+	if err != nil {
+		return 0, err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	seq, err := w.appender.Append(ctx, payload)
+	if err != nil {
+		return 0, err
+	}
+	w.headerEmitted = true
+	return seq, nil
 }
 
 // RegisterType registers a Go proto.Message type with optional primary key field numbers.
@@ -88,6 +164,10 @@ func (w *Writer) RegisterDescriptor(md protoreflect.MessageDescriptor, keyFields
 // ensureAnnounced ensures that the TypeDefinition for typeID is emitted to the stream
 // before any record of this type is written.
 func (w *Writer) ensureAnnounced(ctx context.Context, typeID uint32) error {
+	if err := w.ensureStreamHeaderLocked(ctx); err != nil {
+		return err
+	}
+
 	def, _, ok := w.registry.LookupByID(typeID)
 	if !ok {
 		return fmt.Errorf("%w: %d", ErrTypeNotRegistered, typeID)
@@ -164,6 +244,9 @@ func (w *Writer) AppendTxCommit(ctx context.Context, commit *sdsv1.TxCommit) (ui
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.ensureStreamHeaderLocked(ctx); err != nil {
+		return 0, err
+	}
 	return w.appender.Append(ctx, payload)
 }
 
@@ -182,6 +265,9 @@ func (w *Writer) AppendSnapshotPointer(ctx context.Context, ptr *sdsv1.SnapshotP
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.ensureStreamHeaderLocked(ctx); err != nil {
+		return 0, err
+	}
 	return w.appender.Append(ctx, payload)
 }
 
@@ -198,6 +284,9 @@ func (w *Writer) AppendPaddingBytes(ctx context.Context, body []byte) (uint64, e
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.ensureStreamHeaderLocked(ctx); err != nil {
+		return 0, err
+	}
 	return w.appender.Append(ctx, payload)
 }
 
@@ -205,6 +294,10 @@ func (w *Writer) AppendPaddingBytes(ctx context.Context, body []byte) (uint64, e
 func (w *Writer) AppendRaw(ctx context.Context, typeID uint32, body []byte) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if err := w.ensureStreamHeaderLocked(ctx); err != nil {
+		return 0, err
+	}
 
 	if typeID >= MinAppTypeID {
 		if err := w.ensureAnnounced(ctx, typeID); err != nil {
