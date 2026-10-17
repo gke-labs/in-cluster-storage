@@ -382,6 +382,66 @@ func (x *SnapshotPointer) GetRestoredFrom() string {
 	return ""
 }
 
+type StreamHeader struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	FormatVersion  uint32                 `protobuf:"varint,1,opt,name=format_version,json=formatVersion,proto3" json:"format_version,omitempty"`
+	CreatorVersion string                 `protobuf:"bytes,2,opt,name=creator_version,json=creatorVersion,proto3" json:"creator_version,omitempty"`
+	CreatedAt      *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *StreamHeader) Reset() {
+	*x = StreamHeader{}
+	mi := &file_proto_sds_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamHeader) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamHeader) ProtoMessage() {}
+
+func (x *StreamHeader) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_sds_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamHeader.ProtoReflect.Descriptor instead.
+func (*StreamHeader) Descriptor() ([]byte, []int) {
+	return file_proto_sds_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *StreamHeader) GetFormatVersion() uint32 {
+	if x != nil {
+		return x.FormatVersion
+	}
+	return 0
+}
+
+func (x *StreamHeader) GetCreatorVersion() string {
+	if x != nil {
+		return x.CreatorVersion
+	}
+	return ""
+}
+
+func (x *StreamHeader) GetCreatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return nil
+}
+
 type Registry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Types         []*TypeDefinition      `protobuf:"bytes,1,rep,name=types,proto3" json:"types,omitempty"`
@@ -391,7 +451,7 @@ type Registry struct {
 
 func (x *Registry) Reset() {
 	*x = Registry{}
-	mi := &file_proto_sds_proto_msgTypes[4]
+	mi := &file_proto_sds_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -403,7 +463,7 @@ func (x *Registry) String() string {
 func (*Registry) ProtoMessage() {}
 
 func (x *Registry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sds_proto_msgTypes[4]
+	mi := &file_proto_sds_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -416,7 +476,7 @@ func (x *Registry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Registry.ProtoReflect.Descriptor instead.
 func (*Registry) Descriptor() ([]byte, []int) {
-	return file_proto_sds_proto_rawDescGZIP(), []int{4}
+	return file_proto_sds_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Registry) GetTypes() []*TypeDefinition {
@@ -463,7 +523,12 @@ const file_proto_sds_proto_rawDesc = "" +
 	"\x04name\x18\x05 \x01(\tR\x04name\x129\n" +
 	"\n" +
 	"created_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12#\n" +
-	"\rrestored_from\x18\a \x01(\tR\frestoredFrom\"8\n" +
+	"\rrestored_from\x18\a \x01(\tR\frestoredFrom\"\x99\x01\n" +
+	"\fStreamHeader\x12%\n" +
+	"\x0eformat_version\x18\x01 \x01(\rR\rformatVersion\x12'\n" +
+	"\x0fcreator_version\x18\x02 \x01(\tR\x0ecreatorVersion\x129\n" +
+	"\n" +
+	"created_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"8\n" +
 	"\bRegistry\x12,\n" +
 	"\x05types\x18\x01 \x03(\v2\x16.sds.v1.TypeDefinitionR\x05typesB:Z8github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1;v1b\x06proto3"
 
@@ -480,28 +545,30 @@ func file_proto_sds_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_sds_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_sds_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_proto_sds_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_proto_sds_proto_goTypes = []any{
 	(OpRecord_Op)(0),                       // 0: sds.v1.OpRecord.Op
 	(*TypeDefinition)(nil),                 // 1: sds.v1.TypeDefinition
 	(*OpRecord)(nil),                       // 2: sds.v1.OpRecord
 	(*TxCommit)(nil),                       // 3: sds.v1.TxCommit
 	(*SnapshotPointer)(nil),                // 4: sds.v1.SnapshotPointer
-	(*Registry)(nil),                       // 5: sds.v1.Registry
-	(*descriptorpb.FileDescriptorSet)(nil), // 6: google.protobuf.FileDescriptorSet
-	(*timestamppb.Timestamp)(nil),          // 7: google.protobuf.Timestamp
+	(*StreamHeader)(nil),                   // 5: sds.v1.StreamHeader
+	(*Registry)(nil),                       // 6: sds.v1.Registry
+	(*descriptorpb.FileDescriptorSet)(nil), // 7: google.protobuf.FileDescriptorSet
+	(*timestamppb.Timestamp)(nil),          // 8: google.protobuf.Timestamp
 }
 var file_proto_sds_proto_depIdxs = []int32{
-	6, // 0: sds.v1.TypeDefinition.descriptors:type_name -> google.protobuf.FileDescriptorSet
+	7, // 0: sds.v1.TypeDefinition.descriptors:type_name -> google.protobuf.FileDescriptorSet
 	0, // 1: sds.v1.OpRecord.op:type_name -> sds.v1.OpRecord.Op
-	7, // 2: sds.v1.TxCommit.commit_time:type_name -> google.protobuf.Timestamp
-	7, // 3: sds.v1.SnapshotPointer.created_at:type_name -> google.protobuf.Timestamp
-	1, // 4: sds.v1.Registry.types:type_name -> sds.v1.TypeDefinition
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	8, // 2: sds.v1.TxCommit.commit_time:type_name -> google.protobuf.Timestamp
+	8, // 3: sds.v1.SnapshotPointer.created_at:type_name -> google.protobuf.Timestamp
+	8, // 4: sds.v1.StreamHeader.created_at:type_name -> google.protobuf.Timestamp
+	1, // 5: sds.v1.Registry.types:type_name -> sds.v1.TypeDefinition
+	6, // [6:6] is the sub-list for method output_type
+	6, // [6:6] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_proto_sds_proto_init() }
@@ -515,7 +582,7 @@ func file_proto_sds_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_sds_proto_rawDesc), len(file_proto_sds_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   5,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
