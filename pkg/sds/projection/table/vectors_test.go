@@ -19,16 +19,20 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
-	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 var regenerateVectors = flag.Bool("regenerate", false, "regenerate golden snapshot vectors")
@@ -41,6 +45,45 @@ type SnapshotVector struct {
 	TableNames  []string `json:"table_names"`
 	RowCount    int      `json:"row_count"`
 	SSTableHex  string   `json:"sstable_hex"`
+}
+
+func newSnapshotTestDescriptor(t *testing.T) protoreflect.MessageDescriptor {
+	t.Helper()
+	msgProto := &descriptorpb.DescriptorProto{
+		Name: proto.String("SnapshotItem"),
+		Field: []*descriptorpb.FieldDescriptorProto{
+			{
+				Name:   proto.String("id"),
+				Number: proto.Int32(1),
+				Type:   descriptorpb.FieldDescriptorProto_TYPE_INT64.Enum(),
+				Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+			},
+			{
+				Name:   proto.String("value"),
+				Number: proto.Int32(2),
+				Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+				Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+			},
+		},
+	}
+	fileProto := &descriptorpb.FileDescriptorProto{
+		Name:        proto.String("snapshot_item.proto"),
+		Package:     proto.String("testdata"),
+		MessageType: []*descriptorpb.DescriptorProto{msgProto},
+		Syntax:      proto.String("proto3"),
+	}
+	fds := &descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{fileProto},
+	}
+	files, err := protodesc.NewFiles(fds)
+	if err != nil {
+		t.Fatalf("protodesc.NewFiles failed: %v", err)
+	}
+	d, err := files.FindDescriptorByName("testdata.SnapshotItem")
+	if err != nil {
+		t.Fatalf("FindDescriptorByName failed: %v", err)
+	}
+	return d.(protoreflect.MessageDescriptor)
 }
 
 func TestSnapshotGoldenVectors(t *testing.T) {
@@ -104,15 +147,27 @@ func TestSnapshotGoldenVectors(t *testing.T) {
 				}
 
 				// Verify Point Get for each row
-				for _, r := range rows {
-					node := r.(*pb.Inode)
-					k, _, _ := pk.Split(node)
+				for i, r := range rows {
+					k, _, err := pk.Split(r)
+					if err != nil {
+						t.Fatalf("pk.Split failed: %v", err)
+					}
 					got, found, err := sr.Get(tblName, k)
 					if err != nil || !found {
 						t.Fatalf("sr.Get row failed: found=%v, err=%v", found, err)
 					}
-					if got.(*pb.Inode).GetIno() != node.GetIno() {
-						t.Fatalf("got ino %d, want %d", got.(*pb.Inode).GetIno(), node.GetIno())
+					if !proto.Equal(got, r) {
+						t.Fatalf("got row %+v, want %+v", got, r)
+					}
+
+					refl := r.ProtoReflect()
+					idField := refl.Descriptor().Fields().ByName("id")
+					if idField != nil {
+						gotID := refl.Get(idField).Int()
+						wantID := int64(i + 1)
+						if gotID != wantID {
+							t.Fatalf("row %d: got id %d, want %d", i, gotID, wantID)
+						}
 					}
 				}
 			}
@@ -161,20 +216,25 @@ func generateGoldenVector(t *testing.T, ctx context.Context, vectorDir string) {
 	}
 	defer db.Close()
 
-	def, err := db.RegisterType(ctx, &pb.Inode{}, 1)
+	md := newSnapshotTestDescriptor(t)
+	def, err := db.RegisterType(ctx, dynamicpb.NewMessage(md), 1)
 	if err != nil {
 		t.Fatalf("RegisterType failed: %v", err)
 	}
 
 	pk := sds.NewPrimaryKey(1)
 	rowCount := 5
+	idField := md.Fields().ByName("id")
+	valField := md.Fields().ByName("value")
 	for i := 1; i <= rowCount; i++ {
-		node := &pb.Inode{
-			Ino:  proto.Uint64(uint64(i)),
-			Mode: uint32(0644),
+		row := dynamicpb.NewMessage(md)
+		row.Set(idField, protoreflect.ValueOfInt64(int64(i)))
+		row.Set(valField, protoreflect.ValueOfString(fmt.Sprintf("item-%d", i)))
+		k, v, err := pk.Split(row)
+		if err != nil {
+			t.Fatalf("pk.Split failed: %v", err)
 		}
-		k, v, _ := pk.Split(node)
-		err := db.Apply(ctx, sds.Change{
+		err = db.Apply(ctx, sds.Change{
 			Op:       sds.OpCreate,
 			TypeID:   def.GetId(),
 			TypeName: def.GetName(),
@@ -201,7 +261,7 @@ func generateGoldenVector(t *testing.T, ctx context.Context, vectorDir string) {
 
 	vec := SnapshotVector{
 		Name:        "01_snapshot_basic",
-		Description: "Single-table Inode snapshot at position 50 with 5 rows and reserved metadata keys",
+		Description: "Single-table SnapshotItem snapshot at position 50 with 5 rows and reserved metadata keys",
 		StreamID:    streamID,
 		Position:    snapPos,
 		TableNames:  []string{def.GetName()},
@@ -215,7 +275,7 @@ func generateGoldenVector(t *testing.T, ctx context.Context, vectorDir string) {
 	}
 
 	outPath := filepath.Join(vectorDir, "01_snapshot_basic.json")
-	if err := os.WriteFile(outPath, vecJSON, 0644); err != nil {
+	if err := os.WriteFile(outPath, append(vecJSON, '\n'), 0644); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 	t.Logf("Wrote golden vector to %s", outPath)
