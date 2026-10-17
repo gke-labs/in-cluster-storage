@@ -1331,3 +1331,134 @@ func TestDivergentLocalTailAboveWitnessWatermarkDiscarded(t *testing.T) {
 		t.Fatalf("wait for seq 4 failed: %v", err)
 	}
 }
+
+func startBufferServerOnAddr(t *testing.T, backend objectstore.Backend, dataDir string, addr string) *testServerHandle {
+	ctx := t.Context()
+	srv, err := buffer.NewServer(ctx, buffer.ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 2 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to start buffer server: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to listen on %s: %v", addr, err)
+	}
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterWalBufferServer(grpcServer, srv)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	return &testServerHandle{
+		srv:        srv,
+		addr:       listener.Addr().String(),
+		grpcServer: grpcServer,
+		listener:   listener,
+	}
+}
+
+func TestClientReconnectAfterBufferCrash(t *testing.T) {
+	backend := inmemorystorage.New()
+	bufDir1 := t.TempDir()
+
+	// Reserve a local port
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve port: %v", err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+
+	handle1 := startBufferServerOnAddr(t, backend, bufDir1, addr)
+
+	clientDir := t.TempDir()
+	streamID := uuid.New()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	stream, err := Open(ctx, clientDir, streamID, handle1.addr)
+	if err != nil {
+		t.Fatalf("failed to open stream: %v", err)
+	}
+	defer stream.Close()
+
+	// Append 5 records
+	for i := 1; i <= 5; i++ {
+		seq, err := stream.Append(ctx, []byte(fmt.Sprintf("record-%d", i)))
+		if err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+		if err := stream.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("wait witness %d failed: %v", seq, err)
+		}
+	}
+	// Flush 1..5 to backend so restarted buffer starts with witness head = 5
+	if _, err := handle1.srv.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	// Append 5 more records (witness only, above buffer's backend watermark 5)
+	for i := 6; i <= 10; i++ {
+		seq, err := stream.Append(ctx, []byte(fmt.Sprintf("record-%d", i)))
+		if err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+		if err := stream.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("wait witness %d failed: %v", seq, err)
+		}
+	}
+
+	// Crash stop buffer service WITHOUT Close()
+	handle1.StopWithoutClose()
+
+	// Restart buffer service on the SAME address with empty data dir (failover to another worker node).
+	// Restarted buffer recovers segments 1..5 from backend, so its initial witness watermark is 5.
+	// The client has local records 6..10 above this witness head.
+	handle2 := startBufferServerOnAddr(t, backend, t.TempDir(), addr)
+	defer handle2.StopGraceful()
+
+	// Wait for client to reconnect, replay unacknowledged records 6..10, and witness ack to advance
+	if err := stream.Wait(ctx, 10, Witness, false); err != nil {
+		t.Fatalf("failed waiting for witness ack on running stream after restart: %v", err)
+	}
+
+	// Append a new record and ensure it completes
+	seq11, err := stream.Append(ctx, []byte("record-11"))
+	if err != nil {
+		t.Fatalf("append 11 failed: %v", err)
+	}
+	if err := stream.Wait(ctx, seq11, Witness, false); err != nil {
+		t.Fatalf("wait 11 failed: %v", err)
+	}
+
+	// Tail all records from restarted buffer to verify 1..11 are all present and contiguous
+	tailCtx, tailCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer tailCancel()
+	tailIter, err := TailStream(tailCtx, addr, streamID, 0)
+	if err != nil {
+		t.Fatalf("TailStream failed: %v", err)
+	}
+	var receivedSeqs []uint64
+	for seq := range tailIter {
+		receivedSeqs = append(receivedSeqs, seq)
+		if len(receivedSeqs) == 11 {
+			break
+		}
+	}
+	expectedSeqs := []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+	if len(receivedSeqs) != len(expectedSeqs) {
+		t.Fatalf("expected %d records after restart, got %d: %v", len(expectedSeqs), len(receivedSeqs), receivedSeqs)
+	}
+	for i, seq := range receivedSeqs {
+		if seq != expectedSeqs[i] {
+			t.Errorf("at index %d: expected seq %d, got %d", i, expectedSeqs[i], seq)
+		}
+	}
+}

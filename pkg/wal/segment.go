@@ -331,6 +331,9 @@ func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
 		// Partial segment: scan records, find offset where StreamSeq <= maxSeq, truncate file
 		f, err := os.OpenFile(seg.Path, os.O_RDWR, 0644)
 		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
 			errs = append(errs, fmt.Errorf("failed to open segment file %s for truncate: %w", seg.Path, err))
 			remaining = append(remaining, seg)
 			continue
@@ -386,6 +389,11 @@ func (s *ClientSegmentStore) TruncateAfter(maxSeq uint64) error {
 	}
 
 	s.segments = remaining
+	if len(remaining) > 0 {
+		s.activeMeta = remaining[len(remaining)-1]
+	} else {
+		s.activeMeta = nil
+	}
 	return errors.Join(errs...)
 }
 

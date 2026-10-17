@@ -226,6 +226,14 @@ func TestHandleHelloAck_TruncateFailureReturnsError(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to truncate local segment store") {
 		t.Errorf("expected 'failed to truncate local segment store' in error, got: %v", err)
 	}
+
+	// Verify that the stream enters terminal failed state so Append and Wait return the terminal error immediately
+	if _, appendErr := impl.Append(ctx, []byte("should-fail")); appendErr == nil || !strings.Contains(appendErr.Error(), "failed to truncate local segment store") {
+		t.Errorf("expected Append to fail with terminal error, got: %v", appendErr)
+	}
+	if waitErr := impl.Wait(ctx, 1, Witness, false); waitErr == nil || !strings.Contains(waitErr.Error(), "failed to truncate local segment store") {
+		t.Errorf("expected Wait to fail with terminal error, got: %v", waitErr)
+	}
 }
 
 type mockBufferClientWithTail struct {

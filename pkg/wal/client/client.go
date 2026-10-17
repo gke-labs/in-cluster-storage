@@ -137,6 +137,7 @@ type streamImpl struct {
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
 	initialHelloAckErr  error
+	terminalErr         error
 
 	// Retained in-memory records queue for network sending & replay
 	retainedMu      sync.RWMutex
@@ -256,6 +257,14 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		return 0, errors.New("stream closed")
 	}
 
+	s.mu.RLock()
+	if s.terminalErr != nil {
+		err := s.terminalErr
+		s.mu.RUnlock()
+		return 0, err
+	}
+	s.mu.RUnlock()
+
 	select {
 	case <-s.initialHelloAckDone:
 		if s.initialHelloAckErr != nil {
@@ -271,11 +280,11 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 
 	// Degraded mode / backpressure check: block if retained bytes exceed maxRetainedBytes
 	s.mu.Lock()
-	for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() {
+	for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.terminalErr == nil {
 		doneCh := make(chan struct{})
 		go func() {
 			s.mu.Lock()
-			for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() {
+			for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.terminalErr == nil {
 				s.cond.Wait()
 			}
 			s.mu.Unlock()
@@ -291,6 +300,12 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		case <-doneCh:
 		}
 		s.mu.Lock()
+	}
+
+	if s.terminalErr != nil {
+		err := s.terminalErr
+		s.mu.Unlock()
+		return 0, err
 	}
 
 	s.localSeq++
@@ -336,7 +351,12 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 	s.mu.RLock()
 	witness := s.witnessSeq
 	s3 := s.s3Seq
+	termErr := s.terminalErr
 	s.mu.RUnlock()
+
+	if termErr != nil {
+		return termErr
+	}
 
 	if level == Witness && witness >= seq {
 		return nil
@@ -349,7 +369,7 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 		waitChan := make(chan struct{})
 		go func() {
 			s.mu.Lock()
-			for !s.closed.Load() {
+			for !s.closed.Load() && s.terminalErr == nil {
 				if level == Witness && s.witnessSeq >= seq {
 					break
 				}
@@ -369,8 +389,12 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 			return errors.New("stream closed")
 		case <-waitChan:
 			s.mu.RLock()
+			termErr := s.terminalErr
 			w, s3w := s.witnessSeq, s.s3Seq
 			s.mu.RUnlock()
+			if termErr != nil {
+				return termErr
+			}
 			if level == Witness && w >= seq {
 				return nil
 			}
@@ -392,6 +416,11 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 	}
 
 	s.mu.RLock()
+	if s.terminalErr != nil {
+		err := s.terminalErr
+		s.mu.RUnlock()
+		return err
+	}
 	local := s.localSeq
 	s.mu.RUnlock()
 
@@ -438,6 +467,11 @@ func (s *streamImpl) Flush(ctx context.Context) error {
 	}
 
 	s.mu.RLock()
+	if s.terminalErr != nil {
+		err := s.terminalErr
+		s.mu.RUnlock()
+		return err
+	}
 	targetSeq := s.localSeq
 	s3 := s.s3Seq
 	s.mu.RUnlock()
@@ -518,6 +552,7 @@ func (s *streamImpl) backgroundReplicationLoop() {
 
 	backoff := 50 * time.Millisecond
 	maxBackoff := 2 * time.Second
+	firstFailure := true
 
 	for {
 		select {
@@ -528,7 +563,20 @@ func (s *streamImpl) backgroundReplicationLoop() {
 
 		err := s.runStreamSession()
 		if err != nil && !s.closed.Load() {
-			klog.V(4).Infof("WAL client replication session ended: %v, reconnecting in %v", err, backoff)
+			if firstFailure || backoff >= maxBackoff {
+				klog.Warningf("WAL client stream %s: replication session failed: %v, reconnecting in %v", s.streamID, err, backoff)
+				firstFailure = false
+			} else {
+				klog.V(4).Infof("WAL client replication session ended: %v, reconnecting in %v", err, backoff)
+			}
+
+			s.mu.RLock()
+			termErr := s.terminalErr
+			s.mu.RUnlock()
+			if termErr != nil {
+				return
+			}
+
 			select {
 			case <-s.cancelCtx.Done():
 				return
@@ -540,6 +588,7 @@ func (s *streamImpl) backgroundReplicationLoop() {
 			}
 		} else {
 			backoff = 50 * time.Millisecond
+			firstFailure = true
 		}
 	}
 }
@@ -583,7 +632,22 @@ func (s *streamImpl) runStreamSession() error {
 		return fmt.Errorf("handleHelloAck failed: %w", err)
 	}
 
-	// 3. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
+	// 3. Concurrently receive Acks and send newly appended records
+	recvErrCh := make(chan error, 1)
+	go func() {
+		for {
+			ackResp, err := stream.Recv()
+			if err != nil {
+				recvErrCh <- err
+				return
+			}
+			if ack := ackResp.GetAck(); ack != nil {
+				s.handleAck(ack)
+			}
+		}
+	}()
+
+	// 4. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
 	s.retainedMu.RLock()
 	var recordsToReplay []*wal.ClientRecord
 	for _, r := range s.retainedRecords {
@@ -602,21 +666,6 @@ func (s *streamImpl) runStreamSession() error {
 			return fmt.Errorf("failed to replay record %d: %w", rec.StreamSeq, err)
 		}
 	}
-
-	// 4. Concurrently receive Acks and send newly appended records
-	recvErrCh := make(chan error, 1)
-	go func() {
-		for {
-			ackResp, err := stream.Recv()
-			if err != nil {
-				recvErrCh <- err
-				return
-			}
-			if ack := ackResp.GetAck(); ack != nil {
-				s.handleAck(ack)
-			}
-		}
-	}()
 
 	nextSeqToSend := uint64(0)
 	if len(recordsToReplay) > 0 {
@@ -686,8 +735,10 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 			// Query buffer for record at witnessHead.
 			// Release s.mu while tailing buffer to avoid blocking callers/cond.
 			s.mu.Unlock()
-			tailIter, err := s.Tail(s.cancelCtx, witnessHead-1)
+			tailCtx, tailCancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
+			tailIter, err := s.Tail(tailCtx, witnessHead-1)
 			if err != nil {
+				tailCancel()
 				s.mu.Lock()
 				return fmt.Errorf("failed to tail buffer at witness head %d: %w", witnessHead, err)
 			}
@@ -699,7 +750,11 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 					found = true
 					break
 				}
+				if seq > witnessHead {
+					break
+				}
 			}
+			tailCancel()
 			s.mu.Lock()
 			if !found {
 				return fmt.Errorf("record at witness head %d not found in buffer stream tail", witnessHead)
@@ -726,7 +781,16 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 
 				if s.store != nil {
 					if err := s.store.TruncateAfter(witnessHead); err != nil {
-						return fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err)
+						truncErr := fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err)
+						s.terminalErr = truncErr
+						if s.cond != nil {
+							s.cond.Broadcast()
+						}
+						s.initialHelloAckOnce.Do(func() {
+							s.initialHelloAckErr = truncErr
+							close(s.initialHelloAckDone)
+						})
+						return truncErr
 					}
 				}
 
@@ -746,7 +810,9 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 		s.cleanupS3AckedLocked(helloAck.S3AckedStreamSeq)
 	}
 
-	s.cond.Broadcast()
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
 	s.initialHelloAckOnce.Do(func() {
 		close(s.initialHelloAckDone)
 	})
@@ -765,7 +831,9 @@ func (s *streamImpl) handleAck(ack *pb.Ack) {
 		s.cleanupS3AckedLocked(ack.S3AckedStreamSeq)
 	}
 
-	s.cond.Broadcast()
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
 }
 
 func (s *streamImpl) cleanupS3AckedLocked(s3AckedSeq uint64) {

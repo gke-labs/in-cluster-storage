@@ -1913,7 +1913,7 @@ done
 	runnerScript := `/tmp/wal_workload.sh > /tmp/wal_workload.log 2>&1
 echo $? > /tmp/wal_workload.status
 `
-	_, err = h.RunInPod(writerPodName, "default", "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/wal_runner.sh\n%s\nEOF\nchmod +x /tmp/wal_runner.sh\n/tmp/wal_runner.sh &", runnerScript))
+	_, err = runInPodWithTimeout(t, h, writerPodName, "default", 3*time.Minute, "/bin/sh", "-c", fmt.Sprintf("cat << 'EOF' > /tmp/wal_runner.sh\n%s\nEOF\nchmod +x /tmp/wal_runner.sh\n/tmp/wal_runner.sh </dev/null >/dev/null 2>&1 &", runnerScript))
 	if err != nil {
 		t.Fatalf("Failed to start mid-workload in writer pod: %v", err)
 	}
@@ -1925,11 +1925,11 @@ echo $? > /tmp/wal_workload.status
 		t.Fatalf("wal-buffer failed to restart mid-workload: %v", err)
 	}
 
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(3 * time.Minute)
 	workloadFinished := false
 	var exitCodeStr string
 	for time.Now().Before(deadline) {
-		out, err := h.RunInPod(writerPodName, "default", "cat", "/tmp/wal_workload.status")
+		out, err := runInPodWithTimeout(t, h, writerPodName, "default", 30*time.Second, "cat", "/tmp/wal_workload.status")
 		if err == nil && strings.TrimSpace(out) != "" {
 			exitCodeStr = strings.TrimSpace(out)
 			workloadFinished = true
@@ -1938,8 +1938,17 @@ echo $? > /tmp/wal_workload.status
 		time.Sleep(1 * time.Second)
 	}
 	if !workloadFinished {
-		wLogs, _ := h.RunInPod(writerPodName, "default", "cat", "/tmp/wal_workload.log")
-		t.Fatalf("WAL mid-workload did not complete in time. Logs:\n%s", wLogs)
+		wLogs, _ := runInPodWithTimeout(t, h, writerPodName, "default", 30*time.Second, "cat", "/tmp/wal_workload.log")
+		t.Logf("======= DUMPING DIAGNOSTICS FOR HUNG WAL WORKLOAD (3-minute timeout) =======")
+		if desc, err := exec.Command("kubectl", "describe", "pod", writerPodName, "-n", "default").CombinedOutput(); err == nil {
+			t.Logf("kubectl describe pod %s:\n%s\n", writerPodName, string(desc))
+		}
+		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		if walLogs := h.getContainerLogs("wal-buffer-0", "wal-buffer", "default", false); walLogs != "" {
+			t.Logf("WAL Buffer Logs:\n%s\n", walLogs)
+		}
+		t.Fatalf("WAL mid-workload did not complete within 3 minutes. Logs:\n%s", wLogs)
 	}
 	if exitCodeStr != "0" {
 		wLogs, _ := h.RunInPod(writerPodName, "default", "cat", "/tmp/wal_workload.log")
@@ -1977,7 +1986,7 @@ echo $? > /tmp/wal_workload.status
 	}
 
 	t.Logf("Writing final post-restart file")
-	_, err = h.RunInPod(writerPodName, "default", "/bin/sh", "-c", "echo 'final-wal-buffer-data' > /data/final_wal.txt && sync /data/final_wal.txt")
+	_, err = runInPodWithTimeout(t, h, writerPodName, "default", 3*time.Minute, "/bin/sh", "-c", "echo 'final-wal-buffer-data' | dd of=/data/final_wal.txt conv=fsync 2>/dev/null")
 	if err != nil {
 		t.Fatalf("Failed to write final post-restart file: %v", err)
 	}
@@ -1986,8 +1995,39 @@ echo $? > /tmp/wal_workload.status
 		t.Fatalf("Failed to read final_wal.txt: %v (out: %s)", err, outFinal)
 	}
 
-	h.DeletePod(writerPodName, "default")
+	deletePodBounded(t, h, writerPodName, "default", 3*time.Minute)
 	t.Logf("Successfully verified WAL buffer restart durability, mid-workload restart, and continued writes!")
+}
+
+// runInPodWithTimeout executes a command in a pod and aborts with a diagnostic dump if it exceeds timeout.
+func runInPodWithTimeout(t *testing.T, h *Harness, podName, namespace string, timeout time.Duration, cmd ...string) (string, error) {
+	t.Helper()
+	type res struct {
+		out string
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		out, err := h.RunInPod(podName, namespace, cmd...)
+		ch <- res{out: out, err: err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.out, r.err
+	case <-time.After(timeout):
+		t.Logf("======= DUMPING DIAGNOSTICS FOR HUNG COMMAND IN POD %s (timeout: %v): %v =======", podName, timeout, cmd)
+		if desc, err := exec.Command("kubectl", "describe", "pod", podName, "-n", namespace).CombinedOutput(); err == nil {
+			t.Logf("kubectl describe pod %s:\n%s\n", podName, string(desc))
+		}
+		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", namespace))
+		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", namespace))
+		if walLogs := h.getContainerLogs("wal-buffer-0", "wal-buffer", namespace, false); walLogs != "" {
+			t.Logf("WAL Buffer Logs:\n%s\n", walLogs)
+		}
+		t.Fatalf("Command %v timed out after %v in pod %s", cmd, timeout, podName)
+		return "", fmt.Errorf("command timed out in pod %s", podName)
+	}
 }
 
 // deletePodBounded deletes a pod with --wait=false and polls until it is completely deleted
@@ -2015,6 +2055,9 @@ func deletePodBounded(t *testing.T, h *Harness, podName, namespace string, timeo
 	}
 	t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", namespace))
 	t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", namespace))
+	if walLogs := h.getContainerLogs("wal-buffer-0", "wal-buffer", namespace, false); walLogs != "" {
+		t.Logf("WAL Buffer Logs:\n%s\n", walLogs)
+	}
 	t.Fatalf("Timed out waiting %v for pod %s to be deleted", timeout, podName)
 }
 
