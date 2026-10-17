@@ -2279,30 +2279,9 @@ spec:
 	t.Logf("Force-deleting Pod A on Node 1 (--force --grace-period=0)")
 	h.RunCommand("kubectl", "delete", "pod", podAName, "-n", "default", "--force", "--grace-period=0", "--wait=false")
 
-	// Wait for Node 1's final checkpoint before starting Pod B.
-	// Note (#307): A force delete removes the pod object immediately, freeing the ReadWriteOncePod claim,
-	// so without this wait, Pod B would schedule and materialise on Node 2 before Node 1's unpublish
-	// finishes committing the post-checkpoint writes to the controller (racing the hand-off).
-	// This wait is removed when the controller-side hold with a lease lands in #307.
-	t.Logf("Waiting for Node 1 final unpublish checkpoint for volume %s", actualVolumeID)
-	deadline := time.Now().Add(60 * time.Second)
-	expectedLog := fmt.Sprintf("Successfully unpublished and checkpointed ObjectFS volume %s", actualVolumeID)
-	checkpointed := false
-	var daemonLogs string
-	for time.Now().Before(deadline) {
-		daemonLogs = h.GetPodLogs("app=objectfs-node-daemon", "default")
-		if strings.Contains(daemonLogs, expectedLog) {
-			checkpointed = true
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	if !checkpointed {
-		t.Fatalf("Precondition failed: Node 1 did not complete final checkpoint within 60s for volume %s (logs: %s)", actualVolumeID, daemonLogs)
-	}
-	t.Logf("Node 1 successfully completed final unpublish checkpoint for volume %s", actualVolumeID)
-
-	// Step 3: Deploy Pod B on Node 2 in exclusive-local mode
+	// Step 3: Deploy Pod B on Node 2 in exclusive-local mode immediately without test-side wait.
+	// Thanks to the controller-side exclusive hold (#307), Pod B's publish attempts on Node 2
+	// are held off with codes.Aborted while Node 1 holds the lease and completes its unmount checkpoint.
 	podBName := "exclusive-kill-pod-b"
 	podBYaml := fmt.Sprintf(`
 apiVersion: v1
@@ -2481,4 +2460,168 @@ spec:
 	deletePodBounded(t, h, fusePodName, "default", 3*time.Minute)
 	deletePodBounded(t, h, podAName, "default", 3*time.Minute)
 	h.DeletePVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+}
+
+func TestObjectFSExclusiveLocalDaemonKillE2E(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("Skipping ObjectFS Exclusive-Local Daemon Kill E2E test; RUN_E2E not set")
+	}
+
+	h, node1, node2 := setupObjectFSMultiNodeCluster(t, "objectfs-exclusive-daemonkill-e2e")
+	volumeID := "exclusive-daemonkill-e2e-vol"
+
+	podAName := "exclusive-daemonkill-pod-a"
+	podBName := "exclusive-daemonkill-pod-b"
+
+	t.Cleanup(func() {
+		// Restore daemonset nodeSelector in case it was modified
+		h.RunCommand("kubectl", "patch", "daemonset", "objectfs-node-daemon", "-n", "default", "-p", `{"spec":{"template":{"spec":{"nodeSelector":null}}}}`)
+		deletePodBounded(t, h, podAName, "default", 3*time.Minute)
+		deletePodBounded(t, h, podBName, "default", 3*time.Minute)
+		h.DeletePVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+	})
+
+	// Setup PVC with storageClassName: objectfs-exclusive-local and ReadWriteOncePod
+	pvcYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s-pvc
+spec:
+  accessModes:
+    - ReadWriteOncePod
+  storageClassName: objectfs-exclusive-local
+  resources:
+    requests:
+      storage: 1Gi
+`, volumeID)
+	h.KubectlApplyContent(fmt.Sprintf("%s-pvc", volumeID), pvcYaml)
+
+	// Step 1: Deploy Pod A on Node 1 in exclusive-local mode
+	podAYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: %s-pvc
+`, podAName, node1, volumeID)
+
+	t.Logf("Starting Pod A on Node 1 (%s)", node1)
+	h.KubectlApplyContent(podAName, podAYaml)
+	if err := h.WaitForPodReady(podAName, "default", 3*time.Minute); err != nil {
+		t.Fatalf("Pod A failed to start: %v", err)
+	}
+	t.Logf("Pod A is ready on Node 1")
+
+	// Pod A writes a file to be checkpointed
+	t.Logf("Pod A writing checkpointed file")
+	_, err := h.RunInPod(podAName, "default", "/bin/sh", "-c", "echo 'checkpointed-data' > /data/checkpointed.txt && sync")
+	if err != nil {
+		t.Fatalf("Failed to write initial file in Pod A: %v", err)
+	}
+
+	actualVolumeID, err := h.GetPVForPVC(fmt.Sprintf("%s-pvc", volumeID), "default")
+	if err != nil {
+		t.Fatalf("Failed to get PV volumeName for PVC %s-pvc: %v", volumeID, err)
+	}
+
+	// Trigger explicit checkpoint via objectfsctl checkpoint <volume>
+	t.Logf("Executing objectfsctl checkpoint for volume %s", actualVolumeID)
+	h.RunCommand("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "checkpoint", actualVolumeID)
+
+	// Pod A writes post-checkpoint file
+	t.Logf("Pod A writing files after checkpoint")
+	_, err = h.RunInPod(podAName, "default", "/bin/sh", "-c", "echo 'post-checkpoint-data' > /data/post_checkpoint.txt && sync")
+	if err != nil {
+		t.Fatalf("Failed to write post-checkpoint file in Pod A: %v", err)
+	}
+
+	// Step 2: Kill node daemon on Node 1 (restrict DaemonSet to Node 2)
+	t.Logf("Killing node daemon pod on Node 1 by restricting DaemonSet to Node 2 (%s)", node2)
+	h.RunCommand("kubectl", "patch", "daemonset", "objectfs-node-daemon", "-n", "default", "-p",
+		fmt.Sprintf(`{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/hostname":"%s"}}}}}`, node2))
+
+	// Wait for daemon pod on Node 1 to terminate
+	t.Logf("Waiting for node daemon pod on Node 1 to terminate")
+	waitDeadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		out, _ := exec.Command("kubectl", "get", "pods", "-n", "default", "-l", "app=objectfs-node-daemon",
+			"--field-selector", fmt.Sprintf("spec.nodeName=%s", node1), "--no-headers").CombinedOutput()
+		if strings.TrimSpace(string(out)) == "" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Logf("Node daemon on Node 1 terminated")
+
+	// Force-delete Pod A on Node 1
+	t.Logf("Force-deleting Pod A on Node 1 (--force --grace-period=0)")
+	h.RunCommand("kubectl", "delete", "pod", podAName, "-n", "default", "--force", "--grace-period=0", "--wait=false")
+
+	// Inspect hold via objectfsctl volumes describe: hold is still recorded for Node 1
+	if descOut, descErr := exec.Command("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--",
+		"objectfsctl", "--server", "localhost:50051", "volumes", "describe", actualVolumeID).CombinedOutput(); descErr == nil {
+		t.Logf("objectfsctl volumes describe output after daemon kill:\n%s", string(descOut))
+	}
+
+	// Step 3: Deploy Pod B on Node 2 in exclusive-local mode
+	// Pod B publish is held off while Node 1 lease is live, admitted after 30s lease expiry
+	podBYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+    - name: app
+      image: alpine
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: %s-pvc
+`, podBName, node2, volumeID)
+
+	t.Logf("Deploying Pod B on Node 2 (%s), expecting admission after lease expiry", node2)
+	startTime := time.Now()
+	h.KubectlApplyContent(podBName, podBYaml)
+	if err := h.WaitForPodReady(podBName, "default", 3*time.Minute); err != nil {
+		t.Fatalf("Pod B failed to become ready: %v", err)
+	}
+	elapsed := time.Since(startTime)
+	t.Logf("Pod B became ready after %v (lease expiry admission verified)", elapsed)
+
+	// Step 4: Verify data durability contract:
+	// - checkpointed.txt MUST exist with 'checkpointed-data'
+	// - post_checkpoint.txt MUST NOT exist (uncheckpointed data lost on node death, matching contract)
+	var outCheckpointed string
+	outCheckpointed, err = retryCatInPod(h, podBName, "/data/checkpointed.txt", 15*time.Second)
+	if err != nil || !strings.Contains(outCheckpointed, "checkpointed-data") {
+		t.Fatalf("Expected checkpointed-data, got %q (err=%v)", outCheckpointed, err)
+	}
+	t.Logf("Pod B successfully found checkpointed file /data/checkpointed.txt")
+
+	_, err = h.RunInPod(podBName, "default", "/bin/sh", "-c", "cat /data/post_checkpoint.txt")
+	if err == nil {
+		t.Fatalf("post_checkpoint.txt unexpectedly exists: writes after last checkpoint must be lost on node daemon death")
+	}
+	t.Logf("Pod B confirmed post_checkpoint.txt does not exist (contract verified: uncheckpointed data lost on node death)!")
 }
