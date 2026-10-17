@@ -33,35 +33,39 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ObjectFSController_GetAttr_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/GetAttr"
-	ObjectFSController_SetAttr_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/SetAttr"
-	ObjectFSController_Lookup_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/Lookup"
-	ObjectFSController_ReadDir_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/ReadDir"
-	ObjectFSController_Mkdir_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Mkdir"
-	ObjectFSController_CreateFile_FullMethodName     = "/objectfs.v1alpha1.ObjectFSController/CreateFile"
-	ObjectFSController_ReadFile_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/ReadFile"
-	ObjectFSController_WriteFile_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/WriteFile"
-	ObjectFSController_TruncateFile_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/TruncateFile"
-	ObjectFSController_PunchHole_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/PunchHole"
-	ObjectFSController_Unlink_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/Unlink"
-	ObjectFSController_Rmdir_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Rmdir"
-	ObjectFSController_Rename_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/Rename"
-	ObjectFSController_Fsync_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Fsync"
-	ObjectFSController_WatchVolume_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/WatchVolume"
-	ObjectFSController_Symlink_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/Symlink"
-	ObjectFSController_Readlink_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/Readlink"
-	ObjectFSController_Link_FullMethodName           = "/objectfs.v1alpha1.ObjectFSController/Link"
-	ObjectFSController_Open_FullMethodName           = "/objectfs.v1alpha1.ObjectFSController/Open"
-	ObjectFSController_Release_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/Release"
-	ObjectFSController_ListBlobs_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/ListBlobs"
-	ObjectFSController_GetBlob_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/GetBlob"
-	ObjectFSController_GetManifest_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/GetManifest"
-	ObjectFSController_ListVolumes_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/ListVolumes"
-	ObjectFSController_ListSnapshots_FullMethodName  = "/objectfs.v1alpha1.ObjectFSController/ListSnapshots"
-	ObjectFSController_CreateSnapshot_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/CreateSnapshot"
-	ObjectFSController_GetVolumeStats_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/GetVolumeStats"
-	ObjectFSController_Checkpoint_FullMethodName     = "/objectfs.v1alpha1.ObjectFSController/Checkpoint"
-	ObjectFSController_AckCheckpoint_FullMethodName  = "/objectfs.v1alpha1.ObjectFSController/AckCheckpoint"
+	ObjectFSController_GetAttr_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/GetAttr"
+	ObjectFSController_SetAttr_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/SetAttr"
+	ObjectFSController_Lookup_FullMethodName           = "/objectfs.v1alpha1.ObjectFSController/Lookup"
+	ObjectFSController_ReadDir_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/ReadDir"
+	ObjectFSController_Mkdir_FullMethodName            = "/objectfs.v1alpha1.ObjectFSController/Mkdir"
+	ObjectFSController_CreateFile_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/CreateFile"
+	ObjectFSController_ReadFile_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/ReadFile"
+	ObjectFSController_WriteFile_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/WriteFile"
+	ObjectFSController_TruncateFile_FullMethodName     = "/objectfs.v1alpha1.ObjectFSController/TruncateFile"
+	ObjectFSController_PunchHole_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/PunchHole"
+	ObjectFSController_Unlink_FullMethodName           = "/objectfs.v1alpha1.ObjectFSController/Unlink"
+	ObjectFSController_Rmdir_FullMethodName            = "/objectfs.v1alpha1.ObjectFSController/Rmdir"
+	ObjectFSController_Rename_FullMethodName           = "/objectfs.v1alpha1.ObjectFSController/Rename"
+	ObjectFSController_Fsync_FullMethodName            = "/objectfs.v1alpha1.ObjectFSController/Fsync"
+	ObjectFSController_WatchVolume_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/WatchVolume"
+	ObjectFSController_Symlink_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Symlink"
+	ObjectFSController_Readlink_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/Readlink"
+	ObjectFSController_Link_FullMethodName             = "/objectfs.v1alpha1.ObjectFSController/Link"
+	ObjectFSController_Open_FullMethodName             = "/objectfs.v1alpha1.ObjectFSController/Open"
+	ObjectFSController_Release_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Release"
+	ObjectFSController_ListBlobs_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/ListBlobs"
+	ObjectFSController_GetBlob_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/GetBlob"
+	ObjectFSController_GetManifest_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/GetManifest"
+	ObjectFSController_ListVolumes_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/ListVolumes"
+	ObjectFSController_ListSnapshots_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/ListSnapshots"
+	ObjectFSController_CreateSnapshot_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/CreateSnapshot"
+	ObjectFSController_GetVolumeStats_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/GetVolumeStats"
+	ObjectFSController_Checkpoint_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/Checkpoint"
+	ObjectFSController_AckCheckpoint_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/AckCheckpoint"
+	ObjectFSController_AcquireExclusive_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/AcquireExclusive"
+	ObjectFSController_RenewExclusive_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/RenewExclusive"
+	ObjectFSController_ReleaseExclusive_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/ReleaseExclusive"
+	ObjectFSController_GetExclusiveHold_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/GetExclusiveHold"
 )
 
 // ObjectFSControllerClient is the client API for ObjectFSController service.
@@ -101,6 +105,14 @@ type ObjectFSControllerClient interface {
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
 	// AckCheckpoint acknowledges completion of an explicit checkpoint by a node daemon.
 	AckCheckpoint(ctx context.Context, in *AckCheckpointRequest, opts ...grpc.CallOption) (*AckCheckpointResponse, error)
+	// AcquireExclusive acquires an exclusive-local hold for a volume on a specific node and mount.
+	AcquireExclusive(ctx context.Context, in *AcquireExclusiveRequest, opts ...grpc.CallOption) (*AcquireExclusiveResponse, error)
+	// RenewExclusive renews an active exclusive-local hold for a volume, extending its lease.
+	RenewExclusive(ctx context.Context, in *RenewExclusiveRequest, opts ...grpc.CallOption) (*RenewExclusiveResponse, error)
+	// ReleaseExclusive releases an exclusive-local hold after final checkpoint completion.
+	ReleaseExclusive(ctx context.Context, in *ReleaseExclusiveRequest, opts ...grpc.CallOption) (*ReleaseExclusiveResponse, error)
+	// GetExclusiveHold returns the current exclusive hold status for a volume.
+	GetExclusiveHold(ctx context.Context, in *GetExclusiveHoldRequest, opts ...grpc.CallOption) (*GetExclusiveHoldResponse, error)
 }
 
 type objectFSControllerClient struct {
@@ -419,6 +431,46 @@ func (c *objectFSControllerClient) AckCheckpoint(ctx context.Context, in *AckChe
 	return out, nil
 }
 
+func (c *objectFSControllerClient) AcquireExclusive(ctx context.Context, in *AcquireExclusiveRequest, opts ...grpc.CallOption) (*AcquireExclusiveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AcquireExclusiveResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_AcquireExclusive_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) RenewExclusive(ctx context.Context, in *RenewExclusiveRequest, opts ...grpc.CallOption) (*RenewExclusiveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RenewExclusiveResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_RenewExclusive_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) ReleaseExclusive(ctx context.Context, in *ReleaseExclusiveRequest, opts ...grpc.CallOption) (*ReleaseExclusiveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseExclusiveResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_ReleaseExclusive_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) GetExclusiveHold(ctx context.Context, in *GetExclusiveHoldRequest, opts ...grpc.CallOption) (*GetExclusiveHoldResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetExclusiveHoldResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_GetExclusiveHold_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ObjectFSControllerServer is the server API for ObjectFSController service.
 // All implementations must embed UnimplementedObjectFSControllerServer
 // for forward compatibility.
@@ -456,6 +508,14 @@ type ObjectFSControllerServer interface {
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
 	// AckCheckpoint acknowledges completion of an explicit checkpoint by a node daemon.
 	AckCheckpoint(context.Context, *AckCheckpointRequest) (*AckCheckpointResponse, error)
+	// AcquireExclusive acquires an exclusive-local hold for a volume on a specific node and mount.
+	AcquireExclusive(context.Context, *AcquireExclusiveRequest) (*AcquireExclusiveResponse, error)
+	// RenewExclusive renews an active exclusive-local hold for a volume, extending its lease.
+	RenewExclusive(context.Context, *RenewExclusiveRequest) (*RenewExclusiveResponse, error)
+	// ReleaseExclusive releases an exclusive-local hold after final checkpoint completion.
+	ReleaseExclusive(context.Context, *ReleaseExclusiveRequest) (*ReleaseExclusiveResponse, error)
+	// GetExclusiveHold returns the current exclusive hold status for a volume.
+	GetExclusiveHold(context.Context, *GetExclusiveHoldRequest) (*GetExclusiveHoldResponse, error)
 	mustEmbedUnimplementedObjectFSControllerServer()
 }
 
@@ -552,6 +612,18 @@ func (UnimplementedObjectFSControllerServer) Checkpoint(context.Context, *Checkp
 }
 func (UnimplementedObjectFSControllerServer) AckCheckpoint(context.Context, *AckCheckpointRequest) (*AckCheckpointResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AckCheckpoint not implemented")
+}
+func (UnimplementedObjectFSControllerServer) AcquireExclusive(context.Context, *AcquireExclusiveRequest) (*AcquireExclusiveResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AcquireExclusive not implemented")
+}
+func (UnimplementedObjectFSControllerServer) RenewExclusive(context.Context, *RenewExclusiveRequest) (*RenewExclusiveResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RenewExclusive not implemented")
+}
+func (UnimplementedObjectFSControllerServer) ReleaseExclusive(context.Context, *ReleaseExclusiveRequest) (*ReleaseExclusiveResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReleaseExclusive not implemented")
+}
+func (UnimplementedObjectFSControllerServer) GetExclusiveHold(context.Context, *GetExclusiveHoldRequest) (*GetExclusiveHoldResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetExclusiveHold not implemented")
 }
 func (UnimplementedObjectFSControllerServer) mustEmbedUnimplementedObjectFSControllerServer() {}
 func (UnimplementedObjectFSControllerServer) testEmbeddedByValue()                            {}
@@ -1082,6 +1154,78 @@ func _ObjectFSController_AckCheckpoint_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ObjectFSController_AcquireExclusive_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcquireExclusiveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).AcquireExclusive(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_AcquireExclusive_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).AcquireExclusive(ctx, req.(*AcquireExclusiveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_RenewExclusive_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewExclusiveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).RenewExclusive(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_RenewExclusive_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).RenewExclusive(ctx, req.(*RenewExclusiveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_ReleaseExclusive_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseExclusiveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).ReleaseExclusive(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_ReleaseExclusive_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).ReleaseExclusive(ctx, req.(*ReleaseExclusiveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_GetExclusiveHold_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetExclusiveHoldRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).GetExclusiveHold(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_GetExclusiveHold_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).GetExclusiveHold(ctx, req.(*GetExclusiveHoldRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ObjectFSController_ServiceDesc is the grpc.ServiceDesc for ObjectFSController service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1196,6 +1340,22 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AckCheckpoint",
 			Handler:    _ObjectFSController_AckCheckpoint_Handler,
+		},
+		{
+			MethodName: "AcquireExclusive",
+			Handler:    _ObjectFSController_AcquireExclusive_Handler,
+		},
+		{
+			MethodName: "RenewExclusive",
+			Handler:    _ObjectFSController_RenewExclusive_Handler,
+		},
+		{
+			MethodName: "ReleaseExclusive",
+			Handler:    _ObjectFSController_ReleaseExclusive_Handler,
+		},
+		{
+			MethodName: "GetExclusiveHold",
+			Handler:    _ObjectFSController_GetExclusiveHold_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

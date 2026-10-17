@@ -55,6 +55,14 @@ service ObjectFSController {
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
   // AckCheckpoint acknowledges completion of an explicit checkpoint by a node daemon.
   rpc AckCheckpoint(AckCheckpointRequest) returns (AckCheckpointResponse);
+  // AcquireExclusive acquires an exclusive-local hold for a volume on a specific node and mount.
+  rpc AcquireExclusive(AcquireExclusiveRequest) returns (AcquireExclusiveResponse);
+  // RenewExclusive renews an active exclusive-local hold for a volume, extending its lease.
+  rpc RenewExclusive(RenewExclusiveRequest) returns (RenewExclusiveResponse);
+  // ReleaseExclusive releases an exclusive-local hold after final checkpoint completion.
+  rpc ReleaseExclusive(ReleaseExclusiveRequest) returns (ReleaseExclusiveResponse);
+  // GetExclusiveHold returns the current exclusive hold status for a volume.
+  rpc GetExclusiveHold(GetExclusiveHoldRequest) returns (GetExclusiveHoldResponse);
 }
 
 enum WriteMode {
@@ -472,6 +480,51 @@ message AckCheckpointRequest {
 
 message AckCheckpointResponse {
   int32 error = 1;
+}
+
+message ExclusiveHold {
+  string volume_id = 1;
+  string node_id = 2;
+  string mount_id = 3;
+  google.protobuf.Timestamp acquired_at = 4;
+  google.protobuf.Timestamp lease_expiry = 5;
+}
+
+message AcquireExclusiveRequest {
+  string volume_id = 1;
+  string node_id = 2;
+  string mount_id = 3;
+}
+
+message AcquireExclusiveResponse {
+  ExclusiveHold hold = 1;
+}
+
+message RenewExclusiveRequest {
+  string volume_id = 1;
+  string node_id = 2;
+  string mount_id = 3;
+}
+
+message RenewExclusiveResponse {
+  ExclusiveHold hold = 1;
+}
+
+message ReleaseExclusiveRequest {
+  string volume_id = 1;
+  string node_id = 2;
+  string mount_id = 3;
+}
+
+message ReleaseExclusiveResponse {
+}
+
+message GetExclusiveHoldRequest {
+  string volume_id = 1;
+}
+
+message GetExclusiveHoldResponse {
+  ExclusiveHold hold = 1;
 }
 
 message Inode {
