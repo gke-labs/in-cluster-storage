@@ -24,80 +24,192 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+var (
+	sharedSingleNodeClusterOnce sync.Once
+	sharedSingleNodeErr         error
+)
+
+const sharedSingleNodeClusterName = "objectfs-shared-single"
+
+func buildAndLoadE2EImages(h *Harness, gitRoot string) {
+	h.DockerBuild("objectfs-controller:e2e", filepath.Join(gitRoot, "images/objectfs-controller/Dockerfile"), gitRoot)
+	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(gitRoot, "images/objectfs-node-daemon/Dockerfile"), gitRoot)
+	h.DockerBuild("wal-buffer:e2e", filepath.Join(gitRoot, "images/wal-buffer/Dockerfile"), gitRoot)
+	h.DockerBuild("fakes3:e2e", filepath.Join(gitRoot, "fakes3/images/fakes3/Dockerfile"), filepath.Join(gitRoot, "fakes3"))
+
+	h.KindLoad("objectfs-controller:e2e")
+	h.KindLoad("objectfs-node-daemon:e2e")
+	h.KindLoad("wal-buffer:e2e")
+	h.KindLoad("fakes3:e2e")
+}
+
+func setupSharedObjectFSCluster(t *testing.T) (*Harness, string) {
+	t.Helper()
+
+	sharedSingleNodeClusterOnce.Do(func() {
+		// Clean up any stale cluster from a previous aborted local run
+		if out, err := exec.Command("kind", "delete", "cluster", "--name", sharedSingleNodeClusterName).CombinedOutput(); err != nil {
+			t.Logf("Note: clean up existing cluster %s returned: %v (%s)", sharedSingleNodeClusterName, err, strings.TrimSpace(string(out)))
+		}
+
+		cmd := exec.Command("kind", "create", "cluster", "--name", sharedSingleNodeClusterName)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			sharedSingleNodeErr = fmt.Errorf("failed to create kind cluster %s: %w\n%s", sharedSingleNodeClusterName, err, strings.TrimSpace(string(out)))
+			return
+		}
+
+		if out, err := exec.Command("kind", "export", "kubeconfig", "--name", sharedSingleNodeClusterName).CombinedOutput(); err != nil {
+			sharedSingleNodeErr = fmt.Errorf("failed to export kubeconfig for %s: %w (%s)", sharedSingleNodeClusterName, err, strings.TrimSpace(string(out)))
+			return
+		}
+
+		initH := NewHarness(t, sharedSingleNodeClusterName)
+		gitRoot := initH.GetGitRoot()
+
+		// Build and load all E2E images into kind
+		buildAndLoadE2EImages(initH, gitRoot)
+
+		// Deploy FakeS3 backing object storage in default namespace
+		fakes3Manifest := `
+apiVersion: v1
+kind: Service
+metadata:
+  name: fakes3
+  namespace: default
+spec:
+  ports:
+    - port: 9000
+      targetPort: 9000
+  selector:
+    app: fakes3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fakes3
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fakes3
+  template:
+    metadata:
+      labels:
+        app: fakes3
+    spec:
+      containers:
+        - name: fakes3
+          image: fakes3:e2e
+          imagePullPolicy: Never
+          args: ["--listen=0.0.0.0:9000", "--buckets=objectfs-bucket", "--quiet"]
+          ports:
+            - containerPort: 9000
+`
+		initH.KubectlApplyContent("fakes3", fakes3Manifest)
+		if err := initH.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
+			sharedSingleNodeErr = fmt.Errorf("fakes3 deployment failed to start: %w", err)
+			return
+		}
+
+		s3BackendURL := "s3://objectfs-bucket?endpoint=http://fakes3:9000&region=us-east-1&s3ForcePathStyle=true"
+
+		// Read and adapt ObjectFS manifest with S3 backend
+		objectfsManifestPath := filepath.Join(gitRoot, "k8s/objectfs.yaml")
+		b, err := os.ReadFile(objectfsManifestPath)
+		if err != nil {
+			sharedSingleNodeErr = fmt.Errorf("failed to read objectfs manifest: %w", err)
+			return
+		}
+		objectfsManifest := string(b)
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
+
+		awsEnvController := `env:
+            - name: AWS_ACCESS_KEY_ID
+              value: "fakes3"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "fakes3"
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: OBJECT_STORAGE_BACKEND`
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvController)
+
+		// Read and adapt WAL buffer manifest
+		walManifestPath := filepath.Join(gitRoot, "k8s/wal.yaml")
+		b, err = os.ReadFile(walManifestPath)
+		if err != nil {
+			sharedSingleNodeErr = fmt.Errorf("failed to read wal manifest: %w", err)
+			return
+		}
+		walManifest := string(b)
+		walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
+		walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
+
+		awsEnvWAL := `env:
+            - name: AWS_ACCESS_KEY_ID
+              value: "fakes3"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "fakes3"
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: OBJECT_STORAGE_BACKEND`
+		walManifest = strings.ReplaceAll(walManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvWAL)
+
+		initH.KubectlApplyContent("wal-buffer", walManifest)
+		initH.KubectlApplyContent("objectfs", objectfsManifest)
+
+		if err := initH.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
+			sharedSingleNodeErr = fmt.Errorf("wal-buffer failed to start: %w", err)
+			return
+		}
+		if err := initH.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
+			sharedSingleNodeErr = fmt.Errorf("objectfs-controller failed to start: %w", err)
+			return
+		}
+		if err := initH.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
+			sharedSingleNodeErr = fmt.Errorf("objectfs-node-daemon failed to start: %w", err)
+			return
+		}
+	})
+
+	if sharedSingleNodeErr != nil {
+		t.Fatalf("setupSharedObjectFSCluster failed: %v", sharedSingleNodeErr)
+	}
+
+	h := NewHarness(t, sharedSingleNodeClusterName)
+	h.TrackNamespace("default")
+
+	// Ensure system statefulsets are back and healthy before the test begins
+	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
+		t.Fatalf("WAL buffer not ready: %v", err)
+	}
+	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
+		t.Fatalf("ObjectFS controller not ready: %v", err)
+	}
+	if err := h.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
+		t.Fatalf("ObjectFS node daemon not ready: %v", err)
+	}
+
+	ns := h.CreateTestNamespace("objectfs-test")
+
+	return h, ns
+}
 
 func TestObjectFSE2E(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
 		t.Skip("Skipping ObjectFS E2E test; RUN_E2E not set")
 	}
 
-	h := NewHarness(t, "objectfs-e2e")
-	h.Setup()
-	t.Cleanup(func() {
-		if t.Failed() {
-			h.DumpDiagnosticLogs(t)
-		}
-	})
-
-	gitRoot := h.GetGitRoot()
-	experimentRoot := gitRoot
-
-	// Build docker images
-	h.DockerBuild("objectfs-controller:e2e", filepath.Join(experimentRoot, "images/objectfs-controller/Dockerfile"), experimentRoot)
-	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/objectfs-node-daemon/Dockerfile"), experimentRoot)
-	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
-
-	// Load images into Kind
-	h.KindLoad("objectfs-controller:e2e")
-	h.KindLoad("objectfs-node-daemon:e2e")
-	h.KindLoad("wal-buffer:e2e")
-
-	// Read and adapt manifests
-	manifestPath := filepath.Join(experimentRoot, "k8s/objectfs.yaml")
-	b, err := os.ReadFile(manifestPath)
-	if err != nil {
-		t.Fatalf("Failed to read manifest: %v", err)
-	}
-	manifest := string(b)
-	manifest = strings.ReplaceAll(manifest, "namespace: kube-objectfs-system", "namespace: default")
-	manifest = strings.ReplaceAll(manifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, `backend: ""`, `backend: "memory://"`)
-
-	walManifestPath := filepath.Join(experimentRoot, "k8s/wal.yaml")
-	walB, err := os.ReadFile(walManifestPath)
-	if err != nil {
-		t.Fatalf("Failed to read wal manifest: %v", err)
-	}
-	walManifest := string(walB)
-	walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
-	walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
-
-	// Apply WAL buffer and ObjectFS CSI driver / controller
-	h.KubectlApplyContent("wal-buffer", walManifest)
-	h.KubectlApplyContent("objectfs", manifest)
-
-	// Wait for wal-buffer
-	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("WAL Buffer failed to start: %v", err)
-	}
-
-	// Wait for controller
-	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("ObjectFS Controller failed to start: %v", err)
-	}
-
-	// Wait for node-daemon
-	if err := h.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("ObjectFS Node Daemon failed to start: %v", err)
-	}
-
-	volumeID := "objectfs-test-vol"
+	h, ns := setupSharedObjectFSCluster(t)
+	volumeID := fmt.Sprintf("objectfs-test-vol-%s", ns)
 
 	// Step 1: Run Pod 1 that writes a file
 	pod1Name := "objectfs-pod-1"
@@ -106,6 +218,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: %s
+  namespace: %s
 spec:
   restartPolicy: Never
   containers:
@@ -121,19 +234,19 @@ spec:
         driver: objectfs.labs.gke.io
         volumeAttributes:
           volumeID: %s
-`, pod1Name, volumeID)
+`, pod1Name, ns, volumeID)
 
-	t.Logf("Creating Pod 1")
+	t.Logf("Creating Pod 1 in namespace %s", ns)
 	h.KubectlApplyContent(pod1Name, pod1Yaml)
-	if err := h.WaitForPodReady(pod1Name, "default", 1*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+	if err := h.WaitForPodReady(pod1Name, ns, 1*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents(ns))
 		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
 		t.Fatalf("Test Pod 1 failed to start: %v", err)
 	}
 
 	time.Sleep(5 * time.Second)
 	t.Logf("Deleting Pod 1")
-	h.DeletePod(pod1Name, "default")
+	h.DeletePod(pod1Name, ns)
 
 	// Step 2: Start Pod 2, read the file, verify content, create subdir and second file
 	pod2Name := "objectfs-pod-2"
@@ -142,6 +255,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: %s
+  namespace: %s
 spec:
   restartPolicy: Never
   containers:
@@ -157,23 +271,23 @@ spec:
         driver: objectfs.labs.gke.io
         volumeAttributes:
           volumeID: %s
-`, pod2Name, volumeID)
+`, pod2Name, ns, volumeID)
 
-	t.Logf("Creating Pod 2")
+	t.Logf("Creating Pod 2 in namespace %s", ns)
 	h.KubectlApplyContent(pod2Name, pod2Yaml)
-	if err := h.WaitForPodReady(pod2Name, "default", 1*time.Minute); err != nil {
+	if err := h.WaitForPodReady(pod2Name, ns, 1*time.Minute); err != nil {
 		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
 		t.Fatalf("Test Pod 2 failed to start: %v", err)
 	}
 
 	time.Sleep(5 * time.Second)
-	logs2 := h.GetPodLogsByName(pod2Name, "default")
+	logs2 := h.GetPodLogsByName(pod2Name, ns)
 	if !strings.Contains(logs2, "hello objectfs") {
 		t.Logf("Pod 2 Logs:\n%s\n", logs2)
 		t.Fatalf("Pod 2 did not see 'hello objectfs'")
 	}
 	t.Logf("Pod 2 verified, deleting")
-	h.DeletePod(pod2Name, "default")
+	h.DeletePod(pod2Name, ns)
 
 	// Step 3: Start Pod 3 to verify updated file and nested directory
 	pod3Name := "objectfs-pod-3"
@@ -182,6 +296,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: %s
+  namespace: %s
 spec:
   containers:
     - name: app
@@ -196,15 +311,15 @@ spec:
         driver: objectfs.labs.gke.io
         volumeAttributes:
           volumeID: %s
-`, pod3Name, volumeID)
+`, pod3Name, ns, volumeID)
 
-	t.Logf("Creating Pod 3")
+	t.Logf("Creating Pod 3 in namespace %s", ns)
 	h.KubectlApplyContent(pod3Name, pod3Yaml)
-	if err := h.WaitForPodReady(pod3Name, "default", 1*time.Minute); err != nil {
+	if err := h.WaitForPodReady(pod3Name, ns, 1*time.Minute); err != nil {
 		t.Fatalf("Test Pod 3 failed to start: %v", err)
 	}
 
-	out1, err := h.RunInPod(pod3Name, "default", "cat", "/data/hello.txt")
+	out1, err := h.RunInPod(pod3Name, ns, "cat", "/data/hello.txt")
 	if err != nil {
 		t.Fatalf("Failed to read hello.txt in Pod 3: %v", err)
 	}
@@ -212,7 +327,7 @@ spec:
 		t.Fatalf("Expected hello.txt content 'updated objectfs', got: %s", out1)
 	}
 
-	out2, err := h.RunInPod(pod3Name, "default", "cat", "/data/nested/data.txt")
+	out2, err := h.RunInPod(pod3Name, ns, "cat", "/data/nested/data.txt")
 	if err != nil {
 		t.Fatalf("Failed to read nested/data.txt in Pod 3: %v", err)
 	}
@@ -220,7 +335,7 @@ spec:
 		t.Fatalf("Expected nested/data.txt content 'nested data', got: %s", out2)
 	}
 
-	h.DeletePod(pod3Name, "default")
+	h.DeletePod(pod3Name, ns)
 	t.Logf("Successfully verified ObjectFS multi-writer FUSE CSI driver!")
 }
 
@@ -229,76 +344,15 @@ func TestObjectFSStatefulSetE2E(t *testing.T) {
 		t.Skip("Skipping ObjectFS StatefulSet E2E test; RUN_E2E not set")
 	}
 
-	h := NewHarness(t, "objectfs-statefulset-e2e")
-	h.Setup()
-	t.Cleanup(func() {
-		if t.Failed() {
-			h.DumpDiagnosticLogs(t)
-		}
-	})
-
-	gitRoot := h.GetGitRoot()
-	experimentRoot := gitRoot
-
-	// Build docker images
-	h.DockerBuild("objectfs-controller:e2e", filepath.Join(experimentRoot, "images/objectfs-controller/Dockerfile"), experimentRoot)
-	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/objectfs-node-daemon/Dockerfile"), experimentRoot)
-	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
-
-	// Load images into Kind
-	h.KindLoad("objectfs-controller:e2e")
-	h.KindLoad("objectfs-node-daemon:e2e")
-	h.KindLoad("wal-buffer:e2e")
-
-	// Read and adapt manifests
-	manifestPath := filepath.Join(experimentRoot, "k8s/objectfs.yaml")
-	b, err := os.ReadFile(manifestPath)
-	if err != nil {
-		t.Fatalf("Failed to read manifest: %v", err)
-	}
-	manifest := string(b)
-	manifest = strings.ReplaceAll(manifest, "namespace: kube-objectfs-system", "namespace: default")
-	manifest = strings.ReplaceAll(manifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, `backend: ""`, `backend: "memory://"`)
-
-	walManifestPath := filepath.Join(experimentRoot, "k8s/wal.yaml")
-	walB, err := os.ReadFile(walManifestPath)
-	if err != nil {
-		t.Fatalf("Failed to read wal manifest: %v", err)
-	}
-	walManifest := string(walB)
-	walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
-	walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
-
-	// Apply WAL buffer and ObjectFS CSI driver / controller
-	h.KubectlApplyContent("wal-buffer", walManifest)
-	h.KubectlApplyContent("objectfs", manifest)
-
-	// Wait for wal-buffer
-	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("WAL Buffer failed to start: %v", err)
-	}
-
-	// Wait for controller
-	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("ObjectFS Controller failed to start: %v", err)
-	}
-
-	// Wait for node-daemon
-	if err := h.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("ObjectFS Node Daemon failed to start: %v", err)
-	}
+	h, ns := setupSharedObjectFSCluster(t)
 
 	// Deploy StatefulSet with Dynamic Volume Provisioning via StorageClass
-	statefulSetYaml := `
+	statefulSetYaml := fmt.Sprintf(`
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: dev-vscode
+  namespace: %s
 data:
   settings.json: |
     {
@@ -309,6 +363,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: dev-vscode
+  namespace: %s
 type: Opaque
 data:
   password: cGFzc3dvcmQ=
@@ -317,6 +372,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: dev-vscode
+  namespace: %s
 spec:
   ports:
     - port: 80
@@ -328,6 +384,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: dev-vscode
+  namespace: %s
 spec:
   serviceName: dev-vscode
   replicas: 1
@@ -371,14 +428,15 @@ spec:
         resources:
           requests:
             storage: 10Gi
-`
-	t.Logf("Applying VSCode StatefulSet with ObjectFS StorageClass")
+`, ns, ns, ns, ns)
+
+	t.Logf("Applying VSCode StatefulSet with ObjectFS StorageClass in namespace %s", ns)
 	h.KubectlApplyContent("dev-vscode", statefulSetYaml)
 
 	podName := "dev-vscode-0"
 	t.Logf("Waiting for StatefulSet pod %s to be ready", podName)
-	if err := h.WaitForPodReady(podName, "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+	if err := h.WaitForPodReady(podName, ns, 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents(ns))
 		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
 		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
 		t.Fatalf("StatefulSet pod %s failed to start: %v", podName, err)
@@ -386,13 +444,13 @@ spec:
 
 	// Step 1: Write a file via kubectl exec inside the pod
 	t.Logf("Writing data inside %s", podName)
-	_, err = h.RunInPod(podName, "default", "/bin/sh", "-c", "echo 'hello from vscode statefulset' > /vscode-server/workspace/test.txt && sync")
+	_, err := h.RunInPod(podName, ns, "/bin/sh", "-c", "echo 'hello from vscode statefulset' > /vscode-server/workspace/test.txt && sync")
 	if err != nil {
 		t.Fatalf("Failed to write test.txt in %s: %v", podName, err)
 	}
 
 	// Verify the file can be read back
-	out, err := h.RunInPod(podName, "default", "cat", "/vscode-server/workspace/test.txt")
+	out, err := h.RunInPod(podName, ns, "cat", "/vscode-server/workspace/test.txt")
 	if err != nil {
 		t.Fatalf("Failed to read test.txt in %s: %v", podName, err)
 	}
@@ -402,17 +460,17 @@ spec:
 
 	// Step 2: Delete the pod and verify persistence across StatefulSet pod recreation
 	t.Logf("Deleting pod %s to test data persistence", podName)
-	h.DeletePod(podName, "default")
+	h.DeletePod(podName, ns)
 
 	t.Logf("Waiting for recreated pod %s to be ready", podName)
-	if err := h.WaitForPodReady(podName, "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+	if err := h.WaitForPodReady(podName, ns, 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents(ns))
 		t.Fatalf("Recreated pod %s failed to become ready: %v", podName, err)
 	}
 
 	// Verify persisted data after recreation
 	t.Logf("Reading data from recreated pod %s", podName)
-	outAfterRestart, err := h.RunInPod(podName, "default", "cat", "/vscode-server/workspace/test.txt")
+	outAfterRestart, err := h.RunInPod(podName, ns, "cat", "/vscode-server/workspace/test.txt")
 	if err != nil {
 		t.Fatalf("Failed to read test.txt after recreation in %s: %v", podName, err)
 	}
@@ -423,24 +481,24 @@ spec:
 	// Step 3: Delete StatefulSet, pod, and PVC, and verify that the PV is deleted by csi-provisioner
 	t.Logf("Verifying PV cleanup upon PVC deletion")
 	pvcName := "dev-vscode-data-" + podName
-	pvName, err := h.GetPVForPVC(pvcName, "default")
+	pvName, err := h.GetPVForPVC(pvcName, ns)
 	if err != nil {
 		t.Fatalf("Failed to get PV for PVC %s: %v", pvcName, err)
 	}
 	t.Logf("Discovered bound PV %s for PVC %s", pvName, pvcName)
 
 	t.Logf("Deleting StatefulSet dev-vscode")
-	h.DeleteStatefulSet("dev-vscode", "default")
+	h.DeleteStatefulSet("dev-vscode", ns)
 
 	t.Logf("Deleting Pod %s", podName)
-	h.DeletePod(podName, "default")
+	h.DeletePod(podName, ns)
 
 	t.Logf("Deleting PVC %s", pvcName)
-	h.DeletePVC(pvcName, "default")
+	h.DeletePVC(pvcName, ns)
 
 	t.Logf("Waiting for PV %s to disappear", pvName)
 	if err := h.WaitForPVDeleted(pvName, 60*time.Second); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Logf("Events:\n%s\n", h.GetEvents(ns))
 		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
 		t.Fatalf("PersistentVolume %s failed to be deleted: %v", pvName, err)
 	}
@@ -453,140 +511,8 @@ func TestObjectFSPersistentE2E(t *testing.T) {
 		t.Skip("Skipping ObjectFS Persistent E2E test; RUN_E2E not set")
 	}
 
-	h := NewHarness(t, "objectfs-persistent-e2e")
-	h.Setup()
-	t.Cleanup(func() {
-		if t.Failed() {
-			h.DumpDiagnosticLogs(t)
-		}
-	})
-
-	gitRoot := h.GetGitRoot()
-	experimentRoot := gitRoot
-
-	// Build docker images
-	h.DockerBuild("objectfs-controller:e2e", filepath.Join(experimentRoot, "images/objectfs-controller/Dockerfile"), experimentRoot)
-	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/objectfs-node-daemon/Dockerfile"), experimentRoot)
-	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
-	h.DockerBuild("fakes3:e2e", filepath.Join(experimentRoot, "fakes3/images/fakes3/Dockerfile"), filepath.Join(experimentRoot, "fakes3"))
-
-	// Load images into Kind
-	h.KindLoad("objectfs-controller:e2e")
-	h.KindLoad("objectfs-node-daemon:e2e")
-	h.KindLoad("wal-buffer:e2e")
-	h.KindLoad("fakes3:e2e")
-
-	// Deploy FakeS3 service & deployment in default namespace
-	fakes3Manifest := `
-apiVersion: v1
-kind: Service
-metadata:
-  name: fakes3
-  namespace: default
-spec:
-  ports:
-    - port: 9000
-      targetPort: 9000
-  selector:
-    app: fakes3
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: fakes3
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: fakes3
-  template:
-    metadata:
-      labels:
-        app: fakes3
-    spec:
-      containers:
-        - name: fakes3
-          image: fakes3:e2e
-          imagePullPolicy: Never
-          args: ["--listen=0.0.0.0:9000", "--buckets=objectfs-bucket", "--quiet"]
-          ports:
-            - containerPort: 9000
-`
-	t.Logf("Deploying FakeS3 backing object storage")
-	h.KubectlApplyContent("fakes3", fakes3Manifest)
-	if err := h.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
-		t.Fatalf("FakeS3 deployment failed to start: %v", err)
-	}
-
-	// Read and adapt ObjectFS manifest with S3 backend
-	s3BackendURL := "s3://objectfs-bucket?endpoint=http://fakes3:9000&region=us-east-1&s3ForcePathStyle=true"
-
-	objectfsManifestPath := filepath.Join(experimentRoot, "k8s/objectfs.yaml")
-	b, err := os.ReadFile(objectfsManifestPath)
-	if err != nil {
-		t.Fatalf("Failed to read objectfs manifest: %v", err)
-	}
-	objectfsManifest := string(b)
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
-
-	// Inject AWS credential env vars into objectfs-controller container
-	awsEnvController := `env:
-            - name: AWS_ACCESS_KEY_ID
-              value: "fakes3"
-            - name: AWS_SECRET_ACCESS_KEY
-              value: "fakes3"
-            - name: AWS_REGION
-              value: "us-east-1"
-            - name: OBJECT_STORAGE_BACKEND`
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvController)
-
-	// Read and adapt WAL buffer manifest
-	walManifestPath := filepath.Join(experimentRoot, "k8s/wal.yaml")
-	b, err = os.ReadFile(walManifestPath)
-	if err != nil {
-		t.Fatalf("Failed to read wal manifest: %v", err)
-	}
-	walManifest := string(b)
-	walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
-	walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
-
-	awsEnvWAL := `env:
-            - name: AWS_ACCESS_KEY_ID
-              value: "fakes3"
-            - name: AWS_SECRET_ACCESS_KEY
-              value: "fakes3"
-            - name: AWS_REGION
-              value: "us-east-1"
-            - name: OBJECT_STORAGE_BACKEND`
-	walManifest = strings.ReplaceAll(walManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvWAL)
-
-	t.Logf("Deploying ObjectFS and WAL Buffer with S3 backend and hostPath caching")
-	h.KubectlApplyContent("objectfs", objectfsManifest)
-	h.KubectlApplyContent("wal-buffer", walManifest)
-
-	// Wait for wal-buffer
-	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("WAL Buffer failed to start: %v", err)
-	}
-
-	// Wait for controller
-	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("ObjectFS Controller failed to start: %v", err)
-	}
-
-	// Wait for node-daemon
-	if err := h.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("ObjectFS Node Daemon failed to start: %v", err)
-	}
-
-	volumeID := "persistent-s3-test-vol"
+	h, ns := setupSharedObjectFSCluster(t)
+	volumeID := fmt.Sprintf("persistent-s3-test-vol-%s", ns)
 
 	// Step 1: Write initial files to the persistent volume
 	pod1Name := "persistent-pod-1"
@@ -595,6 +521,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: %s
+  namespace: %s
 spec:
   restartPolicy: Never
   containers:
@@ -610,18 +537,18 @@ spec:
         driver: objectfs.labs.gke.io
         volumeAttributes:
           volumeID: %s
-`, pod1Name, volumeID)
+`, pod1Name, ns, volumeID)
 
-	t.Logf("Creating Pod 1 (writing data before controller restart)")
+	t.Logf("Creating Pod 1 (writing data before controller restart) in namespace %s", ns)
 	h.KubectlApplyContent(pod1Name, pod1Yaml)
-	if err := h.WaitForPodReady(pod1Name, "default", 1*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+	if err := h.WaitForPodReady(pod1Name, ns, 1*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents(ns))
 		t.Fatalf("Pod 1 failed to start: %v", err)
 	}
 
 	time.Sleep(5 * time.Second)
 	t.Logf("Deleting Pod 1")
-	h.DeletePod(pod1Name, "default")
+	h.DeletePod(pod1Name, ns)
 
 	// Step 2: Restart ObjectFS Controller (simulating crash / pod restart)
 	t.Logf("Restarting ObjectFS Controller pod to verify persistence across restarts")
@@ -640,6 +567,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: %s
+  namespace: %s
 spec:
   restartPolicy: Never
   containers:
@@ -655,23 +583,23 @@ spec:
         driver: objectfs.labs.gke.io
         volumeAttributes:
           volumeID: %s
-`, pod2Name, volumeID)
+`, pod2Name, ns, volumeID)
 
-	t.Logf("Creating Pod 2 (reading data after controller restart and making further writes)")
+	t.Logf("Creating Pod 2 (reading data after controller restart and making further writes) in namespace %s", ns)
 	h.KubectlApplyContent(pod2Name, pod2Yaml)
-	if err := h.WaitForPodReady(pod2Name, "default", 1*time.Minute); err != nil {
-		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+	if err := h.WaitForPodReady(pod2Name, ns, 1*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents(ns))
 		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
 		t.Fatalf("Pod 2 failed to start: %v", err)
 	}
 
 	time.Sleep(5 * time.Second)
-	logs2 := h.GetPodLogsByName(pod2Name, "default")
+	logs2 := h.GetPodLogsByName(pod2Name, ns)
 	if !strings.Contains(logs2, "root-persistent-data") || !strings.Contains(logs2, "model-weights-persisted") {
 		t.Fatalf("Pod 2 did not recover pre-restart data! Logs:\n%s", logs2)
 	}
 	t.Logf("Pod 2 successfully verified recovered data across controller restart!")
-	h.DeletePod(pod2Name, "default")
+	h.DeletePod(pod2Name, ns)
 
 	// Step 4: Restart ObjectFS Controller a second time
 	t.Logf("Restarting ObjectFS Controller a second time")
@@ -688,6 +616,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: %s
+  namespace: %s
 spec:
   containers:
     - name: app
@@ -702,15 +631,15 @@ spec:
         driver: objectfs.labs.gke.io
         volumeAttributes:
           volumeID: %s
-`, pod3Name, volumeID)
+`, pod3Name, ns, volumeID)
 
-	t.Logf("Creating Pod 3 (verifying state after 2nd controller restart)")
+	t.Logf("Creating Pod 3 (verifying state after 2nd controller restart) in namespace %s", ns)
 	h.KubectlApplyContent(pod3Name, pod3Yaml)
-	if err := h.WaitForPodReady(pod3Name, "default", 1*time.Minute); err != nil {
+	if err := h.WaitForPodReady(pod3Name, ns, 1*time.Minute); err != nil {
 		t.Fatalf("Pod 3 failed to start: %v", err)
 	}
 
-	outRoot, err := h.RunInPod(pod3Name, "default", "cat", "/data/root.txt")
+	outRoot, err := h.RunInPod(pod3Name, ns, "cat", "/data/root.txt")
 	if err != nil {
 		t.Fatalf("Failed to read /data/root.txt in Pod 3: %v", err)
 	}
@@ -718,7 +647,7 @@ spec:
 		t.Fatalf("Expected updated-root-data, got: %s", outRoot)
 	}
 
-	outConfig, err := h.RunInPod(pod3Name, "default", "cat", "/data/models/config.json")
+	outConfig, err := h.RunInPod(pod3Name, ns, "cat", "/data/models/config.json")
 	if err != nil {
 		t.Fatalf("Failed to read /data/models/config.json in Pod 3: %v", err)
 	}
@@ -726,47 +655,79 @@ spec:
 		t.Fatalf("Expected after-restart-file, got: %s", outConfig)
 	}
 
-	h.DeletePod(pod3Name, "default")
+	h.DeletePod(pod3Name, ns)
 	t.Logf("Successfully verified ObjectFS persistent deployment with S3 backend, WAL buffer, and restart recovery!")
 }
 
+var (
+	sharedMultiNodeClusterOnce sync.Once
+	sharedMultiNodeErr         error
+	sharedMultiNode1           string
+	sharedMultiNode2           string
+)
+
+const sharedMultiNodeClusterName = "objectfs-shared-multinode"
+
 func setupObjectFSMultiNodeCluster(t *testing.T, clusterName string) (*Harness, string, string) {
 	t.Helper()
-	h := NewHarness(t, clusterName)
-	h.SetupMultiNode(2)
-	t.Cleanup(func() {
-		if t.Failed() {
-			h.DumpDiagnosticLogs(t)
+
+	sharedMultiNodeClusterOnce.Do(func() {
+		// Clean up any stale cluster from a previous aborted local run
+		if out, err := exec.Command("kind", "delete", "cluster", "--name", sharedMultiNodeClusterName).CombinedOutput(); err != nil {
+			t.Logf("Note: clean up existing cluster %s returned: %v (%s)", sharedMultiNodeClusterName, err, strings.TrimSpace(string(out)))
 		}
-	})
 
-	nodes := h.GetWorkerNodeNames()
-	if len(nodes) < 2 {
-		nodes = h.GetNodeNames()
-	}
-	if len(nodes) < 2 {
-		t.Fatalf("Expected at least 2 nodes in kind cluster, found %d: %v", len(nodes), nodes)
-	}
-	node1 := nodes[0]
-	node2 := nodes[1]
+		var configBuilder strings.Builder
+		configBuilder.WriteString("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n- role: worker\n- role: worker\n")
+		tmpConfig, err := os.CreateTemp("", "kind-config-*.yaml")
+		if err != nil {
+			sharedMultiNodeErr = fmt.Errorf("failed to create temp kind config: %w", err)
+			return
+		}
+		defer func() {
+			if err := os.Remove(tmpConfig.Name()); err != nil && !os.IsNotExist(err) {
+				t.Logf("Warning: failed to remove %s: %v", tmpConfig.Name(), err)
+			}
+		}()
+		if _, err := tmpConfig.WriteString(configBuilder.String()); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("failed to write kind config: %w", err)
+			return
+		}
+		if err := tmpConfig.Close(); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("failed to close temp kind config: %w", err)
+			return
+		}
 
-	gitRoot := h.GetGitRoot()
-	experimentRoot := gitRoot
+		cmd := exec.Command("kind", "create", "cluster", "--name", sharedMultiNodeClusterName, "--config", tmpConfig.Name())
+		if out, err := cmd.CombinedOutput(); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("failed to create kind cluster %s: %w\n%s", sharedMultiNodeClusterName, err, strings.TrimSpace(string(out)))
+			return
+		}
 
-	// Build docker images
-	h.DockerBuild("objectfs-controller:e2e", filepath.Join(experimentRoot, "images/objectfs-controller/Dockerfile"), experimentRoot)
-	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/objectfs-node-daemon/Dockerfile"), experimentRoot)
-	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
-	h.DockerBuild("fakes3:e2e", filepath.Join(experimentRoot, "fakes3/images/fakes3/Dockerfile"), filepath.Join(experimentRoot, "fakes3"))
+		if out, err := exec.Command("kind", "export", "kubeconfig", "--name", sharedMultiNodeClusterName).CombinedOutput(); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("failed to export kubeconfig for %s: %w (%s)", sharedMultiNodeClusterName, err, strings.TrimSpace(string(out)))
+			return
+		}
 
-	// Load images into Kind
-	h.KindLoad("objectfs-controller:e2e")
-	h.KindLoad("objectfs-node-daemon:e2e")
-	h.KindLoad("wal-buffer:e2e")
-	h.KindLoad("fakes3:e2e")
+		initH := NewHarness(t, sharedMultiNodeClusterName)
+		nodes := initH.GetWorkerNodeNames()
+		if len(nodes) < 2 {
+			nodes = initH.GetNodeNames()
+		}
+		if len(nodes) < 2 {
+			sharedMultiNodeErr = fmt.Errorf("expected at least 2 nodes in kind cluster, found %d: %v", len(nodes), nodes)
+			return
+		}
+		sharedMultiNode1 = nodes[0]
+		sharedMultiNode2 = nodes[1]
 
-	// Deploy FakeS3
-	fakes3Manifest := `
+		gitRoot := initH.GetGitRoot()
+
+		// Build and load all E2E images into kind
+		buildAndLoadE2EImages(initH, gitRoot)
+
+		// Deploy FakeS3
+		fakes3Manifest := `
 apiVersion: v1
 kind: Service
 metadata:
@@ -802,27 +763,28 @@ spec:
           ports:
             - containerPort: 9000
 `
-	t.Logf("Deploying FakeS3 backing object storage")
-	h.KubectlApplyContent("fakes3", fakes3Manifest)
-	if err := h.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
-		t.Fatalf("FakeS3 deployment failed to start: %v", err)
-	}
+		initH.KubectlApplyContent("fakes3", fakes3Manifest)
+		if err := initH.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("fakes3 deployment failed to start: %w", err)
+			return
+		}
 
-	s3BackendURL := "s3://objectfs-bucket?endpoint=http://fakes3:9000&region=us-east-1&s3ForcePathStyle=true"
+		s3BackendURL := "s3://objectfs-bucket?endpoint=http://fakes3:9000&region=us-east-1&s3ForcePathStyle=true"
 
-	// ObjectFS manifest with S3 backend and pinned initially to node1
-	objectfsManifestPath := filepath.Join(experimentRoot, "k8s/objectfs.yaml")
-	b, err := os.ReadFile(objectfsManifestPath)
-	if err != nil {
-		t.Fatalf("Failed to read objectfs manifest: %v", err)
-	}
-	objectfsManifest := string(b)
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
+		// ObjectFS manifest with S3 backend and pinned initially to node1
+		objectfsManifestPath := filepath.Join(gitRoot, "k8s/objectfs.yaml")
+		b, err := os.ReadFile(objectfsManifestPath)
+		if err != nil {
+			sharedMultiNodeErr = fmt.Errorf("failed to read objectfs manifest: %w", err)
+			return
+		}
+		objectfsManifest := string(b)
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "namespace: kube-objectfs-system", "namespace: default")
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, `backend: ""`, fmt.Sprintf("backend: %q", s3BackendURL))
 
-	awsEnvController := `env:
+		awsEnvController := `env:
             - name: AWS_ACCESS_KEY_ID
               value: "fakes3"
             - name: AWS_SECRET_ACCESS_KEY
@@ -830,23 +792,24 @@ spec:
             - name: AWS_REGION
               value: "us-east-1"
             - name: OBJECT_STORAGE_BACKEND`
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvController)
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvController)
 
-	// Pin controller to node1 initially and add toleration
-	nodeSelectorNode1 := fmt.Sprintf("nodeSelector:\n        kubernetes.io/hostname: %s\n      tolerations:\n        - key: \"node-role.kubernetes.io/control-plane\"\n          operator: \"Exists\"\n          effect: \"NoSchedule\"\n      serviceAccountName: objectfs-controller", node1)
-	objectfsManifest = strings.ReplaceAll(objectfsManifest, "serviceAccountName: objectfs-controller", nodeSelectorNode1)
+		// Pin controller to node1 initially and add toleration
+		nodeSelectorNode1 := fmt.Sprintf("nodeSelector:\n        kubernetes.io/hostname: %s\n      tolerations:\n        - key: \"node-role.kubernetes.io/control-plane\"\n          operator: \"Exists\"\n          effect: \"NoSchedule\"\n      serviceAccountName: objectfs-controller", sharedMultiNode1)
+		objectfsManifest = strings.ReplaceAll(objectfsManifest, "serviceAccountName: objectfs-controller", nodeSelectorNode1)
 
-	// WAL buffer manifest
-	walManifestPath := filepath.Join(experimentRoot, "k8s/wal.yaml")
-	b, err = os.ReadFile(walManifestPath)
-	if err != nil {
-		t.Fatalf("Failed to read wal manifest: %v", err)
-	}
-	walManifest := string(b)
-	walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
-	walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
+		// WAL buffer manifest
+		walManifestPath := filepath.Join(gitRoot, "k8s/wal.yaml")
+		b, err = os.ReadFile(walManifestPath)
+		if err != nil {
+			sharedMultiNodeErr = fmt.Errorf("failed to read wal manifest: %w", err)
+			return
+		}
+		walManifest := string(b)
+		walManifest = strings.ReplaceAll(walManifest, "namespace: kube-objectfs-system", "namespace: default")
+		walManifest = strings.ReplaceAll(walManifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
 
-	awsEnvWAL := `env:
+		awsEnvWAL := `env:
             - name: AWS_ACCESS_KEY_ID
               value: "fakes3"
             - name: AWS_SECRET_ACCESS_KEY
@@ -854,21 +817,82 @@ spec:
             - name: AWS_REGION
               value: "us-east-1"
             - name: OBJECT_STORAGE_BACKEND`
-	walManifest = strings.ReplaceAll(walManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvWAL)
+		walManifest = strings.ReplaceAll(walManifest, "env:\n            - name: OBJECT_STORAGE_BACKEND", awsEnvWAL)
 
-	t.Logf("Deploying ObjectFS (on %s) and WAL Buffer", node1)
-	h.KubectlApplyContent("objectfs", objectfsManifest)
-	h.KubectlApplyContent("wal-buffer", walManifest)
+		initH.KubectlApplyContent("objectfs", objectfsManifest)
+		initH.KubectlApplyContent("wal-buffer", walManifest)
 
+		if err := initH.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("wal-buffer failed to start: %w", err)
+			return
+		}
+		if err := initH.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("objectfs-controller failed to start on %s: %w", sharedMultiNode1, err)
+			return
+		}
+		if err := initH.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
+			sharedMultiNodeErr = fmt.Errorf("objectfs-node-daemon failed to start: %w", err)
+			return
+		}
+	})
+
+	if sharedMultiNodeErr != nil {
+		t.Fatalf("setupObjectFSMultiNodeCluster failed: %v", sharedMultiNodeErr)
+	}
+
+	h := NewHarness(t, sharedMultiNodeClusterName)
+	node1 := sharedMultiNode1
+	node2 := sharedMultiNode2
+
+	// Clean up any leftover test pods or PVCs in default from a prior test
+	pods := h.getPodNames("", "default")
+	for _, p := range pods {
+		if !strings.HasPrefix(p, "fakes3") &&
+			!strings.HasPrefix(p, "objectfs-controller") &&
+			!strings.HasPrefix(p, "wal-buffer") &&
+			!strings.HasPrefix(p, "objectfs-node-daemon") {
+			if err := exec.Command("kubectl", "delete", "pod", p, "-n", "default", "--force", "--grace-period=0", "--ignore-not-found").Run(); err != nil {
+				t.Logf("Warning: failed to delete leftover pod %s in default: %v", p, err)
+			}
+		}
+	}
+	outPVC, err := exec.Command("kubectl", "get", "pvc", "-n", "default", "-o", "jsonpath={.items[*].metadata.name}").CombinedOutput()
+	if err != nil {
+		t.Logf("Warning: failed to query pvcs in default: %v", err)
+	} else {
+		for _, pvc := range strings.Fields(string(outPVC)) {
+			if err := exec.Command("kubectl", "delete", "pvc", pvc, "-n", "default", "--ignore-not-found").Run(); err != nil {
+				t.Logf("Warning: failed to delete leftover pvc %s in default: %v", pvc, err)
+			}
+		}
+	}
+
+	// Restore controller nodeSelector to node1 and replicas to 1 (in case a prior test moved or scaled it down)
+	patchNode1JSON := fmt.Sprintf(`{"spec":{"replicas":1,"template":{"spec":{"nodeSelector":{"kubernetes.io/hostname":%q}}}}}`, node1)
+	h.RunCommand("kubectl", "patch", "statefulset", "objectfs-controller", "-n", "default", "-p", patchNode1JSON)
+
+	// Ensure system statefulsets are back and healthy before the test begins
 	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
-		t.Fatalf("WAL Buffer failed to start: %v", err)
+		t.Fatalf("WAL buffer not ready: %v", err)
 	}
 	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
-		t.Fatalf("ObjectFS Controller failed to start on %s: %v", node1, err)
+		t.Fatalf("ObjectFS Controller not ready on %s: %v", node1, err)
 	}
 	if err := h.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
-		t.Fatalf("ObjectFS Node Daemon failed to start: %v", err)
+		t.Fatalf("ObjectFS Node Daemon not ready: %v", err)
 	}
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnosticLogs(t)
+			h.CollectArtifacts(t.Name())
+		}
+		// If controller was scaled down or moved during a failed test, restore it
+		restoreJSON := fmt.Sprintf(`{"spec":{"replicas":1,"template":{"spec":{"nodeSelector":{"kubernetes.io/hostname":%q}}}}}`, node1)
+		if err := exec.Command("kubectl", "patch", "statefulset", "objectfs-controller", "-n", "default", "-p", restoreJSON).Run(); err != nil {
+			t.Logf("Warning: failed to restore objectfs-controller on cleanup: %v", err)
+		}
+	})
 
 	return h, node1, node2
 }

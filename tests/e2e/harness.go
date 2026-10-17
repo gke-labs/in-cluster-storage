@@ -38,6 +38,32 @@ func NewHarness(t *testing.T, clusterName string) *Harness {
 	}
 }
 
+// CreateTestNamespace creates a uniquely named test namespace, tracks it for artifact collection,
+// sets h.Namespace, and registers a t.Cleanup callback that dumps diagnostics on failure and
+// deletes the namespace when the test completes.
+func (h *Harness) CreateTestNamespace(prefix string) string {
+	h.t.Helper()
+	ns := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	if len(ns) > 63 {
+		ns = ns[:63]
+	}
+	h.RunCommand("kubectl", "create", "namespace", ns)
+	h.TrackNamespace(ns)
+	h.Namespace = ns
+
+	h.t.Cleanup(func() {
+		if h.t.Failed() {
+			h.DumpDiagnosticLogs(h.t)
+			h.CollectArtifacts(h.t.Name())
+		}
+		// Delete test namespace during teardown
+		if err := exec.Command("kubectl", "delete", "namespace", ns, "--ignore-not-found").Run(); err != nil {
+			h.t.Logf("Warning: failed to delete test namespace %s: %v", ns, err)
+		}
+	})
+	return ns
+}
+
 // SetupMultiNode sets up a Kind cluster with a control plane and the requested number of worker nodes.
 func (h *Harness) SetupMultiNode(workerNodes int) {
 	if workerNodes <= 0 {
@@ -134,6 +160,28 @@ func (h *Harness) getContainerLogs(pod, container, namespace string, previous bo
 
 func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 	t.Log("======= DUMPING DIAGNOSTIC LOGS =======")
+
+	// Dump test namespace if non-default
+	if h.Namespace != "" && h.Namespace != "default" {
+		if out, err := exec.Command("kubectl", "get", "pods", "-n", h.Namespace, "-o", "wide").CombinedOutput(); err != nil {
+			t.Logf("Warning: failed to get pods in %s namespace: %v (out: %s)", h.Namespace, err, strings.TrimSpace(string(out)))
+		} else {
+			t.Logf("Pods in %s namespace:\n%s\n", h.Namespace, strings.TrimSpace(string(out)))
+		}
+		t.Logf("Events in %s:\n%s\n", h.Namespace, h.GetEvents(h.Namespace))
+
+		testPods := h.getPodNames("", h.Namespace)
+		for _, pod := range testPods {
+			if desc, err := exec.Command("kubectl", "describe", "pod", pod, "-n", h.Namespace).CombinedOutput(); err != nil {
+				t.Logf("Warning: failed to describe pod %s/%s: %v (out: %s)", h.Namespace, pod, err, strings.TrimSpace(string(desc)))
+			} else {
+				t.Logf("Pod %s/%s Description:\n%s\n", h.Namespace, pod, strings.TrimSpace(string(desc)))
+			}
+			if logs := h.getContainerLogs(pod, "", h.Namespace, false); logs != "" {
+				t.Logf("Pod %s/%s Logs:\n%s\n", h.Namespace, pod, logs)
+			}
+		}
+	}
 
 	// Pod overview
 	if out, err := exec.Command("kubectl", "get", "pods", "-n", "default", "-o", "wide").CombinedOutput(); err != nil {
