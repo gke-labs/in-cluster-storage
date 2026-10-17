@@ -622,3 +622,65 @@ func TestCheckpointCommand(t *testing.T) {
 		t.Fatalf("expected output %q to contain %q", out, expected)
 	}
 }
+
+func TestVolumesDescribeCommand(t *testing.T) {
+	server, serverAddr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	volumeID := "test-desc-vol"
+
+	// 1. Describe volume when no hold exists
+	out, err := executeCommand("--server", serverAddr, "volumes", "describe", volumeID)
+	if err != nil {
+		t.Fatalf("volumes describe failed: %v", err)
+	}
+	if !strings.Contains(out, "Volume: test-desc-vol") {
+		t.Errorf("expected volume name in output, got: %s", out)
+	}
+	if !strings.Contains(out, "Exclusive Hold: none") {
+		t.Errorf("expected 'Exclusive Hold: none' in output, got: %s", out)
+	}
+
+	// 2. Acquire hold on server
+	_, err = server.AcquireExclusive(t.Context(), &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-worker-1",
+		MountId:  "/var/lib/kubelet/pods/uuid-1/volumes/mount",
+	})
+	if err != nil {
+		t.Fatalf("AcquireExclusive failed: %v", err)
+	}
+
+	// 3. Describe volume with active hold
+	out, err = executeCommand("--server", serverAddr, "volumes", "describe", volumeID)
+	if err != nil {
+		t.Fatalf("volumes describe with hold failed: %v", err)
+	}
+	if !strings.Contains(out, "Holder Node:  node-worker-1") {
+		t.Errorf("expected holder node in output, got: %s", out)
+	}
+	if !strings.Contains(out, "Mount ID:     /var/lib/kubelet/pods/uuid-1/volumes/mount") {
+		t.Errorf("expected mount ID in output, got: %s", out)
+	}
+	if !strings.Contains(out, "Lease Expiry:") {
+		t.Errorf("expected lease expiry in output, got: %s", out)
+	}
+
+	// 4. Release hold and verify describe shows none
+	_, err = server.ReleaseExclusive(t.Context(), &pb.ReleaseExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   "node-worker-1",
+		MountId:  "/var/lib/kubelet/pods/uuid-1/volumes/mount",
+	})
+	if err != nil {
+		t.Fatalf("ReleaseExclusive failed: %v", err)
+	}
+
+	out, err = executeCommand("--server", serverAddr, "volumes", "describe", volumeID)
+	if err != nil {
+		t.Fatalf("volumes describe after release failed: %v", err)
+	}
+	if !strings.Contains(out, "Exclusive Hold: none") {
+		t.Errorf("expected 'Exclusive Hold: none' after release, got: %s", out)
+	}
+}

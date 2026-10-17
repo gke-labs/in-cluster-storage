@@ -223,8 +223,79 @@ func newVolumesCommand(opts *options) *cobra.Command {
 	}
 
 	volumesCmd.AddCommand(newVolumesListCommand(opts))
+	volumesCmd.AddCommand(newVolumesDescribeCommand(opts))
 
 	return volumesCmd
+}
+
+func newVolumesDescribeCommand(opts *options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "describe <volume>",
+		Aliases: []string{"desc", "show", "get"},
+		Short:   "Describe a volume and its current exclusive-local hold",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.serverAddr == "" {
+				return fmt.Errorf("--server is required")
+			}
+			volumeID := args[0]
+			if volumeID == "" {
+				return fmt.Errorf("volume ID is required")
+			}
+
+			client, conn, err := dialServer(opts.serverAddr)
+			if err != nil {
+				return err
+			}
+			defer errutil.CloseAndLog(conn, "server connection")
+
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "Volume: %s\n", volumeID)
+
+			holdResp, err := client.GetExclusiveHold(cmd.Context(), &pb.GetExclusiveHoldRequest{
+				VolumeId: volumeID,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to get exclusive hold for volume %s: %w", volumeID, err)
+			}
+
+			hold := holdResp.GetHold()
+			if hold != nil && hold.GetNodeId() != "" {
+				fmt.Fprintln(out, "Exclusive Hold:")
+				fmt.Fprintf(out, "  Holder Node:  %s\n", hold.GetNodeId())
+				fmt.Fprintf(out, "  Mount ID:     %s\n", hold.GetMountId())
+				if hold.GetAcquiredAt() != nil {
+					fmt.Fprintf(out, "  Acquired:     %s\n", hold.GetAcquiredAt().AsTime().Format(time.RFC3339))
+				}
+				if hold.GetLeaseExpiry() != nil {
+					expiry := hold.GetLeaseExpiry().AsTime()
+					remaining := time.Until(expiry).Round(time.Second)
+					if remaining > 0 {
+						fmt.Fprintf(out, "  Lease Expiry: %s (%s remaining)\n", expiry.Format(time.RFC3339), remaining)
+					} else {
+						fmt.Fprintf(out, "  Lease Expiry: %s (expired)\n", expiry.Format(time.RFC3339))
+					}
+				}
+			} else {
+				fmt.Fprintln(out, "Exclusive Hold: none")
+			}
+
+			// Also display stats if volume exists in store
+			statsResp, err := client.GetVolumeStats(cmd.Context(), &pb.GetVolumeStatsRequest{
+				VolumeId: volumeID,
+			})
+			if err == nil && statsResp.GetStats() != nil {
+				s := statsResp.GetStats()
+				fmt.Fprintln(out, "Stats:")
+				fmt.Fprintf(out, "  Files:         %d\n", s.GetInodesFile())
+				fmt.Fprintf(out, "  Directories:   %d\n", s.GetInodesDir())
+				fmt.Fprintf(out, "  Logical Bytes: %d\n", s.GetLogicalBytes())
+			}
+
+			return nil
+		},
+	}
+	return cmd
 }
 
 type volumesListOptions struct {
