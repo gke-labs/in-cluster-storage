@@ -51,6 +51,9 @@ var (
 	controllerSyncTimeout  = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for sync RPCs (fsync, flush, write) to ObjectFS controller")
 	syncOnClose            = flag.Bool("sync-on-close", true, "Schedule non-blocking sync on file release")
 	backgroundSyncInterval = flag.Duration("background-sync-interval", 30*time.Second, "Background sync interval for dirty volumes")
+	caCertFile             = flag.String("ca-cert-file", "", "Path to CA certificate file for controller TLS verification")
+	tokenFile              = flag.String("token-file", "", "Path to projected ServiceAccount token file")
+	insecureFlag           = flag.Bool("insecure", false, "Connect to controller using plaintext gRPC without authentication")
 )
 
 func main() {
@@ -84,6 +87,9 @@ func main() {
 	if err != nil {
 		klog.Fatalf("failed to initialize driver: %v", err)
 	}
+	driver.caCertFile = *caCertFile
+	driver.tokenFile = *tokenFile
+	driver.insecure = *insecureFlag
 	defer func() {
 		if closeErr := driver.Close(); closeErr != nil {
 			klog.V(4).Infof("driver close error: %v", closeErr)
@@ -111,6 +117,11 @@ func parseEndpoint(endpoint string) (string, string, error) {
 	return scheme, addr, nil
 }
 
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
+}
+
 type activeMount struct {
 	server     *gofuse.Server
 	cancelFunc context.CancelFunc
@@ -134,6 +145,9 @@ type objectFSDriver struct {
 	syncTimeout            time.Duration
 	syncOnClose            bool
 	backgroundSyncInterval time.Duration
+	caCertFile             string
+	tokenFile              string
+	insecure               bool
 
 	clientConn *grpc.ClientConn
 	client     pb.ObjectFSControllerClient
@@ -191,12 +205,33 @@ func (d *objectFSDriver) getClient() (pb.ObjectFSControllerClient, error) {
 		return d.client, nil
 	}
 
-	conn, err := grpc.NewClient(d.controllerAddress,
-		grpcutil.DialOptions(
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-		)...,
-	)
+	caFile := d.caCertFile
+	if caFile == "" && !d.insecure && fileExists("/etc/objectfs/tls/ca.crt") {
+		caFile = "/etc/objectfs/tls/ca.crt"
+	}
+	tokFile := d.tokenFile
+	if tokFile == "" && !d.insecure && fileExists("/var/run/secrets/tokens/token") {
+		tokFile = "/var/run/secrets/tokens/token"
+	}
+
+	useInsecure := d.insecure || (caFile == "" && tokFile == "")
+
+	var dialOpts []grpc.DialOption
+	if useInsecure {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else {
+		tlsCreds, err := grpcutil.NewClientTLSFromFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load TLS credentials from %s: %w", caFile, err)
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(tlsCreds))
+		if tokFile != "" {
+			dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(grpcutil.NewTokenFileCredentials(tokFile)))
+		}
+	}
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.WaitForReady(true)))
+
+	conn, err := grpc.NewClient(d.controllerAddress, grpcutil.DialOptions(dialOpts...)...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to controller at %s: %w", d.controllerAddress, err)
 	}

@@ -622,3 +622,16 @@ func TestCheckpointCommand(t *testing.T) {
 		t.Fatalf("expected output %q to contain %q", out, expected)
 	}
 }
+
+func TestAuthFlags(t *testing.T) {
+	cmd := NewRootCommand()
+	if cmd.PersistentFlags().Lookup("ca") == nil {
+		t.Errorf("missing --ca flag")
+	}
+	if cmd.PersistentFlags().Lookup("token") == nil {
+		t.Errorf("missing --token flag")
+	}
+	if cmd.PersistentFlags().Lookup("insecure") == nil {
+		t.Errorf("missing --insecure flag")
+	}
+}
