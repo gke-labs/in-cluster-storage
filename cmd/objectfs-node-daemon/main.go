@@ -118,6 +118,7 @@ type activeMount struct {
 	volumeID   string
 	mode       string
 	volumeDir  string
+	mountID    string
 }
 
 type objectFSDriver struct {

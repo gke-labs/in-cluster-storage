@@ -291,7 +291,7 @@ func TestStartExclusiveLocalSync_ExplicitTrigger(t *testing.T) {
 		syncWg.Wait()
 	}()
 
-	driver.startExclusiveLocalSync(watchCtx, &syncWg, client, volumeID, volumeDir, lowerDir, upperDir, 0)
+	driver.startExclusiveLocalSync(watchCtx, &syncWg, client, volumeID, volumeDir, lowerDir, upperDir, "/mnt/test-target", 0)
 
 	// Small pause for watcher to establish connection
 	time.Sleep(30 * time.Millisecond)
@@ -378,7 +378,7 @@ func TestStartExclusiveLocalSync_IntervalTrigger(t *testing.T) {
 	}()
 
 	// 25ms interval with daemon-lifetime context
-	driver.startExclusiveLocalSync(daemonCtx, &syncWg, client, volumeID, volumeDir, lowerDir, upperDir, 25*time.Millisecond)
+	driver.startExclusiveLocalSync(daemonCtx, &syncWg, client, volumeID, volumeDir, lowerDir, upperDir, "/mnt/test-target", 25*time.Millisecond)
 
 	// Write file in upper
 	testData := []byte("interval periodic data")

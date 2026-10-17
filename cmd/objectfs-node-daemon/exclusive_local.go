@@ -29,6 +29,8 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 )
 
@@ -91,6 +93,7 @@ func unmountTarget(targetPath string) error {
 
 func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.NodePublishVolumeRequest, volumeID string) (*csi.NodePublishVolumeResponse, error) {
 	targetPath := req.GetTargetPath()
+	mountID := targetPath
 	klog.Infof("Publishing ObjectFS volume %s in exclusive-local mode to %s", volumeID, targetPath)
 
 	volumeDir := filepath.Join(d.cacheDir, volumeID)
@@ -102,6 +105,38 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	if err != nil {
 		return nil, fmt.Errorf("failed to get controller client: %w", err)
 	}
+
+	// 1. Acquire exclusive hold from controller before touching local state or materialising.
+	// If another node holds the lease, controller returns codes.Aborted, which we surface as
+	// a retryable CSI error so kubelet retries publish with backoff.
+	acqResp, err := client.AcquireExclusive(ctx, &pb.AcquireExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   d.nodeID,
+		MountId:  mountID,
+	})
+	if err != nil {
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.Aborted {
+			klog.Warningf("exclusive-local [%s]: volume is held by another node: %v; retrying publish", volumeID, st.Message())
+			return nil, err
+		}
+		return nil, fmt.Errorf("failed to acquire exclusive hold for volume %s: %w", volumeID, err)
+	}
+	klog.Infof("exclusive-local [%s]: acquired exclusive hold on node %s (mount %s) lease expires %s",
+		volumeID, d.nodeID, mountID, acqResp.GetHold().GetLeaseExpiry().AsTime().Format(time.RFC3339))
+
+	var publishSuccess bool
+	defer func() {
+		if !publishSuccess {
+			relCtx, relCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer relCancel()
+			_, _ = client.ReleaseExclusive(relCtx, &pb.ReleaseExclusiveRequest{
+				VolumeId: volumeID,
+				NodeId:   d.nodeID,
+				MountId:  mountID,
+			})
+		}
+	}()
 
 	// Check if a previous session left an uncommitted upper layer (e.g. from a failed checkpoint)
 	if hasLeftover, err := isUpperNonEmpty(upperPath); err != nil {
@@ -154,6 +189,7 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	}
 	if !notMnt {
 		klog.Infof("Volume %s already mounted at %s", volumeID, targetPath)
+		publishSuccess = true
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
@@ -174,7 +210,7 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 
 	var syncWg sync.WaitGroup
 	watchCtx, cancel := context.WithCancel(context.Background())
-	d.startExclusiveLocalSync(watchCtx, &syncWg, client, volumeID, volumeDir, lowerPath, upperPath, checkpointInterval)
+	d.startExclusiveLocalSync(watchCtx, &syncWg, client, volumeID, volumeDir, lowerPath, upperPath, mountID, checkpointInterval)
 
 	d.mu.Lock()
 	if old, ok := d.mounts[targetPath]; ok {
@@ -194,16 +230,21 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 		volumeID:   volumeID,
 		mode:       "exclusive-local",
 		volumeDir:  volumeDir,
+		mountID:    mountID,
 		cancelFunc: cancel,
 		syncWg:     &syncWg,
 	}
+	publishSuccess = true
 	d.mu.Unlock()
 
 	klog.Infof("Successfully mounted ObjectFS exclusive-local volume %s at %s", volumeID, targetPath)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (d *objectFSDriver) startExclusiveLocalSync(ctx context.Context, wg *sync.WaitGroup, client pb.ObjectFSControllerClient, volumeID, volumeDir, lowerPath, upperPath string, interval time.Duration) {
+func (d *objectFSDriver) startExclusiveLocalSync(ctx context.Context, wg *sync.WaitGroup, client pb.ObjectFSControllerClient, volumeID, volumeDir, lowerPath, upperPath, mountID string, interval time.Duration) {
+	if mountID == "" {
+		mountID = filepath.Join(volumeDir, "mount")
+	}
 	var cpMu sync.Mutex
 	manifestPath := filepath.Join(volumeDir, "checkpoint.json")
 
@@ -324,6 +365,33 @@ func (d *objectFSDriver) startExclusiveLocalSync(ctx context.Context, wg *sync.W
 			}
 		}
 	}()
+
+	// 3. Periodic lease renewal for exclusive-local hold (renew well inside 30s lease)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				renewCtx, renewCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				resp, err := client.RenewExclusive(renewCtx, &pb.RenewExclusiveRequest{
+					VolumeId: volumeID,
+					NodeId:   d.nodeID,
+					MountId:  mountID,
+				})
+				renewCancel()
+				if err != nil {
+					klog.Warningf("exclusive-local [%s]: failed to renew exclusive hold: %v", volumeID, err)
+				} else if resp.GetHold() != nil {
+					klog.V(4).Infof("exclusive-local [%s]: renewed exclusive hold until %s", volumeID, resp.GetHold().GetLeaseExpiry().AsTime().Format(time.RFC3339))
+				}
+			}
+		}
+	}()
 }
 
 func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, volumeID, volumeDir string, mountInfo *activeMount) (*csi.NodeUnpublishVolumeResponse, error) {
@@ -334,8 +402,8 @@ func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.N
 	upperPath := filepath.Join(volumeDir, "upper")
 	manifestPath := filepath.Join(volumeDir, "checkpoint.json")
 
-	// Unpublish ordering: cancel, wait, unmount, scan, replay, remove
-	// 1. Cancel background watcher and ticker
+	// Unpublish ordering: cancel, wait, unmount, scan, replay, remove, release hold
+	// 1. Cancel background watcher, ticker, and renew loops
 	if mountInfo != nil && mountInfo.cancelFunc != nil {
 		mountInfo.cancelFunc()
 	}
@@ -363,7 +431,7 @@ func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.N
 		return nil, fmt.Errorf("checkpoint scan failed: %w", err)
 	}
 
-	// 5. Connect to controller and replay operations
+	// 5. Connect to controller and replay operations (commits final unmount checkpoint)
 	client, err := d.getClient()
 	if err != nil {
 		klog.Errorf("Failed to connect to controller for checkpoint on volume %s: %v. Leaving upper layer intact.", volumeID, err)
@@ -378,6 +446,23 @@ func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.N
 	// 6. On SUCCESS only, clean up volumeDir
 	if err := os.RemoveAll(volumeDir); err != nil {
 		klog.Warningf("Failed to cleanup volume directory %s after checkpoint: %v", volumeDir, err)
+	}
+
+	// 7. Release exclusive hold AFTER the final checkpoint has committed, never before.
+	mountID := targetPath
+	if mountInfo != nil && mountInfo.mountID != "" {
+		mountID = mountInfo.mountID
+	}
+	relCtx, relCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer relCancel()
+	if _, relErr := client.ReleaseExclusive(relCtx, &pb.ReleaseExclusiveRequest{
+		VolumeId: volumeID,
+		NodeId:   d.nodeID,
+		MountId:  mountID,
+	}); relErr != nil {
+		klog.Warningf("exclusive-local [%s]: failed to release exclusive hold after checkpoint: %v", volumeID, relErr)
+	} else {
+		klog.Infof("exclusive-local [%s]: released exclusive hold on node %s (mount %s)", volumeID, d.nodeID, mountID)
 	}
 
 	klog.Infof("Successfully unpublished and checkpointed ObjectFS volume %s", volumeID)
