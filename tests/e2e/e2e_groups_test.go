@@ -52,13 +52,6 @@ var (
 	periodicGroup = map[string]bool{
 		"TestObjectFSTortureE2E": true, // #300
 	}
-
-	// agentfsGroup tests remain in legacy ap-e2e until deleted by #289.
-	agentfsGroup = map[string]bool{
-		"TestCASE2E":         true,
-		"TestE2E":            true,
-		"TestEROFSLayersE2E": true,
-	}
 )
 
 func findE2ETestFunctions(t *testing.T, dir string) (map[string]*ast.FuncDecl, *token.FileSet) {
@@ -121,7 +114,6 @@ func TestE2EGroups_NoDrift(t *testing.T) {
 		"multinode": multiNodeGroup,
 		"chaos":     chaosGroup,
 		"periodic":  periodicGroup,
-		"agentfs":   agentfsGroup,
 	}
 
 	missing, duplicates := checkTestAssignment(tests, groups)

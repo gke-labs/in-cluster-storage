@@ -437,9 +437,9 @@ The following items represent the planned roadmap and architectural evolution fo
 - [x] **Eliminate "latest" Snapshot Pointer Object:** Remove the `volumes/<volID>/meta/latest` pointer file; discover the most recent valid snapshot via lexicographical listing or timestamp markers to avoid single-object update contention.
 - [x] **Tiered Metadata Caching (Hot in Memory, Cold on Disk):** Refactor the controller metadata engine so only "hot" active directories and inodes are kept in RAM, while the full metadata state resides on fast local disk (replicated from cloud EROFS snapshots) to scale to millions of files without unbounded memory usage.
 
-### 2. Convergence with AgentFS (Kernel-Native EROFS Mounting)
-- [ ] **Bypass User-Space FUSE Overhead:** Instead of routing all node I/O through a user-space FUSE daemon, converge with AgentFS by distributing the compiled EROFS metadata snapshot directly to worker nodes.
-- [ ] **Kernel-Level Lazy-Loading & OverlayFS:** Mount the EROFS snapshot image directly as a read-only `lower` layer in an OverlayFS mount, combining kernel-native filesystem performance with on-demand blob fetching (via `fanotify`, `fscache`, or blob drivers) when file contents are accessed.
+### 2. Exclusive-Local Mount Mode (Kernel-Native OverlayFS)
+- [x] **Bypass User-Space FUSE Overhead:** Instead of routing all node I/O through a user-space FUSE daemon, `mode: exclusive-local` materialises the volume into a local directory and mounts it into the pod with OverlayFS, running at local-disk speed with no FUSE overhead and no per-operation RPCs (#287). AgentFS is retired (#289).
+- [ ] **Kernel-Level Lazy-Loading & EROFS Materialisation:** For very large volumes where eager download is measured to be too slow, evaluate on-demand lazy materialisation with an EROFS lower layer and chunk fetches (deferred until measured necessary).
 
 ### 3. Enlightened Applications & CAS Unix Domain Socket (UDS) API
 - [ ] **In-Filesystem Control Socket:** Expose a well-known Unix Domain Socket path inside the mounted volume (e.g. `/.in-cluster-storage/api` or `/.objectfs/api`).

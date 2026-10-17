@@ -146,12 +146,6 @@ func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 	t.Logf("Events:\n%s\n", h.GetEvents("default"))
 
 	// Controller Logs (current & previous)
-	if logs := h.getContainerLogs("agentfs-controller-0", "agentfs-controller", "default", false); logs != "" {
-		t.Logf("AgentFS Controller Logs:\n%s\n", logs)
-	}
-	if prevLogs := h.getContainerLogs("agentfs-controller-0", "agentfs-controller", "default", true); prevLogs != "" {
-		t.Logf("AgentFS Controller Previous Logs:\n%s\n", prevLogs)
-	}
 	ctrlPods := h.getPodNames("app=objectfs-controller", "default")
 	if len(ctrlPods) == 0 {
 		ctrlPods = []string{"objectfs-controller-0"}
@@ -184,8 +178,8 @@ func (h *Harness) DumpDiagnosticLogs(t *testing.T) {
 	// Node Daemon Logs (current & previous, both node-daemon & node-driver-registrar containers)
 	daemonPods := h.getPodNames("", "default")
 	for _, pod := range daemonPods {
-		if strings.Contains(pod, "node-daemon") || strings.Contains(pod, "agentfs") || strings.Contains(pod, "objectfs") {
-			for _, container := range []string{"agentfs-node-daemon", "objectfs-node-daemon", "node-driver-registrar", "cas-node-daemon"} {
+		if strings.Contains(pod, "node-daemon") || strings.Contains(pod, "objectfs") {
+			for _, container := range []string{"objectfs-node-daemon", "node-driver-registrar", "cas-node-daemon"} {
 				if logs := h.getContainerLogs(pod, container, "default", false); logs != "" {
 					t.Logf("Node Daemon (%s / %s) Logs:\n%s\n", pod, container, logs)
 				}

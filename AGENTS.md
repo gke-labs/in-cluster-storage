@@ -40,7 +40,7 @@ Ensure your `DOCKER_HOST` environment variable is exported and points to the run
 
 ## 2. Running the E2E Tests
 
-Once the prerequisites are satisfied, you can execute the E2E test suite locally using the repository's presubmit wrapper script:
+Once the prerequisites are satisfied, you can execute the E2E test suite locally using the repository's presubmit wrapper scripts:
 
 ```bash
 # Force the Go toolchain to auto-resolve matching versions and execute the E2E runner
@@ -48,11 +48,11 @@ GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e
 ```
 
 The E2E suite will:
-1. Spin up a local `kind` Kubernetes cluster named `agentfs-e2e`.
-2. Compile and build the `agentfs-controller:e2e` and `agentfs-node-daemon:e2e` Docker images.
+1. Spin up local `kind` Kubernetes clusters (single-node for core tests, two-worker clusters for multi-node and chaos tests).
+2. Compile and build the `objectfs-controller:e2e`, `objectfs-node-daemon:e2e`, and `wal-buffer:e2e` Docker images.
 3. Load the built images directly into the `kind` cluster nodes.
-4. Deploy the Kubernetes CSI controller and daemonsets.
-5. Create and run test pods verifying normal OverlayFS operations, incremental snapshitting, whiteouts, and (if active) hybrid lazy-loading.
+4. Deploy the ObjectFS controller StatefulSet, node daemon DaemonSet, and WAL buffer (`k8s/wal.yaml` and `k8s/objectfs.yaml`).
+5. Create and run test pods verifying standard FUSE operations, StatefulSet volumes, cross-node migration, failover, crash recovery, and exclusive-local OverlayFS checkpoints.
 6. Automatically clean up and teardown the cluster.
 
 ### E2E Presubmit Groups
@@ -79,9 +79,9 @@ GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-chaos
 ## 3. Troubleshooting & Diagnostics
 
 - **Docker Communication Errors**: Run `docker ps` to verify that the Docker CLI can communicate successfully with the daemon.
-- **YAML Manifest Errors**: Ensure that modifications to the CSI driver arguments in `tests/e2e/e2e_test.go` or `k8s/manifest.yaml` are clean, properly indented, and have correctly matched quotes.
-- **Interception Deadlocks**: If testing on kernels `< 6.5` with fanotify, do not monitor the underlying physical directory (`/var/lib/agentfs`) directly. Instead, mark the active OverlayFS virtual mount points (`targetPath`) to ensure events are captured reliably across all host kernel distributions.
-- **Inspecting Node Daemon Logs**: If a test pod hangs, read the node driver logs via `kubectl logs daemonset/agentfs-node-daemon -n default -c agentfs-node-daemon` to see if events are triggering and being allowed cleanly.
+- **YAML Manifest Errors**: Ensure that modifications to the CSI driver arguments in `k8s/objectfs.yaml` or `k8s/wal.yaml` are clean, properly indented, and have correctly matched quotes.
+- **Inspecting Logs**: If a test pod hangs, inspect node driver logs via `kubectl logs daemonset/objectfs-node-daemon -n default -c objectfs-node-daemon` or controller logs via `kubectl logs statefulset/objectfs-controller -n default -c objectfs-controller`.
+- **Exclusive-Local Diagnostics**: If unmount or publish hangs during exclusive-local tests, verify whether unmount checkpoint completed and check the upper layer directory state on the node.
 
 ---
 
@@ -138,7 +138,7 @@ For closing `io.Closer` resources without dropping errors, use the helpers in `p
 
 ### Enforcement & Ratchet Baseline
 
-`ap lint` enforces error handling via the `droppederrors` check using a ratchet baseline in `.ap/droppederrors-baseline.txt`. This baseline only ever shrinks as grandfathered sites are resolved; never run `ap lint droppederrors --write-baseline` to add new entries. See #189 for the dropped-errors burn-down tracker.
+`ap lint` enforces error handling via the `droppederrors` check. All grandfathered sites across the repository have been burned down to zero and `.ap/droppederrors-baseline.txt` has been removed (#189 closed). Every dropped error in new or modified code is a lint failure; no baseline file exists.
 
 ---
 
