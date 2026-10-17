@@ -183,18 +183,23 @@ func TestSdsCatLiveServer(t *testing.T) {
 	output, _ := executeCommand(catCtx, "cat", "--server", handle.addr, "--stream", streamID.String())
 
 	lines := strings.Split(strings.TrimSpace(output), "\n")
-	if len(lines) < 2 {
-		t.Fatalf("expected at least 2 output lines, got %d: %q", len(lines), output)
+	if len(lines) < 3 {
+		t.Fatalf("expected at least 3 output lines, got %d: %q", len(lines), output)
 	}
 
-	// Line 1: TypeDefinition (TypeID 1)
-	if !strings.Contains(lines[0], "1\t1\tsds.v1.TypeDefinition") || !strings.Contains(lines[0], `"name":"testpkg.Order"`) {
+	// Line 1: StreamHeader (TypeID 6)
+	if !strings.Contains(lines[0], "1\t6\tsds.v1.StreamHeader") {
 		t.Errorf("unexpected line 0: %s", lines[0])
 	}
 
-	// Line 2: OpRecord (TypeID 5)
-	if !strings.Contains(lines[1], "2\t5\tsds.v1.OpRecord") || !strings.Contains(lines[1], `"typeId":16`) {
+	// Line 2: TypeDefinition (TypeID 1)
+	if !strings.Contains(lines[1], "2\t1\tsds.v1.TypeDefinition") || !strings.Contains(lines[1], `"name":"testpkg.Order"`) {
 		t.Errorf("unexpected line 1: %s", lines[1])
+	}
+
+	// Line 3: OpRecord (TypeID 5)
+	if !strings.Contains(lines[2], "3\t5\tsds.v1.OpRecord") || !strings.Contains(lines[2], `"typeId":16`) {
+		t.Errorf("unexpected line 2: %s", lines[2])
 	}
 }
 
@@ -247,7 +252,10 @@ func TestSdsCatSegmentAndRegistry(t *testing.T) {
 		StreamSeq: 1,
 		Payload:   rawPayload,
 	}
-	if err := os.WriteFile(segmentFile, logRec.Encode(), 0644); err != nil {
+	var segBuf bytes.Buffer
+	segBuf.Write(wal.DefaultSegmentHeader().Encode())
+	segBuf.Write(logRec.Encode())
+	if err := os.WriteFile(segmentFile, segBuf.Bytes(), 0644); err != nil {
 		t.Fatalf("WriteFile segment failed: %v", err)
 	}
 
@@ -473,6 +481,10 @@ func TestSdsCat_CorruptRecordContinuesAndReportsError(t *testing.T) {
 	f, err := os.Create(segmentFile)
 	if err != nil {
 		t.Fatalf("Create segment file failed: %v", err)
+	}
+	if _, err := f.Write(wal.DefaultSegmentHeader().Encode()); err != nil {
+		f.Close()
+		t.Fatalf("Write header failed: %v", err)
 	}
 	if _, err := f.Write(rec1.Encode()); err != nil {
 		f.Close()
