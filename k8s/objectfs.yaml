@@ -62,6 +62,122 @@ roleRef:
 
 ---
 
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: objectfs-admin
+  namespace: kube-objectfs-system
+
+---
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: objectfs-tls
+  namespace: kube-objectfs-system
+type: kubernetes.io/tls
+stringData:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIC6TCCAdGgAwIBAgIBATANBgkqhkiG9w0BAQsFADAWMRQwEgYDVQQDEwtvYmpl
+    Y3Rmcy1jYTAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMBYxFDASBgNV
+    BAMTC29iamVjdGZzLWNhMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA
+    59j/9GcRSt/ki9Z+e20YGNT5nAZOKh+eeCIOzsdv3yYhVpFj9dCE77unXH88zUyE
+    sqtruCr7+7ypHguiRuA8pfvFZYhb2ecWcUofShdTxMF2qlPPmuZ26QIs9GExjbnz
+    ZbJlUeLOQefWVmVSh6UKWvT84IeNiAgFQg3KRPZL3pzbwmJdFJ+nR4cI3V7jVk1+
+    3OWfmPvT+7HdG5p9SIsNN+NhYkMCvXF4m07DFTL9yQJqTWju5YthbVUrG5DW6KoP
+    Z7TRqGt7gC+FW5La27Ngwql+eBZ7ZEFhAbF42Qrpit1hBsZwVT8BHyCEX7VnALyV
+    YeUslRmOcisgSHzLQNWHkQIDAQABo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T
+    AQH/BAUwAwEB/zAdBgNVHQ4EFgQUYb1VbzMMN4NCLJFKBeyrfqIhU90wDQYJKoZI
+    hvcNAQELBQADggEBALOSu6IlFypwf5FmkMrmqd0JuBtOyVyjeCpGR9UkuR/XCc1A
+    53IQPlzuX++Wv4cj5pAQl/xe8guK8rrqrwU2L/2mhTkkHk7fiwehVXSOuAd+kTOa
+    Fm+9OCcNW07vaYiVEVXXBb6otjamTgsCbGu+vrZMoFCmd93IAvfSis1WglJMI2uZ
+    HeM/T43qLM1YfZfvMKBRgy3i9p0w6exA2KCsCNe268IU48Y4QUodn9pNH6vzPUQY
+    NRMj6YnqMLYxXwrvHIfDkQbVLlrQ0cuhhTEcjFyImLT4GkotIfZW/K6Saf/HIZCg
+    SO96dbUPWjgvfJHdsYAQUbGfqS0lmSLRcLO+t3g=
+    -----END CERTIFICATE-----
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIEIDCCAwigAwIBAgIBAjANBgkqhkiG9w0BAQsFADAWMRQwEgYDVQQDEwtvYmpl
+    Y3Rmcy1jYTAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMB4xHDAaBgNV
+    BAMTE29iamVjdGZzLWNvbnRyb2xsZXIwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAw
+    ggEKAoIBAQDeNDFVtsjkhNr6Y4oYFEsCzDdPfC4lJSd4wFxhStoHbnKgKXnIcocF
+    E8GRgioNvdNuL5J6MNd4zXDO2qjIZcE4/wxrB8V6Eo4LzK4kj07CgTYsfvq/c4y4
+    b+GPnrGreXoG9dPOEDQpEGSXru/aIzOXWpSwTTu8QiJmkl46LtSipDi1wlENu/rq
+    JTmVsM8JOU8j6HiFN6ENs50CGBPUp5zwane33DCLAOInM7LCZHi/VJqzPvHhFHCG
+    IrbqZsb2HAyW3sYZ7y2DPG+hseAdNpKTXADCEwAOFn+wHTVnumbl+elXbKiiZMrp
+    VlTCAw6ApnUiVoWELKy46w/8XTQV7IzJAgMBAAGjggFvMIIBazAOBgNVHQ8BAf8E
+    BAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADCCATQGA1Ud
+    EQSCASswggEnghNvYmplY3Rmcy1jb250cm9sbGVygihvYmplY3Rmcy1jb250cm9s
+    bGVyLmt1YmUtb2JqZWN0ZnMtc3lzdGVtgixvYmplY3Rmcy1jb250cm9sbGVyLmt1
+    YmUtb2JqZWN0ZnMtc3lzdGVtLnN2Y4I6b2JqZWN0ZnMtY29udHJvbGxlci5rdWJl
+    LW9iamVjdGZzLXN5c3RlbS5zdmMuY2x1c3Rlci5sb2NhbIIbb2JqZWN0ZnMtY29u
+    dHJvbGxlci5kZWZhdWx0gh9vYmplY3Rmcy1jb250cm9sbGVyLmRlZmF1bHQuc3Zj
+    gi1vYmplY3Rmcy1jb250cm9sbGVyLmRlZmF1bHQuc3ZjLmNsdXN0ZXIubG9jYWyC
+    CWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAQEA4hnfWLigrwMrcZmP
+    bVFvc/UoAber5YYiF6ZtY3dMERFmgf0efzQ11fZrc4mnCM5KeDngTNLA2K9zidxT
+    cUbv2gldkq6ifx5Soe2ksMM/RBQoaghx5HqDUsfu1g0jd/8bHX5iotqpnJnPTZi9
+    df8ZNIU5JE7ZdyJKjLfddNMVrVyguos2tt5x1222GCEO03FVRmksZN/G82259gyl
+    dq9ShLgywBcapXY2vG4o8xUyGyzhSxaNLflcjipZuGLkk7Ns3T3+KYqWvoGktKYJ
+    21trLBWitO9ggHs2NHfKmEOw9WjqbfFmYCKTAfzQKZ57/aTmJEjSLj5wDe07B6a5
+    39YujQ==
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN RSA PRIVATE KEY-----
+    MIIEpAIBAAKCAQEA3jQxVbbI5ITa+mOKGBRLAsw3T3wuJSUneMBcYUraB25yoCl5
+    yHKHBRPBkYIqDb3Tbi+SejDXeM1wztqoyGXBOP8MawfFehKOC8yuJI9OwoE2LH76
+    v3OMuG/hj56xq3l6BvXTzhA0KRBkl67v2iMzl1qUsE07vEIiZpJeOi7UoqQ4tcJR
+    Dbv66iU5lbDPCTlPI+h4hTehDbOdAhgT1Kec8Gp3t9wwiwDiJzOywmR4v1Sasz7x
+    4RRwhiK26mbG9hwMlt7GGe8tgzxvobHgHTaSk1wAwhMADhZ/sB01Z7pm5fnpV2yo
+    omTK6VZUwgMOgKZ1IlaFhCysuOsP/F00FeyMyQIDAQABAoIBAAlmKMi+OheHJ8zG
+    msfzonakVRnyH/DnS5j302Xe04PT9VpMAYBBQ+/Viu8Q6Ul6hEUuvaHt4KIWApW6
+    ub/8Tzo4zk7VXdI7kwbxv1NW59ciExIPxE3b4TxzUxW5pJH4dKPIZeSwr8bQOt5l
+    rR9LijpL6mqItyRP9yzijRol8qL3KNeFI5K+DnQUzSh+rY0mflGE0HGPn5sx+F8i
+    7MoQBdhmlIHDpkgJIyVSxwU8XzIjgW6yRbpolLTbD/jePZ7DlDd278ipNIx5U0/+
+    uWvaC9fOUncJ4EAdA3+1xsOYNhvOfg65GGy0oRf9ib0b5H3j5UEbGNvk+SW//UMc
+    lQEqtr8CgYEA7t0S/46GYA4OTQZantixJEQ9WtiOx/ug94e3QTBAAGlqDoL8sImM
+    B9uWWD4rBW0PHsBJoR/gEwGke1dbi3thDH1Pj0MAUxX7wlrCJU9CUxOOmr9XZGNE
+    KmmvfmIpYEE4OnClL3bNcP1AD1smpPTsdIV9wnjxs2lftaeRSHux2ucCgYEA7iUm
+    SGlnVLHFc8oZfzU42DzhR9eYMdkGwiBb73CpbqdQe+Pqt0X8L2lnTJIpzdXcrf9k
+    B9Ck4QJtz5jPr296AW9R34hFKZjtxPcVhcZyPKZvIkGug6xtvfHUQLT7JOabEGo4
+    ajaPYb7HYtDkusTuJkJYbynIIxehm3T+ZHIZlM8CgYB+GYu8Clv6PbFjDGWu0irC
+    QJw7Z3QJM1gJFUazTWucTApHWvNXp2WbiFtYfolrteVzkIPOYeuDXSyeSMH1Ys8b
+    LtRfhzmWo1ZjhlJULAGRphN0smrKfnUwBtc021GIlSXABFPQOOHAMpItCSvfjcV+
+    xjJcBkljM8/pMGtMXrDIJQKBgQCUXbSyHGjyDScU8m5cIE5f+d3oolsBg1KAkyRz
+    0l7cv4SXCvHqaMGq0CI5RD6jLIAmLxyk+cofHSJI2c1aYTtDtZTujLl6JvrLYZyZ
+    EX+OZaqLTxxokH52fjlcbuSgosMswOCQ25kMro0N9VLrQVGVqHPsHb3AjzJx5buv
+    3J4vZQKBgQC0GEkfv72G8qhkE5sPLyYLXL/Cn5/C11eJpRrUtfMSeIGiRJX9SJW1
+    snpAT6a6/HYHAU80rVbt7EQZvmj11Ndtal/7Ycd42fmdulFRyf/Bpun8mz3lEdq/
+    i71yN9gHo++pNytfaDzn+ggFMACOSMCV7qo8oRf0+Oq65jXXZBegKQ==
+    -----END RSA PRIVATE KEY-----
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: objectfs-controller
+  namespace: kube-objectfs-system
+spec:
+  podSelector:
+    matchLabels:
+      app: objectfs-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: objectfs-node-daemon
+        - podSelector:
+            matchLabels:
+              app: objectfs-admin
+      ports:
+        - protocol: TCP
+          port: 50051
+
+---
+
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -107,6 +223,8 @@ spec:
             - "--nodeid=$(NODE_ID)"
             - "--controller-address=objectfs-controller:50051"
             - "--cache-dir=/var/cache/objectfs"
+            - "--ca-cert-file=/etc/objectfs/tls/ca.crt"
+            - "--token-file=/var/run/secrets/tokens/token"
           env:
             - name: NODE_ID
               valueFrom:
@@ -120,6 +238,12 @@ spec:
               mountPropagation: "Bidirectional"
             - name: cache-dir
               mountPath: /var/cache/objectfs
+            - name: objectfs-tls
+              mountPath: /etc/objectfs/tls
+              readOnly: true
+            - name: token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
       volumes:
         - name: socket-dir
           hostPath:
@@ -137,6 +261,16 @@ spec:
           hostPath:
             path: /var/cache/objectfs
             type: DirectoryOrCreate
+        - name: objectfs-tls
+          secret:
+            secretName: objectfs-tls
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: objectfs-controller
+                  expirationSeconds: 3600
+                  path: token
 
 ---
 
@@ -174,6 +308,9 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
 
 ---
 
@@ -258,6 +395,9 @@ spec:
             - "--metadata-dir=/var/lib/objectfs/controller/metadata"
             - "--wal-target=wal-buffer:50051"
             - "--wal-durability=witness"
+            - "--tls-cert-file=/etc/objectfs/tls/tls.crt"
+            - "--tls-key-file=/etc/objectfs/tls/tls.key"
+            - "--auth-audience=objectfs-controller"
           env:
             - name: OBJECT_STORAGE_BACKEND
               valueFrom:
@@ -271,6 +411,12 @@ spec:
               mountPath: /csi
             - name: data-dir
               mountPath: /var/lib/objectfs/controller
+            - name: objectfs-tls
+              mountPath: /etc/objectfs/tls
+              readOnly: true
+            - name: token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
       volumes:
         - name: socket-dir
           emptyDir: {}
@@ -278,6 +424,16 @@ spec:
           hostPath:
             path: /var/lib/objectfs/controller
             type: DirectoryOrCreate
+        - name: objectfs-tls
+          secret:
+            secretName: objectfs-tls
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: objectfs-controller
+                  expirationSeconds: 3600
+                  path: token
 
 ---
 

@@ -335,9 +335,48 @@ Each node daemon and controller maintains a local cache backed by memory and ded
 
 ### 3. Trying It Locally
 
-`dev/tasks/fuse-start` runs the whole stack on one machine with no cloud credentials: it starts `objectfs-controller` against a `file://` object store in a temp directory and mounts a volume there with `objectfsctl mount`. On Linux it runs natively; on macOS it cross-compiles Linux binaries and runs them in a Docker container with `/dev/fuse`, opening a shell inside the container where the mount is visible. See the header of the script for the environment variables it accepts (volume ID, write mode, data directory, extra `objectfsctl mount` flags such as `--debug`).
+`dev/tasks/fuse-start` runs the whole stack on one machine with no cloud credentials: it starts `objectfs-controller` against a `file://` object store in a temp directory and mounts a volume there with `objectfsctl mount`. On Linux it runs natively; on macOS it cross-compiles Linux binaries and runs them in a Docker container with `/dev/fuse`, opening a shell inside the container where the mount is visible. In local dev mode, the controller and `objectfsctl` use the explicit `--insecure` flag to run plaintext gRPC without Kubernetes token authentication. See the header of the script for the environment variables it accepts (volume ID, write mode, data directory, extra `objectfsctl mount` flags such as `--debug`).
 
-### 4. Write Staging, Pack Consolidation & Durability Contract
+### 4. Security, Authentication, TLS & NetworkPolicy
+
+ObjectFS enforces network isolation, transport encryption, and role-based token authentication for controller communication in Kubernetes clusters:
+
+1. **NetworkPolicy:**
+   - Ingress to the controller's gRPC port (`50051`) is restricted by a `NetworkPolicy` to pods labeled `app: objectfs-node-daemon` and `app: objectfs-admin`.
+   - All unauthorized pods in the cluster are blocked from establishing network connections to the controller endpoint.
+
+2. **Transport Layer Security (TLS):**
+   - The controller serves gRPC over TLS.
+   - By default, `k8s/objectfs.yaml` includes a generated CA and controller server certificate in a Kubernetes Secret (`objectfs-tls`). The CA is mounted into `objectfs-node-daemon` pods at `/etc/objectfs/tls/ca.crt` to verify controller authenticity.
+   - **Cert-Manager (Optional):** In production clusters with cert-manager installed, operators can replace the static Secret with a cert-manager `Issuer` and `Certificate` named `objectfs-tls`. Node daemons and the controller consume certificates from the same paths.
+   - Plaintext gRPC is strictly disabled unless explicitly opted into via `--insecure` (e.g. for `dev/tasks/fuse-start` and CI gates). Tokens are never transmitted over plaintext connections.
+
+3. **Node Daemon Authentication & Role-Based Authorization:**
+   - Node daemons authenticate to the controller by presenting a projected Kubernetes `ServiceAccount` token with a dedicated audience (`--auth-audience=objectfs-controller`) as a per-RPC bearer credential (`grpcutil.NewTokenFileCredentials`).
+   - The controller validates tokens against the Kubernetes API server using `TokenReview` requests and caches validation results in memory (`--auth-cache-ttl=5m`) to eliminate API server query overhead on high-frequency RPCs.
+   - Authenticated identities are authorized by role:
+     - **`node-daemon` Role (`objectfs-node-daemon` ServiceAccount):** Allowed to execute filesystem and CSI operations (`GetAttr`, `ReadFile`, `WriteFile`, `Fsync`, `WatchVolume`, `AckCheckpoint`, etc.). Calls to administrative methods are rejected with `PermissionDenied`.
+     - **`admin` Role (`objectfs-admin` ServiceAccount):** Allowed full access to all RPCs, including `CreateSnapshot`, `ListSnapshots`, `ListVolumes`, `ListBlobs`, and `Checkpoint`.
+     - **Unauthenticated / Other ServiceAccounts:** Blocked with `Unauthenticated` or `PermissionDenied`.
+
+4. **Administrative Path for `objectfsctl`:**
+   - `objectfsctl` provides `--ca` and `--token` flags (also configurable via `OBJECTFS_CA` and `OBJECTFS_TOKEN` environment variables):
+     ```bash
+     # Mint a short-lived token for objectfs-admin:
+     TOKEN=$(kubectl create token objectfs-admin -n kube-objectfs-system --audience=objectfs-controller)
+     kubectl get secret objectfs-tls -n kube-objectfs-system -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt
+
+     # Port-forward to controller and execute administrative commands:
+     kubectl port-forward -n kube-objectfs-system svc/objectfs-controller 50051:50051
+     objectfsctl --server=localhost:50051 --ca=ca.crt --token="$TOKEN" volumes list
+     ```
+   - Alternatively, an admin pod labeled `app: objectfs-admin` with `serviceAccountName: objectfs-admin` and the projected token volume can be run directly inside the cluster.
+
+5. **Known Limitations & Follow-ups:**
+   - **Per-volume authorization:** A node daemon currently has access to all volumes serviced by the controller. Limiting each node's access strictly to volumes associated with pods currently scheduled on that node is a planned follow-up.
+   - **WAL buffer endpoint security:** Securing the central `wal-buffer` endpoint with TLS and authentication is a planned follow-up.
+
+### 5. Write Staging, Pack Consolidation & Durability Contract
 
 To achieve both high write throughput and optimal packing in cloud object storage, ObjectFS employs a **stage-and-sync** architecture:
 
@@ -389,7 +428,7 @@ The durability of an `fsync` operation depends on the configured controller WAL 
 **Why Warn When No Controller WAL is Configured?**
 ObjectFS builds a full filesystem on top of structured-data-streams. The controller's WAL stream provides low-latency, crash-consistent linearizable metadata commits without having to take full filesystem index snapshots on every `fsync`. When running without a controller WAL stream, the volume operates as an **ephemeral shared disk**: `fsync` acknowledges success once chunks are packed and uploaded, but metadata modifications remain only in local controller state until the periodic flush or clean shutdown. A controller crash or restart will lose un-flushed metadata since the last snapshot. The controller emits a prominent warning at startup and on volume creation so operators are aware that `fsync` is not durable across controller restarts in this mode.
 
-### 5. Configurable Write-Through Modes
+### 6. Configurable Write-Through Modes
 ObjectFS supports three distinct write synchronization modes:
 1. `WRITE_THROUGH_FSYNC`: Default mode. Writes are staged on the controller and committed to durable pack storage upon `fsync(2)` or background coalesce window sync.
 2. `LAZY_WRITE`: Writes are buffered asynchronously and flushed in background batches, maximizing write throughput for scratch and temporary workloads.

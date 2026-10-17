@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net"
@@ -37,6 +38,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"k8s.io/klog/v2"
 )
 
@@ -60,6 +62,17 @@ var (
 	syncCoalesceWindow       = flag.Duration("sync-coalesce-window", 1*time.Second, "Coalescing window for non-blocking sync requests")
 	maxStagingBytes          = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
 	controllerSyncTimeout    = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
+	tlsCertFile              = flag.String("tls-cert-file", "", "Path to TLS certificate file")
+	tlsKeyFile               = flag.String("tls-key-file", "", "Path to TLS private key file")
+	insecure                 = flag.Bool("insecure", false, "Disable TLS and token authentication (e.g. for local dev/testing)")
+	authAudience             = flag.String("auth-audience", controller.DefaultAudience, "Audience required in projected ServiceAccount tokens")
+	authAdminSA              = flag.String("auth-admin-sa", "objectfs-admin,objectfs-controller", "Comma-separated list of service accounts granted admin role")
+	authNodeSA               = flag.String("auth-node-sa", "objectfs-node-daemon", "Comma-separated list of service accounts granted node role")
+	authCacheTTL             = flag.Duration("auth-cache-ttl", 5*time.Minute, "Cache TTL for successful TokenReviews")
+	authNegativeTTL          = flag.Duration("auth-negative-ttl", 10*time.Second, "Cache TTL for failed TokenReviews")
+	kubeAPIURL               = flag.String("kube-api-url", "", "Kubernetes API server URL for TokenReview (defaults to in-cluster)")
+	kubeTokenFile            = flag.String("kube-token-file", "", "Path to controller ServiceAccount token for TokenReview")
+	kubeCAFile               = flag.String("kube-ca-file", "", "Path to Kubernetes cluster CA cert")
 )
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -72,6 +85,11 @@ func parseEndpoint(endpoint string) (string, string, error) {
 		return "", "", fmt.Errorf("invalid endpoint: %s", endpoint)
 	}
 	return scheme, addr, nil
+}
+
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
 }
 
 func main() {
@@ -158,7 +176,69 @@ func main() {
 		klog.Warningf("objectfs-controller: no WAL stream configured (--wal-dir unset): fsync is NOT durable across controller restarts; volumes behave as ephemeral shared disks and metadata is persisted only by the periodic flush (--flush-interval=%s) and on shutdown", *flushInterval)
 	}
 
-	grpcServer := grpc.NewServer()
+	var grpcServerOpts []grpc.ServerOption
+	if *insecure {
+		klog.Warning("Running in insecure mode: TLS and token authentication are disabled on the gRPC port")
+	} else {
+		certPath := *tlsCertFile
+		if certPath == "" && fileExists("/etc/objectfs/tls/tls.crt") {
+			certPath = "/etc/objectfs/tls/tls.crt"
+		}
+		keyPath := *tlsKeyFile
+		if keyPath == "" && fileExists("/etc/objectfs/tls/tls.key") {
+			keyPath = "/etc/objectfs/tls/tls.key"
+		}
+		if certPath == "" || keyPath == "" {
+			klog.Fatalf("TLS certificate and key required (--tls-cert-file, --tls-key-file) unless --insecure is specified")
+		}
+
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			klog.Fatalf("failed to load TLS certificate from %s / %s: %v", certPath, keyPath, err)
+		}
+		tlsCreds := credentials.NewServerTLSFromCert(&cert)
+
+		kubeReviewer, err := controller.NewKubeTokenReviewer(*kubeAPIURL, *kubeTokenFile, *kubeCAFile)
+		if err != nil {
+			klog.Fatalf("failed to initialize Kubernetes TokenReview client: %v", err)
+		}
+		cachedReviewer := controller.NewCachedTokenReviewer(kubeReviewer, *authCacheTTL, *authNegativeTTL)
+
+		var audiences []string
+		for _, a := range strings.Split(*authAudience, ",") {
+			if a = strings.TrimSpace(a); a != "" {
+				audiences = append(audiences, a)
+			}
+		}
+		var adminSAs []string
+		for _, s := range strings.Split(*authAdminSA, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				adminSAs = append(adminSAs, s)
+			}
+		}
+		var nodeSAs []string
+		for _, s := range strings.Split(*authNodeSA, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				nodeSAs = append(nodeSAs, s)
+			}
+		}
+
+		authConfig := controller.AuthConfig{
+			Audiences:            audiences,
+			AdminServiceAccounts: adminSAs,
+			NodeServiceAccounts:  nodeSAs,
+			Insecure:             false,
+		}
+		authInterceptor := controller.NewServerAuthInterceptor(cachedReviewer, authConfig)
+
+		grpcServerOpts = append(grpcServerOpts,
+			grpc.Creds(tlsCreds),
+			grpc.UnaryInterceptor(authInterceptor.UnaryServerInterceptor()),
+			grpc.StreamInterceptor(authInterceptor.StreamServerInterceptor()),
+		)
+	}
+
+	grpcServer := grpc.NewServer(grpcServerOpts...)
 	server := controller.NewServer(backend, serverOpts...)
 	csiController := controller.NewCSIController(server)
 

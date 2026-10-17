@@ -35,9 +35,18 @@ import (
 
 type options struct {
 	serverAddr string
+	caCert     string
+	token      string
+	insecure   bool
 }
 
-func dialServer(addr string) (pb.ObjectFSControllerClient, io.Closer, error) {
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
+}
+
+func dialServer(opts *options) (pb.ObjectFSControllerClient, io.Closer, error) {
+	addr := opts.serverAddr
 	if addr == "" {
 		addr = os.Getenv("OBJECTFS_SERVER")
 	}
@@ -50,7 +59,46 @@ func dialServer(addr string) (pb.ObjectFSControllerClient, io.Closer, error) {
 		target = strings.TrimPrefix(target, "tcp://")
 	}
 
-	conn, err := grpc.NewClient(target, grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials()))...)
+	caFile := opts.caCert
+	if caFile == "" {
+		caFile = os.Getenv("OBJECTFS_CA")
+	}
+	tok := opts.token
+	if tok == "" {
+		tok = os.Getenv("OBJECTFS_TOKEN")
+	}
+
+	if !opts.insecure {
+		if caFile == "" && fileExists("/etc/objectfs/tls/ca.crt") {
+			caFile = "/etc/objectfs/tls/ca.crt"
+		}
+		if tok == "" && fileExists("/var/run/secrets/tokens/token") {
+			tok = "/var/run/secrets/tokens/token"
+		}
+	}
+
+	useInsecure := opts.insecure || (caFile == "" && tok == "")
+
+	var dialOpts []grpc.DialOption
+	if useInsecure {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else {
+		tlsCreds, err := grpcutil.NewClientTLSFromFile(caFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load TLS credentials: %w", err)
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(tlsCreds))
+
+		if tok != "" {
+			if fileExists(tok) {
+				dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(grpcutil.NewTokenFileCredentials(tok)))
+			} else {
+				dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(grpcutil.NewTokenCredentials(tok)))
+			}
+		}
+	}
+
+	conn, err := grpc.NewClient(target, grpcutil.DialOptions(dialOpts...)...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to server at %s: %w", addr, err)
 	}
@@ -71,6 +119,9 @@ func NewRootCommand() *cobra.Command {
 	}
 
 	rootCmd.PersistentFlags().StringVar(&opts.serverAddr, "server", "", "ObjectFS server address (e.g. localhost:50051 or unix:///path/to/socket)")
+	rootCmd.PersistentFlags().StringVar(&opts.caCert, "ca", "", "Path to CA certificate file for controller TLS verification")
+	rootCmd.PersistentFlags().StringVar(&opts.token, "token", "", "Token string or path to token file for controller authentication")
+	rootCmd.PersistentFlags().BoolVar(&opts.insecure, "insecure", false, "Connect to controller using plaintext gRPC without authentication")
 
 	rootCmd.AddCommand(newBlobsCommand(opts))
 	rootCmd.AddCommand(newVolumesCommand(opts))
@@ -112,7 +163,7 @@ func newBlobsListCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("--server is required")
 			}
 
-			client, conn, err := dialServer(listOpts.serverAddr)
+			client, conn, err := dialServer(listOpts.options)
 			if err != nil {
 				return err
 			}
@@ -177,7 +228,7 @@ func newBlobsGetCommand(opts *options) *cobra.Command {
 			}
 
 			sha := args[0]
-			client, conn, err := dialServer(getOpts.serverAddr)
+			client, conn, err := dialServer(getOpts.options)
 			if err != nil {
 				return err
 			}
@@ -244,7 +295,7 @@ func newVolumesListCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("--server is required")
 			}
 
-			client, conn, err := dialServer(listOpts.serverAddr)
+			client, conn, err := dialServer(listOpts.options)
 			if err != nil {
 				return err
 			}
@@ -352,7 +403,7 @@ func newSnapshotsListCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("volume_id is required")
 			}
 
-			client, conn, err := dialServer(listOpts.serverAddr)
+			client, conn, err := dialServer(listOpts.options)
 			if err != nil {
 				return err
 			}
@@ -470,7 +521,7 @@ func newSnapshotCreateCommand(opts *options) *cobra.Command {
 				snapName = args[1]
 			}
 
-			client, conn, err := dialServer(createOpts.serverAddr)
+			client, conn, err := dialServer(createOpts.options)
 			if err != nil {
 				return err
 			}
@@ -509,7 +560,7 @@ func newCheckpointCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("volume ID is required")
 			}
 
-			client, conn, err := dialServer(opts.serverAddr)
+			client, conn, err := dialServer(opts)
 			if err != nil {
 				return err
 			}
