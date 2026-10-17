@@ -426,6 +426,32 @@ The gRPC contract between `objectfs-node-daemon` and `objectfs-controller` is de
 
 ---
 
+## Compatibility
+
+### Format Versioning Policy
+Every durable artefact written to cloud object storage or local disk contains an explicit magic identifier and format version header:
+- **Readers accept current and previous versions:** Readers for all durable artefacts accept both the current format version ($V_N$) and the previous format version ($V_{N-1}$). Readers reject any artefact with a format version newer than the current supported version with an informative error.
+- **Writers write current version:** Writers always write the current format version ($V_N$).
+- **One-time upgrade flag (`--accept-unversioned-segments`):** Pre-versioning legacy artefacts (files created prior to the introduction of magic and format version headers) are rejected by default. They are accepted only when the `--accept-unversioned-segments` flag is explicitly passed to controllers, buffer daemons, or CLI tools. When an unversioned artefact is encountered with this flag enabled, a warning is logged and the data is read. This flag is intended solely for one-time migrations and will be deprecated and removed in a future release.
+
+### API Compatibility
+The gRPC APIs (`objectfs.v1alpha1`, `wal.v1alpha1`, and `sds.v1`) are in **Alpha**. During the alpha phase, APIs are strictly additive: new fields, RPC methods, and enum values may be added, but existing field numbers, message semantics, and wire formats remain backward-compatible without breaking existing serialized payloads. The API surface will be stabilized and pinned upon reaching `v1`.
+
+### Artefact Classification: Derived vs. Only Copy
+
+Artefacts in ObjectFS are categorized as either **Derived** or **Only Copy**:
+
+| Artefact | Category | Storage Location | Recovery / Resilience Guarantee |
+|---|---|---|---|
+| **Data Blobs** (Loose & Packfiles) | **Only Copy** | Cloud Object Storage (`blobs/`) | Authoritative content-addressable file payload data. Cannot be re-derived if deleted. Versioned with `OBJB` magic and format version `1`. |
+| **Streams** (Log segments & sealed files) | **Only Copy** | Cloud Object Storage & Local WAL (`streams/`) | Authoritative change-log of metadata mutations and transaction events. Cannot be re-derived if deleted. Versioned with `OFWL` magic, format version `1`, and `StreamHeader` record. |
+| **Snapshots past trim point** | **Only Copy** | Cloud Object Storage (`snapshots/`) | When change-log stream history has been trimmed or garbage-collected past the snapshot position, the snapshot is the sole authoritative copy of the base filesystem state. Format-versioned (`_meta` table in SQLite, `\x00format_version` in table snapshots). |
+| **Snapshots with stream retained** | **Derived** | Cloud Object Storage (`snapshots/`) | Point-in-time index images that can be regenerated from scratch by replaying the change-log stream from sequence 1 (or a prior retained snapshot). |
+| **Local Indexes** | **Derived** | Local Node & Controller Disk (`metadata-dir`) | SQLite databases and Pebble table indexes maintained on fast local storage for low-latency queries; rebuilt on restart or corruption from cloud snapshots and WAL replay. |
+| **Local Caches** | **Derived** | Local Node Disk (`cache-dir`) & Memory | Temporary read caches (`NodeCache`) and dirty write staging buffers. Can be discarded or repopulated from authoritative storage on demand. |
+
+---
+
 ## Roadmap & Next Steps (TODOs)
 
 The following items represent the planned roadmap and architectural evolution for ObjectFS:
