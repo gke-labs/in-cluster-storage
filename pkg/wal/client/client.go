@@ -62,6 +62,10 @@ func (l Level) String() string {
 // (Witness or Permanent) is requested on a stream with no remote target configured.
 var ErrDurabilityUnavailable = errors.New("WAL has no remote target")
 
+// ErrRecordDiscarded is returned when a client waiter was waiting on a sequence
+// that was discarded due to divergence from authoritative buffer history.
+var ErrRecordDiscarded = errors.New("WAL record discarded due to history divergence")
+
 // DegradedError indicates that the WAL stream encountered an unrecoverable local store failure
 // (such as segment truncation error) and cannot safely accept or wait for further writes.
 type DegradedError struct {
@@ -158,6 +162,12 @@ func WithGRPCClient(client pb.WalBufferClient) Option {
 	}
 }
 
+type syncWaiter struct {
+	seq   uint64
+	level Level
+	done  chan error
+}
+
 type streamImpl struct {
 	dir      string
 	streamID uuid.UUID
@@ -172,6 +182,7 @@ type streamImpl struct {
 	witnessSeq    uint64
 	s3Seq         uint64
 	retainedBytes int64
+	waiters       []*syncWaiter
 
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
@@ -392,64 +403,69 @@ func (s *streamImpl) waitFor(ctx context.Context, seq uint64, level Level) error
 		return fmt.Errorf("durability level %s requested but %w", level, ErrDurabilityUnavailable)
 	}
 
-	s.mu.RLock()
-	witness := s.witnessSeq
-	s3 := s.s3Seq
-	degErr := s.degradedErr
-	s.mu.RUnlock()
-
-	if degErr != nil {
-		return degErr
+	s.mu.Lock()
+	if s.degradedErr != nil {
+		err := s.degradedErr
+		s.mu.Unlock()
+		return err
 	}
-
-	if level == Witness && witness >= seq {
+	if s.closed.Load() {
+		s.mu.Unlock()
+		return errors.New("stream closed")
+	}
+	if seq > s.localSeq {
+		s.mu.Unlock()
+		return fmt.Errorf("sequence %d was discarded due to divergence: %w", seq, ErrRecordDiscarded)
+	}
+	if level == Witness && s.witnessSeq >= seq {
+		s.mu.Unlock()
 		return nil
 	}
-	if level == Permanent && s3 >= seq {
+	if level == Permanent && s.s3Seq >= seq {
+		s.mu.Unlock()
 		return nil
 	}
 
-	for {
-		waitChan := make(chan struct{})
-		go func() {
-			s.mu.Lock()
-			for !s.closed.Load() && s.degradedErr == nil {
-				if level == Witness && s.witnessSeq >= seq {
-					break
-				}
-				if level == Permanent && s.s3Seq >= seq {
-					break
-				}
-				s.cond.Wait()
-			}
-			s.mu.Unlock()
-			close(waitChan)
-		}()
+	w := &syncWaiter{
+		seq:   seq,
+		level: level,
+		done:  make(chan error, 1),
+	}
+	s.waiters = append(s.waiters, w)
+	s.mu.Unlock()
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-s.cancelCtx.Done():
-			return errors.New("stream closed")
-		case <-waitChan:
-			s.mu.RLock()
-			degErr := s.degradedErr
-			w, s3w := s.witnessSeq, s.s3Seq
-			s.mu.RUnlock()
-			if degErr != nil {
-				return degErr
-			}
-			if level == Witness && w >= seq {
-				return nil
-			}
-			if level == Permanent && s3w >= seq {
-				return nil
-			}
-			if s.closed.Load() {
-				return errors.New("stream closed")
-			}
+	select {
+	case <-ctx.Done():
+		s.mu.Lock()
+		s.removeWaiterLocked(w)
+		s.mu.Unlock()
+		return ctx.Err()
+	case <-s.cancelCtx.Done():
+		return errors.New("stream closed")
+	case err := <-w.done:
+		return err
+	}
+}
+
+func (s *streamImpl) removeWaiterLocked(target *syncWaiter) {
+	for i, w := range s.waiters {
+		if w == target {
+			s.waiters = append(s.waiters[:i], s.waiters[i+1:]...)
+			break
 		}
 	}
+}
+
+func (s *streamImpl) notifyWaitersLocked() {
+	var remaining []*syncWaiter
+	for _, w := range s.waiters {
+		if (w.level == Witness && s.witnessSeq >= w.seq) || (w.level == Permanent && s.s3Seq >= w.seq) {
+			w.done <- nil
+		} else {
+			remaining = append(remaining, w)
+		}
+	}
+	s.waiters = remaining
 }
 
 // Wait blocks until seq has reached level. If requestFlush is true and level is Permanent,
@@ -469,7 +485,7 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 	s.mu.RUnlock()
 
 	if seq > local {
-		return fmt.Errorf("seq %d has not been appended locally (local=%d)", seq, local)
+		return fmt.Errorf("seq %d has not been appended locally or was discarded due to divergence (local=%d): %w", seq, local, ErrRecordDiscarded)
 	}
 
 	if level != Local && level != Witness && level != Permanent {
@@ -581,6 +597,10 @@ func (s *streamImpl) setDegradedLocked(cause error) *DegradedError {
 		At:    time.Now(),
 	}
 	klog.Errorf("WAL client stream %s degraded: %v", s.streamID, s.degradedErr)
+	for _, w := range s.waiters {
+		w.done <- s.degradedErr
+	}
+	s.waiters = nil
 	if s.cond != nil {
 		s.cond.Broadcast()
 	}
@@ -598,6 +618,10 @@ func (s *streamImpl) Close() error {
 		close(s.initialHelloAckDone)
 	})
 	s.mu.Lock()
+	for _, w := range s.waiters {
+		w.done <- errors.New("stream closed")
+	}
+	s.waiters = nil
 	s.cond.Broadcast()
 	s.mu.Unlock()
 
@@ -716,7 +740,29 @@ func (s *streamImpl) runStreamSession() error {
 		klog.Infof("WAL client stream %s: replication session established", s.streamID)
 	}
 
-	// 3. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
+	// 3. Concurrently receive Acks while replaying and sending newly appended records.
+	// Starting the receiver before replay ensures replayed records can be acked and drained
+	// without filling gRPC/HTTP2 flow control buffers.
+	recvErrCh := make(chan error, 1)
+	var firstAck sync.Once
+	go func() {
+		for {
+			ackResp, err := stream.Recv()
+			if err != nil {
+				recvErrCh <- err
+				return
+			}
+			if ack := ackResp.GetAck(); ack != nil {
+				firstAck.Do(func() {
+					klog.Infof("WAL client stream %s: first ack after reconnect: witness=%d, s3=%d",
+						s.streamID, ack.WitnessAckedStreamSeq, ack.S3AckedStreamSeq)
+				})
+				s.handleAck(ack)
+			}
+		}
+	}()
+
+	// 4. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
 	s.retainedMu.RLock()
 	var recordsToReplay []*wal.ClientRecord
 	for _, r := range s.retainedRecords {
@@ -725,6 +771,13 @@ func (s *streamImpl) runStreamSession() error {
 		}
 	}
 	s.retainedMu.RUnlock()
+
+	if len(recordsToReplay) > 0 {
+		klog.Infof("WAL client stream %s: replaying %d unacknowledged records (%d..%d)",
+			s.streamID, len(recordsToReplay), recordsToReplay[0].StreamSeq, recordsToReplay[len(recordsToReplay)-1].StreamSeq)
+	} else {
+		klog.Infof("WAL client stream %s: no unacknowledged records to replay", s.streamID)
+	}
 
 	for _, rec := range recordsToReplay {
 		if err := stream.Send(&pb.AppendRequest{
@@ -735,21 +788,6 @@ func (s *streamImpl) runStreamSession() error {
 			return fmt.Errorf("failed to replay record %d: %w", rec.StreamSeq, err)
 		}
 	}
-
-	// 4. Concurrently receive Acks and send newly appended records
-	recvErrCh := make(chan error, 1)
-	go func() {
-		for {
-			ackResp, err := stream.Recv()
-			if err != nil {
-				recvErrCh <- err
-				return
-			}
-			if ack := ackResp.GetAck(); ack != nil {
-				s.handleAck(ack)
-			}
-		}
-	}()
 
 	nextSeqToSend := uint64(0)
 	if len(recordsToReplay) > 0 {
@@ -798,6 +836,8 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 	defer s.mu.Unlock()
 
 	witnessHead := helloAck.WitnessAckedStreamSeq
+	klog.Infof("WAL client stream %s: HelloAck received: witness watermark=%d, s3 watermark=%d (local head=%d)",
+		s.streamID, witnessHead, helloAck.S3AckedStreamSeq, s.localSeq)
 	if witnessHead > s.localSeq {
 		klog.Infof("Stream %s: buffer witness watermark (%d) is ahead of local stream head (%d); continuing sequence numbering from buffer head",
 			s.streamID, witnessHead, s.localSeq)
@@ -871,6 +911,17 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 				s.retainedBytes = newRetainedBytes
 				s.localSeq = witnessHead
 
+				// Fail waiters for discarded sequences
+				var remainingWaiters []*syncWaiter
+				for _, w := range s.waiters {
+					if w.seq > witnessHead {
+						w.done <- fmt.Errorf("sequence %d was discarded due to divergence: %w", w.seq, ErrRecordDiscarded)
+					} else {
+						remainingWaiters = append(remainingWaiters, w)
+					}
+				}
+				s.waiters = remainingWaiters
+
 				klog.Warningf("Stream %s: local records above buffer witness watermark (%d) diverged from authoritative buffer history; discarded %d local unacknowledged records",
 					s.streamID, witnessHead, discarded)
 			}
@@ -886,6 +937,8 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 		s.s3Seq = helloAck.S3AckedStreamSeq
 		s.cleanupS3AckedLocked(helloAck.S3AckedStreamSeq)
 	}
+
+	s.notifyWaitersLocked()
 
 	if s.cond != nil {
 		s.cond.Broadcast()
@@ -907,6 +960,8 @@ func (s *streamImpl) handleAck(ack *pb.Ack) {
 		s.s3Seq = ack.S3AckedStreamSeq
 		s.cleanupS3AckedLocked(ack.S3AckedStreamSeq)
 	}
+
+	s.notifyWaitersLocked()
 
 	if s.cond != nil {
 		s.cond.Broadcast()

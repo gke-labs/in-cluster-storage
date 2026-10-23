@@ -82,7 +82,7 @@ func TestNewLogSegmentStore_StaleSegmentRemovalFailure(t *testing.T) {
 		_ = os.Chmod(dir, 0755)
 	}()
 
-	_, err := NewLogSegmentStore(dir, "log", DefaultMaxSegmentSize)
+	_, _, err := NewLogSegmentStore(dir, "log", DefaultMaxSegmentSize)
 	if err == nil {
 		t.Fatalf("expected error removing stale segment files in read-only dir, got nil")
 	}
@@ -161,7 +161,7 @@ func TestScanSegmentFile_Errors(t *testing.T) {
 
 func TestLogSegmentStore_ReadFromCallbackError(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLogSegmentStore(dir, "log", DefaultMaxSegmentSize)
+	store, _, err := NewLogSegmentStore(dir, "log", DefaultMaxSegmentSize)
 	if err != nil {
 		t.Fatalf("failed to create log segment store: %v", err)
 	}

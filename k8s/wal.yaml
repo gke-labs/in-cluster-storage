@@ -88,6 +88,12 @@ spec:
           volumeMounts:
             - name: data-dir
               mountPath: /var/lib/objectfs/wal-buffer
+      # When using hostPath storage, the wal-buffer pod must be pinned to a designated node
+      # (e.g. via nodeSelector or nodeAffinity) so that the local segment store persists across
+      # pod restarts. In dynamic multi-node clusters without node pinning, replace volumes with
+      # volumeClaimTemplates backed by a persistent StorageClass.
+      # nodeSelector:
+      #   kubernetes.io/hostname: <designated-node>
       volumes:
         - name: data-dir
           hostPath:

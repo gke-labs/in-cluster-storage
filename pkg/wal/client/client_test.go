@@ -1332,6 +1332,97 @@ func TestDivergentLocalTailAboveWitnessWatermarkDiscarded(t *testing.T) {
 	}
 }
 
+func TestWait_FailsWhenRecordDiscardedDueToDivergence(t *testing.T) {
+	backend1 := inmemorystorage.New()
+	handle1 := startBufferServer(t, backend1, t.TempDir())
+	addr := handle1.addr
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	streamID := uuid.New()
+	clientDir := t.TempDir()
+
+	// 1. Client connects to server 1 and writes record 1
+	stream, err := Open(ctx, clientDir, streamID, addr)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer stream.Close()
+
+	seq1, err := stream.Append(ctx, []byte("nodeA-rec-1"))
+	if err != nil {
+		t.Fatalf("Append 1 failed: %v", err)
+	}
+	if err := stream.Wait(ctx, seq1, Witness, false); err != nil {
+		t.Fatalf("Wait 1 failed: %v", err)
+	}
+
+	// 2. Stop server 1 so client loses connection and enters reconnect loop
+	handle1.StopWithoutClose()
+
+	// 3. Client appends record 2 and record 3 locally while disconnected
+	seq2, err := stream.Append(ctx, []byte("nodeA-divergent-2"))
+	if err != nil {
+		t.Fatalf("Append 2 failed: %v", err)
+	}
+	_ = seq2
+	seq3, err := stream.Append(ctx, []byte("nodeA-divergent-3"))
+	if err != nil {
+		t.Fatalf("Append 3 failed: %v", err)
+	}
+
+	// 4. In-flight waiter blocks waiting for seq 3 at Witness level
+	waitErrCh := make(chan error, 1)
+	go func() {
+		waitErrCh <- stream.Wait(ctx, seq3, Witness, false)
+	}()
+
+	// Give the goroutine a moment to enter waitFor and register its waiter
+	time.Sleep(50 * time.Millisecond)
+
+	// 5. Start server 2 on the SAME address with a DIFFERENT backend where record 1 has different content
+	backend2 := inmemorystorage.New()
+	srv2DataDir := t.TempDir()
+	handle2 := startBufferServerOnAddr(t, backend2, srv2DataDir, addr)
+	defer handle2.StopGraceful()
+
+	// Write authoritative record 1 on server 2 with divergent payload
+	nodeBDir := t.TempDir()
+	streamB, err := Open(ctx, nodeBDir, streamID, addr)
+	if err != nil {
+		t.Fatalf("Open streamB failed: %v", err)
+	}
+	seqB1, err := streamB.Append(ctx, []byte("authoritative-divergent-1"))
+	if err != nil {
+		t.Fatalf("Append streamB failed: %v", err)
+	}
+	if err := streamB.Wait(ctx, seqB1, Witness, false); err != nil {
+		t.Fatalf("Wait streamB failed: %v", err)
+	}
+	_ = streamB.Close()
+
+	// 6. When stream reconnects, handleHelloAck observes divergence at witnessHead=1
+	// and discards local records 2 and 3. The in-flight waiter for seq 3 MUST fail promptly!
+	select {
+	case err := <-waitErrCh:
+		if err == nil {
+			t.Fatalf("expected error from in-flight waiter for discarded sequence, got nil")
+		}
+		if !errors.Is(err, ErrRecordDiscarded) {
+			t.Fatalf("expected ErrRecordDiscarded, got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("in-flight waiter for discarded sequence hung!")
+	}
+
+	// 7. Any new call to Wait for the discarded sequence must also fail immediately with ErrRecordDiscarded
+	err = stream.Wait(ctx, seq3, Witness, false)
+	if err == nil || !errors.Is(err, ErrRecordDiscarded) {
+		t.Fatalf("expected subsequent Wait for discarded sequence to return ErrRecordDiscarded, got: %v", err)
+	}
+}
+
 func startBufferServerOnAddr(t *testing.T, backend objectstore.Backend, dataDir string, addr string) *testServerHandle {
 	ctx := t.Context()
 	srv, err := buffer.NewServer(ctx, buffer.ServerConfig{

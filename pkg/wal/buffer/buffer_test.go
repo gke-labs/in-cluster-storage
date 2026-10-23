@@ -70,6 +70,60 @@ func startTestServer(t *testing.T, backend objectstore.Backend, dataDir string) 
 	return srv, listener.Addr().String(), cleanup
 }
 
+type testBufferHandle struct {
+	srv        *Server
+	grpcServer *grpc.Server
+	listener   net.Listener
+	addr       string
+}
+
+func (h *testBufferHandle) StopGraceful() {
+	h.grpcServer.Stop()
+	_ = h.srv.Close()
+	_ = h.listener.Close()
+}
+
+func (h *testBufferHandle) StopWithoutFlush() {
+	h.grpcServer.Stop()
+	_ = h.listener.Close()
+	close(h.srv.stopChan)
+	if h.srv.localStore != nil {
+		_ = h.srv.localStore.Close()
+	}
+}
+
+func startTestServerHandle(t *testing.T, backend objectstore.Backend, dataDir string) *testBufferHandle {
+	ctx := t.Context()
+	srv, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 2 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterWalBufferServer(grpcServer, srv)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	return &testBufferHandle{
+		srv:        srv,
+		grpcServer: grpcServer,
+		listener:   listener,
+		addr:       listener.Addr().String(),
+	}
+}
+
 func TestNewServerRequiresDataDir(t *testing.T) {
 	ctx := t.Context()
 	backend := inmemorystorage.New()
@@ -711,6 +765,107 @@ func TestRestartOnPersistentDataDir(t *testing.T) {
 		}
 	}
 	_ = srv2
+}
+
+func TestRestartWithoutFlush_WitnessWatermarkNoRegression(t *testing.T) {
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	ctx := t.Context()
+
+	// 1. Incarnation 1: append records, witness-ack them, but do NOT flush
+	handle1 := startTestServerHandle(t, backend, dataDir)
+
+	conn1, err := grpc.NewClient(handle1.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial srv1 failed: %v", err)
+	}
+	defer conn1.Close()
+
+	client1 := pb.NewWalBufferClient(conn1)
+	streamID := uuid.New()
+
+	appendStream1, err := client1.Append(ctx)
+	if err != nil {
+		t.Fatalf("append stream 1 failed: %v", err)
+	}
+
+	if err := appendStream1.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{
+			Hello: &pb.Hello{StreamId: streamID[:]},
+		},
+	}); err != nil {
+		t.Fatalf("send hello failed: %v", err)
+	}
+	helloResp1, err := appendStream1.Recv()
+	if err != nil {
+		t.Fatalf("recv hello ack failed: %v", err)
+	}
+	if helloResp1.GetHelloAck() == nil {
+		t.Fatalf("expected HelloAck, got %v", helloResp1)
+	}
+
+	// Append 5 records, verify each is witness-acked
+	for i := uint64(1); i <= 5; i++ {
+		if err := appendStream1.Send(&pb.AppendRequest{
+			Msg: &pb.AppendRequest_Record{
+				Record: &pb.AppendRecord{
+					StreamSeq: i,
+					Payload:   []byte(fmt.Sprintf("unflushed-rec-%d", i)),
+				},
+			},
+		}); err != nil {
+			t.Fatalf("send record %d failed: %v", i, err)
+		}
+		ackResp, err := appendStream1.Recv()
+		if err != nil {
+			t.Fatalf("recv ack %d failed: %v", i, err)
+		}
+		ack := ackResp.GetAck()
+		if ack == nil || ack.WitnessAckedStreamSeq != i {
+			t.Fatalf("expected witness ack %d, got %v", i, ack)
+		}
+	}
+
+	// Stop handle1 WITHOUT calling Flush or Close (simulate ungraceful restart with data on disk)
+	handle1.StopWithoutFlush()
+
+	// 2. Incarnation 2: restart on the same dataDir without prior flush
+	handle2 := startTestServerHandle(t, backend, dataDir)
+	defer handle2.StopGraceful()
+
+	conn2, err := grpc.NewClient(handle2.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial srv2 failed: %v", err)
+	}
+	defer conn2.Close()
+
+	client2 := pb.NewWalBufferClient(conn2)
+	appendStream2, err := client2.Append(ctx)
+	if err != nil {
+		t.Fatalf("append stream 2 failed: %v", err)
+	}
+
+	if err := appendStream2.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{
+			Hello: &pb.Hello{StreamId: streamID[:]},
+		},
+	}); err != nil {
+		t.Fatalf("send hello 2 failed: %v", err)
+	}
+	helloResp2, err := appendStream2.Recv()
+	if err != nil {
+		t.Fatalf("recv hello ack 2 failed: %v", err)
+	}
+	helloAck2 := helloResp2.GetHelloAck()
+	if helloAck2 == nil {
+		t.Fatalf("expected HelloAck from srv2, got %v", helloResp2)
+	}
+
+	// Assert the HelloAck watermark did not regress (must be >= 5)
+	if helloAck2.WitnessAckedStreamSeq < 5 {
+		t.Fatalf("watermark regressed on restart: expected >= 5, got %d", helloAck2.WitnessAckedStreamSeq)
+	}
 }
 
 func recvAppendResponseWithTimeout(t *testing.T, stream pb.WalBuffer_AppendClient, timeout time.Duration) (*pb.AppendResponse, error) {

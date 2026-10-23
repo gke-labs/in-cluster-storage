@@ -62,7 +62,7 @@ Set `OBJECTFS_E2E_KEEP_CLUSTERS=1` to keep the shared clusters running after tes
 The E2E suite is split into named presubmit jobs with per-group timeouts, attribution, and cluster shapes:
 - `ap-e2e-core` (`dev/ci/presubmits/ap-e2e-core`): single-node core ObjectFS and WAL tests (`TestObjectFSE2E`, `TestObjectFSStatefulSetE2E`, `TestObjectFSPersistentE2E`, `TestWALE2E`, `TestWALS3E2E`).
 - `ap-e2e-multinode` (`dev/ci/presubmits/ap-e2e-multinode`): two-worker cluster tests (`TestObjectFSMultiNodeFailoverE2E`, `TestObjectFSCrossNodeVisibilityE2E`, `TestObjectFSExclusiveLocalE2E`, `TestObjectFSExclusiveLocalKillE2E`, `TestObjectFSExclusiveLocalIntervalE2E`, `TestObjectFSExclusiveLocalDaemonKillE2E`).
-- `ap-e2e-chaos` (`dev/ci/presubmits/ap-e2e-chaos`): two-worker chaos and fault-injection tests (`TestObjectFSControllerCrashMidWriteE2E`, `TestObjectFSControllerOutageE2E`, `TestObjectFSWalBufferRestartE2E`).
+- `ap-e2e-chaos` (`dev/ci/presubmits/ap-e2e-chaos`): two-worker chaos and fault-injection tests (`TestObjectFSControllerCrashMidWriteE2E`, `TestObjectFSControllerOutageE2E`, `TestObjectFSWalBufferRestartE2E`, `TestObjectFSWalBufferInFlightFsyncAcrossKillE2E`).
 - `ap-torture` (`dev/ci/periodics/ap-torture`): nightly periodic torture test (`TestObjectFSTortureE2E`).
 
 You can run any group locally before pushing:

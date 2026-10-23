@@ -45,9 +45,10 @@ var (
 	}
 
 	chaosGroup = map[string]bool{
-		"TestObjectFSControllerCrashMidWriteE2E": true,
-		"TestObjectFSControllerOutageE2E":        true,
-		"TestObjectFSWalBufferRestartE2E":        true,
+		"TestObjectFSControllerCrashMidWriteE2E":          true,
+		"TestObjectFSControllerOutageE2E":                 true,
+		"TestObjectFSWalBufferRestartE2E":                 true,
+		"TestObjectFSWalBufferInFlightFsyncAcrossKillE2E": true,
 	}
 
 	periodicGroup = map[string]bool{

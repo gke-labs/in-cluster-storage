@@ -175,7 +175,7 @@ func TestTornTrailingRecordDropAndRecoverFile(t *testing.T) {
 func TestLogSegmentStoreReadFrom(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Small maxSegmentSize so files rotate frequently (~100 bytes each)
-	store, err := NewLogSegmentStore(tmpDir, "log", 120)
+	store, _, err := NewLogSegmentStore(tmpDir, "log", 120)
 	if err != nil {
 		t.Fatalf("failed to create log segment store: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestLogSegmentStoreReadFrom(t *testing.T) {
 
 func TestLogSegmentStoreDeleteSegmentsThrough(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := NewLogSegmentStore(tmpDir, "log", 100)
+	store, _, err := NewLogSegmentStore(tmpDir, "log", 100)
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}

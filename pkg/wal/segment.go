@@ -494,9 +494,8 @@ type LogSegmentStore struct {
 	segments   []*SegmentMeta
 }
 
-// NewLogSegmentStore initializes a log segment store with a fixed prefix.
-// Any segment files from previous incarnations in dir are cleaned up on startup.
-func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64, opts ...ScanOption) (*LogSegmentStore, error) {
+// NewLogSegmentStore initializes or reopens a log segment store with a fixed prefix.
+func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64, opts ...ScanOption) (*LogSegmentStore, []*LogRecord, error) {
 	var opt ScanOptions
 	for _, o := range opts {
 		o(&opt)
@@ -509,26 +508,21 @@ func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64, opt
 		filePrefix = "log"
 	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+		return nil, nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read directory %s: %w", dir, err)
+		return nil, nil, fmt.Errorf("failed to read directory %s: %w", dir, err)
 	}
 
-	var removeErrs []error
+	var walFiles []string
 	for _, entry := range entries {
-		if !entry.IsDir() && (strings.HasSuffix(entry.Name(), ".wal") || strings.Contains(entry.Name(), ".wal.")) {
-			p := filepath.Join(dir, entry.Name())
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-				removeErrs = append(removeErrs, fmt.Errorf("failed to remove stale segment file %s: %w", p, err))
-			}
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), filePrefix+"-") && strings.HasSuffix(entry.Name(), ".wal") {
+			walFiles = append(walFiles, filepath.Join(dir, entry.Name()))
 		}
 	}
-	if len(removeErrs) > 0 {
-		return nil, errors.Join(removeErrs...)
-	}
+	sort.Strings(walFiles)
 
 	store := &LogSegmentStore{
 		dir:               dir,
@@ -537,7 +531,27 @@ func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64, opt
 		acceptUnversioned: opt.AcceptUnversioned,
 	}
 
-	return store, nil
+	var allRecords []*LogRecord
+	var removeErrs []error
+	for _, file := range walFiles {
+		records, meta, err := ScanLogSegmentFile(file, opts...)
+		if err != nil {
+			return nil, nil, err
+		}
+		if meta.RecordCount > 0 {
+			store.segments = append(store.segments, meta)
+			allRecords = append(allRecords, records...)
+		} else {
+			if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+				removeErrs = append(removeErrs, fmt.Errorf("failed to remove empty segment file %s: %w", file, err))
+			}
+		}
+	}
+	if len(removeErrs) > 0 {
+		return nil, nil, errors.Join(removeErrs...)
+	}
+
+	return store, allRecords, nil
 }
 
 func (s *LogSegmentStore) segmentFilename(firstPos uint64) string {
