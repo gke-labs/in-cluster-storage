@@ -24,11 +24,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
 )
 
@@ -682,5 +685,160 @@ func TestVolumesDescribeCommand(t *testing.T) {
 	}
 	if !strings.Contains(out, "Exclusive Hold: none") {
 		t.Errorf("expected 'Exclusive Hold: none' after release, got: %s", out)
+	}
+}
+
+type mockRepairStream struct {
+	walclient.Stream
+	degraded atomic.Pointer[walclient.DegradedError]
+}
+
+func (m *mockRepairStream) Degraded() *walclient.DegradedError {
+	return m.degraded.Load()
+}
+
+func TestVolumesRepairAndDegradedDisplay(t *testing.T) {
+	ctx := t.Context()
+	backend := controller.NewMemoryBackend()
+
+	volRepair := "vol-repair"
+	volHealthy := "vol-healthy"
+
+	walDir := t.TempDir()
+
+	streamRepair, err := walclient.Open(ctx, walDir, controller.StreamIDForVolume(volRepair), "")
+	if err != nil {
+		t.Fatalf("Open streamRepair failed: %v", err)
+	}
+	defer streamRepair.Close()
+
+	streamHealthy, err := walclient.Open(ctx, walDir, controller.StreamIDForVolume(volHealthy), "")
+	if err != nil {
+		t.Fatalf("Open streamHealthy failed: %v", err)
+	}
+	defer streamHealthy.Close()
+
+	mockRepair := &mockRepairStream{Stream: streamRepair}
+	mockRepair.degraded.Store(&walclient.DegradedError{
+		Cause: fmt.Errorf("read-only file system"),
+		At:    time.Now().Add(-5 * time.Minute),
+	})
+
+	var mu sync.Mutex
+	repaired := false
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	server := controller.NewServer(backend,
+		controller.WithServerWAL(walDir, "", walclient.Local),
+		controller.WithServerStreamFactory(func(volID string) (walclient.Stream, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if volID == volRepair {
+				if repaired {
+					return walclient.Open(ctx, walDir, controller.StreamIDForVolume(volRepair), "")
+				}
+				return mockRepair, nil
+			}
+			if volID == volHealthy {
+				return streamHealthy, nil
+			}
+			return nil, fmt.Errorf("unknown volume %s", volID)
+		}),
+	)
+	defer server.Close()
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	serverAddr := lis.Addr().String()
+
+	// 1. Initial creation of both volumes
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volHealthy,
+		ParentInode:    1,
+		Name:           "h.txt",
+		InitialContent: []byte("healthy"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile volHealthy failed: %v", err)
+	}
+	// For volRepair, access via GetVolumeStats so it's registered
+	_, err = server.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: volRepair})
+	if err != nil {
+		t.Fatalf("GetVolumeStats volRepair failed: %v", err)
+	}
+
+	// 2. volumes list shows degraded status with reason and since
+	out, err := executeCommand("--server", serverAddr, "volumes", "list")
+	if err != nil {
+		t.Fatalf("volumes list failed: %v", err)
+	}
+	if !strings.Contains(out, "vol-healthy") {
+		t.Errorf("expected vol-healthy in list output, got: %s", out)
+	}
+	if !strings.Contains(out, "vol-repair\t(degraded: WAL stream degraded: read-only file system, since:") {
+		t.Errorf("expected degraded details in volumes list, got: %s", out)
+	}
+
+	// 3. volumes describe on degraded volume shows Degraded section
+	descOut, err := executeCommand("--server", serverAddr, "volumes", "describe", volRepair)
+	if err != nil {
+		t.Fatalf("volumes describe volRepair failed: %v", err)
+	}
+	if !strings.Contains(descOut, "Degraded:") || !strings.Contains(descOut, "read-only file system") {
+		t.Errorf("expected Degraded info in volumes describe output, got: %s", descOut)
+	}
+
+	// 4. volumes repair on healthy volume without --force is refused
+	_, err = executeCommand("--server", serverAddr, "volumes", "repair", volHealthy)
+	if err == nil {
+		t.Fatalf("expected repair on healthy volume without --force to fail")
+	}
+	if !strings.Contains(err.Error(), "is not degraded") {
+		t.Errorf("expected 'is not degraded' error, got: %v", err)
+	}
+
+	// 5. volumes repair on healthy volume with --force succeeds
+	forceOut, err := executeCommand("--server", serverAddr, "volumes", "repair", volHealthy, "--force")
+	if err != nil {
+		t.Fatalf("repair with --force failed: %v", err)
+	}
+	if !strings.Contains(forceOut, "Repaired volume vol-healthy") {
+		t.Errorf("expected Repaired volume vol-healthy in output, got: %s", forceOut)
+	}
+
+	// 6. volumes repair on degraded volume succeeds
+	mu.Lock()
+	repaired = true
+	mu.Unlock()
+
+	repairOut, err := executeCommand("--server", serverAddr, "volumes", "repair", volRepair)
+	if err != nil {
+		t.Fatalf("repair on volRepair failed: %v", err)
+	}
+	if !strings.Contains(repairOut, "Repaired volume vol-repair") {
+		t.Errorf("expected Repaired volume vol-repair in output, got: %s", repairOut)
+	}
+	if !strings.Contains(repairOut, "Old segment directory:") || !strings.Contains(repairOut, ".degraded") {
+		t.Errorf("expected old segment directory with .degraded in output, got: %s", repairOut)
+	}
+	if !strings.Contains(repairOut, "New watermark:") {
+		t.Errorf("expected New watermark in output, got: %s", repairOut)
+	}
+
+	// 7. volumes list now shows vol-repair as healthy (no degraded tag)
+	afterList, err := executeCommand("--server", serverAddr, "volumes", "list")
+	if err != nil {
+		t.Fatalf("volumes list after repair failed: %v", err)
+	}
+	if strings.Contains(afterList, "(degraded:") {
+		t.Errorf("expected no degraded volumes after repair, got: %s", afterList)
 	}
 }

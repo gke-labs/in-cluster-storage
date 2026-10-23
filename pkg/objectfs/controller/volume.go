@@ -1186,6 +1186,14 @@ func (v *Volume) Degraded() *walclient.DegradedError {
 	return nil
 }
 
+// ResetStream updates the volume's underlying WAL stream after repair or reconfiguration.
+func (v *Volume) ResetStream(stream walclient.Stream) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.stream = stream
+	return v.initMetadataStreamLocked()
+}
+
 func (v *Volume) commitTxLocked(ctx context.Context, tx *sds.Tx) (uint64, error) {
 	commitSeq, err := tx.Commit(ctx)
 	if err != nil {

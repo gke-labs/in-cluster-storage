@@ -66,6 +66,7 @@ const (
 	ObjectFSController_RenewExclusive_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/RenewExclusive"
 	ObjectFSController_ReleaseExclusive_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/ReleaseExclusive"
 	ObjectFSController_GetExclusiveHold_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/GetExclusiveHold"
+	ObjectFSController_RepairVolume_FullMethodName     = "/objectfs.v1alpha1.ObjectFSController/RepairVolume"
 )
 
 // ObjectFSControllerClient is the client API for ObjectFSController service.
@@ -113,6 +114,9 @@ type ObjectFSControllerClient interface {
 	ReleaseExclusive(ctx context.Context, in *ReleaseExclusiveRequest, opts ...grpc.CallOption) (*ReleaseExclusiveResponse, error)
 	// GetExclusiveHold returns the current exclusive hold status for a volume.
 	GetExclusiveHold(ctx context.Context, in *GetExclusiveHoldRequest, opts ...grpc.CallOption) (*GetExclusiveHoldResponse, error)
+	// RepairVolume repairs a degraded volume by moving its local segment directory aside
+	// and reopening its stream to resume from the buffer witness watermark.
+	RepairVolume(ctx context.Context, in *RepairVolumeRequest, opts ...grpc.CallOption) (*RepairVolumeResponse, error)
 }
 
 type objectFSControllerClient struct {
@@ -471,6 +475,16 @@ func (c *objectFSControllerClient) GetExclusiveHold(ctx context.Context, in *Get
 	return out, nil
 }
 
+func (c *objectFSControllerClient) RepairVolume(ctx context.Context, in *RepairVolumeRequest, opts ...grpc.CallOption) (*RepairVolumeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RepairVolumeResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_RepairVolume_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ObjectFSControllerServer is the server API for ObjectFSController service.
 // All implementations must embed UnimplementedObjectFSControllerServer
 // for forward compatibility.
@@ -516,6 +530,9 @@ type ObjectFSControllerServer interface {
 	ReleaseExclusive(context.Context, *ReleaseExclusiveRequest) (*ReleaseExclusiveResponse, error)
 	// GetExclusiveHold returns the current exclusive hold status for a volume.
 	GetExclusiveHold(context.Context, *GetExclusiveHoldRequest) (*GetExclusiveHoldResponse, error)
+	// RepairVolume repairs a degraded volume by moving its local segment directory aside
+	// and reopening its stream to resume from the buffer witness watermark.
+	RepairVolume(context.Context, *RepairVolumeRequest) (*RepairVolumeResponse, error)
 	mustEmbedUnimplementedObjectFSControllerServer()
 }
 
@@ -624,6 +641,9 @@ func (UnimplementedObjectFSControllerServer) ReleaseExclusive(context.Context, *
 }
 func (UnimplementedObjectFSControllerServer) GetExclusiveHold(context.Context, *GetExclusiveHoldRequest) (*GetExclusiveHoldResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetExclusiveHold not implemented")
+}
+func (UnimplementedObjectFSControllerServer) RepairVolume(context.Context, *RepairVolumeRequest) (*RepairVolumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RepairVolume not implemented")
 }
 func (UnimplementedObjectFSControllerServer) mustEmbedUnimplementedObjectFSControllerServer() {}
 func (UnimplementedObjectFSControllerServer) testEmbeddedByValue()                            {}
@@ -1226,6 +1246,24 @@ func _ObjectFSController_GetExclusiveHold_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ObjectFSController_RepairVolume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RepairVolumeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).RepairVolume(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_RepairVolume_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).RepairVolume(ctx, req.(*RepairVolumeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ObjectFSController_ServiceDesc is the grpc.ServiceDesc for ObjectFSController service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1356,6 +1394,10 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetExclusiveHold",
 			Handler:    _ObjectFSController_GetExclusiveHold_Handler,
+		},
+		{
+			MethodName: "RepairVolume",
+			Handler:    _ObjectFSController_RepairVolume_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

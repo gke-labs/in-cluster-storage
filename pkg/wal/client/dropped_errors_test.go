@@ -89,7 +89,7 @@ func TestTailStream_Validation(t *testing.T) {
 	}
 }
 
-func TestOpen_DivergenceTruncateFailureFailsOpen(t *testing.T) {
+func TestOpen_DivergenceTruncateFailureDegraded(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("skipping read-only directory test when running as root")
 	}
@@ -147,13 +147,17 @@ func TestOpen_DivergenceTruncateFailureFailsOpen(t *testing.T) {
 	}()
 
 	// 4. Open client stream against wal-buffer. Reconciling divergence requires TruncateAfter(2),
-	// which must fail on the read-only directory and fail Open.
-	_, err = Open(ctx, clientDir, streamID, handle.addr, WithMaxSegmentSize(100))
-	if err == nil {
-		t.Fatalf("expected Open to fail when TruncateAfter fails, got nil")
+	// which fails on read-only dir and places the stream into degraded state (without crashing Open).
+	s, err := Open(ctx, clientDir, streamID, handle.addr, WithMaxSegmentSize(100))
+	if err != nil {
+		t.Fatalf("expected Open to succeed in degraded state, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "failed to truncate local segment store") {
-		t.Errorf("expected failed to truncate local segment store in error, got: %v", err)
+	defer s.Close()
+	if s.Degraded() == nil {
+		t.Fatalf("expected stream to be degraded on truncate failure")
+	}
+	if !strings.Contains(s.Degraded().Error(), "failed to truncate local segment store") {
+		t.Errorf("expected failed to truncate local segment store in degraded error, got: %v", s.Degraded())
 	}
 }
 

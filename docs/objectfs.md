@@ -431,6 +431,72 @@ The gRPC contract between `objectfs-node-daemon` and `objectfs-controller` is de
 | | `CreateSnapshot` | Manually triggers an immediate EROFS snapshot compilation. |
 | | `Checkpoint` | Triggers an explicit checkpoint commit on an exclusive-local volume and waits for acknowledgement. |
 | | `AckCheckpoint` | Acknowledges completion of an explicit checkpoint commit by a node daemon. |
+| | `RepairVolume` | Moves volume's degraded segment files aside and reopens stream from witness watermark. |
+
+---
+
+## Degraded Volumes & Recovery Runbook
+
+When a volume's underlying write-ahead log (WAL) stream encounters an unrecoverable local storage error (such as a read-only filesystem, out-of-space condition, or permission denial during stream divergence reconciliation), the stream marks itself as **degraded** (`DegradedError`) and stops replication.
+
+### Operational Characteristics
+
+1. **Read Availability:** The controller keeps the degraded volume fully readable. Workloads can continue reading existing cached and persistent metadata and object data.
+2. **Write Safety:** To prevent uncommitted mutations from accumulating on a divergent local filesystem, all stream-mutating operations fail fast with `EIO` upon `fsync`.
+3. **Data Durability Guarantee:** Records above the WAL buffer's witness watermark represent local unacknowledged records that have diverged from authoritative history; records at or below the witness watermark are already durable in the WAL buffer. Consequently, the local segment store holds no records that cannot be recovered from the buffer.
+
+### Identifying Degraded Volumes
+
+Operators can check volume health using `objectfsctl`:
+
+```bash
+# List volumes and inspect status (degraded volumes display the reason and since timestamp)
+objectfsctl --server <controller-addr> volumes list
+
+# Detailed volume stats and degraded information
+objectfsctl --server <controller-addr> volumes describe <volume-id>
+```
+
+When degraded, `volumes list` outputs:
+```
+my-volume	(degraded: failed to truncate local segment store to 42: read-only file system, since: 2026-10-21T18:00:00Z)
+```
+
+### Automatic Recovery
+
+The WAL client background loop automatically retries the failed truncate operation with exponential backoff (starting at 1 second, capped at 1 minute, continuing indefinitely). If the underlying cause is transient (for example, the filesystem is remounted read-write or disk space is freed), the truncate succeeds automatically.
+
+Upon successful truncate:
+- The stream clears its degraded state.
+- A recovery log is emitted at info level noting the stream ID and duration of degradation.
+- The stream re-enters the replication loop and re-resolves divergence during the buffer handshake.
+- Blocked sync waiters are unblocked, and new mutating operations proceed normally.
+
+### Controller Restart Behaviour
+
+If the controller is restarted:
+- **With the underlying fault cleared:** The controller detects stream divergence during volume open, successfully truncates obsolete local segments to the buffer's witness watermark, and resumes healthy operation automatically.
+- **With the fault still present:** The controller starts up cleanly without crashlooping. The volume initializes in degraded state, remaining readable while failing fsyncs with `EIO` until repaired or until automatic retry succeeds.
+
+### Manual Operator Repair (`objectfsctl volumes repair`)
+
+If automatic retry cannot resolve the issue (e.g. persistent local disk corruption), an operator can repair the volume using `objectfsctl`:
+
+```bash
+objectfsctl --server <controller-addr> volumes repair <volume-id>
+```
+
+This is backed by the `RepairVolume` RPC:
+1. Closes the volume's active WAL stream and segment store.
+2. Moves the volume's local segment files aside into `<dir>/stream-<id>.<unix-ts>.degraded/` (never deletes files).
+3. Reopens the stream, resuming sequence numbering from the buffer's authoritative witness watermark.
+4. Clears the degraded state and restores full read-write availability.
+5. Leaves all other volumes on the controller untouched.
+
+If the volume is healthy, `repair` is refused unless `--force` is specified:
+```bash
+objectfsctl --server <controller-addr> volumes repair <volume-id> --force
+```
 
 ---
 

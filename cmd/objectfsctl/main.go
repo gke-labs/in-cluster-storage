@@ -224,6 +224,7 @@ func newVolumesCommand(opts *options) *cobra.Command {
 
 	volumesCmd.AddCommand(newVolumesListCommand(opts))
 	volumesCmd.AddCommand(newVolumesDescribeCommand(opts))
+	volumesCmd.AddCommand(newVolumesRepairCommand(opts))
 
 	return volumesCmd
 }
@@ -311,10 +312,71 @@ func newVolumesDescribeCommand(opts *options) *cobra.Command {
 				printf("  Directories:   %d\n", s.GetInodesDir())
 				printf("  Logical Bytes: %d\n", s.GetLogicalBytes())
 			}
+			if statsResp != nil && statsResp.GetDegraded() != nil {
+				deg := statsResp.GetDegraded()
+				println("Degraded:")
+				printf("  Reason: %s\n", deg.GetMessage())
+				if deg.GetSince() != nil {
+					printf("  Since:  %s\n", deg.GetSince().AsTime().Format(time.RFC3339))
+				}
+			}
 
 			return printErr
 		},
 	}
+	return cmd
+}
+
+type volumesRepairOptions struct {
+	*options
+	force bool
+}
+
+func newVolumesRepairCommand(opts *options) *cobra.Command {
+	repairOpts := &volumesRepairOptions{options: opts}
+	cmd := &cobra.Command{
+		Use:   "repair <volume>",
+		Short: "Repair a degraded volume by moving its segment directory aside and resuming from buffer watermark",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if repairOpts.serverAddr == "" {
+				return fmt.Errorf("--server is required")
+			}
+			volumeID := args[0]
+			if volumeID == "" {
+				return fmt.Errorf("volume ID is required")
+			}
+
+			client, conn, err := dialServer(repairOpts.serverAddr)
+			if err != nil {
+				return err
+			}
+			defer errutil.CloseAndLog(conn, "server connection")
+
+			resp, err := client.RepairVolume(cmd.Context(), &pb.RepairVolumeRequest{
+				VolumeId: volumeID,
+				Force:    repairOpts.force,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to repair volume %s: %w", volumeID, err)
+			}
+
+			out := cmd.OutOrStdout()
+			if _, err := fmt.Fprintf(out, "Repaired volume %s\n", volumeID); err != nil {
+				return fmt.Errorf("failed writing to output: %w", err)
+			}
+			if resp.GetOldPath() != "" {
+				if _, err := fmt.Fprintf(out, "  Old segment directory: %s\n", resp.GetOldPath()); err != nil {
+					return fmt.Errorf("failed writing to output: %w", err)
+				}
+			}
+			if _, err := fmt.Fprintf(out, "  New watermark:         %d\n", resp.GetNewWatermark()); err != nil {
+				return fmt.Errorf("failed writing to output: %w", err)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&repairOpts.force, "force", false, "Force repair even if volume is not currently reported as degraded (closes stream under in-flight operations, causing them to fail)")
 	return cmd
 }
 
@@ -356,8 +418,24 @@ func newVolumesListCommand(opts *options) *cobra.Command {
 				}
 
 				for _, vol := range resp.GetVolumes() {
-					if _, err := fmt.Fprintln(out, vol.GetVolumeId()); err != nil {
-						return fmt.Errorf("failed writing to output: %w", err)
+					if deg := vol.GetDegraded(); deg != nil {
+						sinceStr := ""
+						if deg.GetSince() != nil {
+							sinceStr = deg.GetSince().AsTime().Format(time.RFC3339)
+						}
+						if sinceStr != "" {
+							if _, err := fmt.Fprintf(out, "%s\t(degraded: %s, since: %s)\n", vol.GetVolumeId(), deg.GetMessage(), sinceStr); err != nil {
+								return fmt.Errorf("failed writing to output: %w", err)
+							}
+						} else {
+							if _, err := fmt.Fprintf(out, "%s\t(degraded: %s)\n", vol.GetVolumeId(), deg.GetMessage()); err != nil {
+								return fmt.Errorf("failed writing to output: %w", err)
+							}
+						}
+					} else {
+						if _, err := fmt.Fprintln(out, vol.GetVolumeId()); err != nil {
+							return fmt.Errorf("failed writing to output: %w", err)
+						}
 					}
 					fromVol = vol.GetVolumeId()
 					if remainingLimit > 0 {

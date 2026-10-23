@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +31,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -1459,5 +1462,214 @@ func TestClientReconnectAfterBufferCrash(t *testing.T) {
 		if seq != expectedSeqs[i] {
 			t.Errorf("at index %d: expected seq %d, got %d", i, expectedSeqs[i], seq)
 		}
+	}
+}
+
+type faultInjectingStore struct {
+	SegmentStore
+	mu           sync.Mutex
+	failCount    int
+	successCount int
+}
+
+func (f *faultInjectingStore) TruncateAfter(seq uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failCount < 2 {
+		f.failCount++
+		return fmt.Errorf("injected TruncateAfter failure #%d", f.failCount)
+	}
+	f.successCount++
+	return f.SegmentStore.TruncateAfter(seq)
+}
+
+func TestDivergenceTruncateRetryRecovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir())
+	defer handle.StopGraceful()
+
+	streamID := uuid.New()
+
+	// 1. Another node writes authoritative records 1..2 to wal-buffer (witness watermark = 2)
+	nodeBDir := t.TempDir()
+	streamB, err := Open(ctx, nodeBDir, streamID, handle.addr)
+	if err != nil {
+		t.Fatalf("Open streamB failed: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		seq, err := streamB.Append(ctx, []byte(fmt.Sprintf("auth-record-%d", i)))
+		if err != nil {
+			t.Fatalf("streamB append %d failed: %v", i, err)
+		}
+		if err := streamB.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("streamB wait %d failed: %v", seq, err)
+		}
+	}
+	if err := streamB.Close(); err != nil {
+		t.Fatalf("streamB close failed: %v", err)
+	}
+
+	// 2. Client writes records 1..5 locally (diverging from authoritative buffer history at seq 2)
+	clientDir := t.TempDir()
+	streamLocal, err := Open(ctx, clientDir, streamID, "")
+	if err != nil {
+		t.Fatalf("Open streamLocal failed: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		_, err := streamLocal.Append(ctx, []byte(fmt.Sprintf("divergent-record-%d", i)))
+		if err != nil {
+			t.Fatalf("streamLocal append %d failed: %v", i, err)
+		}
+	}
+	if err := streamLocal.Close(); err != nil {
+		t.Fatalf("streamLocal close failed: %v", err)
+	}
+
+	// 3. Re-open local store with fault injection wrapping TruncateAfter to fail twice then succeed
+	realStore, recovered, err := wal.NewClientSegmentStore(clientDir, fmt.Sprintf("stream-%s", streamID.String()), 100)
+	if err != nil {
+		t.Fatalf("NewClientSegmentStore failed: %v", err)
+	}
+	faultStore := &faultInjectingStore{SegmentStore: realStore}
+
+	// 4. Open client stream against wal-buffer with fast retry backoff
+	stream, err := Open(ctx, clientDir, streamID, handle.addr,
+		WithStore(faultStore, recovered),
+		WithDegradedRetryBackoff(10*time.Millisecond, 50*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("expected Open to succeed in degraded state, got: %v", err)
+	}
+	defer stream.Close()
+
+	// 5. Verify stream is degraded during initial truncate failures
+	degErr := stream.Degraded()
+	if degErr == nil {
+		t.Fatalf("expected stream to be degraded initially")
+	}
+
+	// Operations while degraded must fail immediately with DegradedError
+	if _, appErr := stream.Append(ctx, []byte("should-fail-while-degraded")); appErr == nil || !errors.Is(appErr, degErr) {
+		t.Fatalf("expected Append to fail with DegradedError while degraded, got: %v", appErr)
+	}
+	if waitErr := stream.Wait(ctx, 1, Witness, false); waitErr == nil || !errors.Is(waitErr, degErr) {
+		t.Fatalf("expected Wait to fail with DegradedError while degraded, got: %v", waitErr)
+	}
+
+	// 6. Wait for automatic retry to succeed and clear degraded state
+	recoveredHealthy := false
+	for start := time.Now(); time.Since(start) < 5*time.Second; {
+		if stream.Degraded() == nil {
+			recoveredHealthy = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !recoveredHealthy {
+		t.Fatalf("expected stream to recover to healthy after retry succeeded")
+	}
+
+	// 7. Verify subsequent append and wait complete successfully
+	seqNew, err := stream.Append(ctx, []byte("recovered-record-new"))
+	if err != nil {
+		t.Fatalf("append after recovery failed: %v", err)
+	}
+	if err := stream.Wait(ctx, seqNew, Witness, false); err != nil {
+		t.Fatalf("wait after recovery failed: %v", err)
+	}
+	if seqNew != 3 {
+		t.Fatalf("expected new record sequence after recovery to be 3 (resuming from buffer watermark 2), got: %d", seqNew)
+	}
+
+	// 8. Verify divergence was resolved exactly once
+	faultStore.mu.Lock()
+	if faultStore.failCount != 2 {
+		t.Errorf("expected exactly 2 truncate failures, got %d", faultStore.failCount)
+	}
+	faultStore.mu.Unlock()
+}
+
+func TestMoveSegmentsAside(t *testing.T) {
+	dir := t.TempDir()
+	streamID1 := uuid.New()
+	streamID2 := uuid.New()
+
+	// Create dummy segment and recover files for stream1
+	seg1 := filepath.Join(dir, fmt.Sprintf("stream-%s-0000000000000000001.wal", streamID1.String()))
+	rec1 := filepath.Join(dir, fmt.Sprintf("stream-%s-0000000000000000001.wal.123456789.recover", streamID1.String()))
+	if err := os.WriteFile(seg1, []byte("seg1-content"), 0644); err != nil {
+		t.Fatalf("WriteFile seg1 failed: %v", err)
+	}
+	if err := os.WriteFile(rec1, []byte("rec1-content"), 0644); err != nil {
+		t.Fatalf("WriteFile rec1 failed: %v", err)
+	}
+
+	// Create dummy segment and recover files for stream2
+	seg2 := filepath.Join(dir, fmt.Sprintf("stream-%s-0000000000000000001.wal", streamID2.String()))
+	rec2 := filepath.Join(dir, fmt.Sprintf("stream-%s-0000000000000000001.wal.987654321.recover", streamID2.String()))
+	if err := os.WriteFile(seg2, []byte("seg2-content"), 0644); err != nil {
+		t.Fatalf("WriteFile seg2 failed: %v", err)
+	}
+	if err := os.WriteFile(rec2, []byte("rec2-content"), 0644); err != nil {
+		t.Fatalf("WriteFile rec2 failed: %v", err)
+	}
+
+	// Create unrelated file and directory
+	otherFile := filepath.Join(dir, "other.txt")
+	if err := os.WriteFile(otherFile, []byte("other-content"), 0644); err != nil {
+		t.Fatalf("WriteFile otherFile failed: %v", err)
+	}
+	otherSubdir := filepath.Join(dir, "otherdir")
+	if err := os.Mkdir(otherSubdir, 0755); err != nil {
+		t.Fatalf("Mkdir otherSubdir failed: %v", err)
+	}
+
+	// Move stream1 aside
+	movedDir, err := MoveSegmentsAside(dir, streamID1)
+	if err != nil {
+		t.Fatalf("MoveSegmentsAside failed: %v", err)
+	}
+	if !strings.HasSuffix(movedDir, ".degraded") {
+		t.Fatalf("expected movedDir to end with .degraded, got: %s", movedDir)
+	}
+	expectedPrefix := filepath.Join(dir, fmt.Sprintf("stream-%s.", streamID1.String()))
+	if !strings.HasPrefix(movedDir, expectedPrefix) {
+		t.Fatalf("expected movedDir to have prefix %s, got: %s", expectedPrefix, movedDir)
+	}
+
+	// Verify stream1 files moved into movedDir
+	if _, err := os.Stat(filepath.Join(movedDir, filepath.Base(seg1))); err != nil {
+		t.Errorf("expected seg1 in movedDir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(movedDir, filepath.Base(rec1))); err != nil {
+		t.Errorf("expected rec1 in movedDir: %v", err)
+	}
+
+	// Verify stream1 files NO LONGER in dir
+	if _, err := os.Stat(seg1); !os.IsNotExist(err) {
+		t.Errorf("expected seg1 removed from dir: %v", err)
+	}
+	if _, err := os.Stat(rec1); !os.IsNotExist(err) {
+		t.Errorf("expected rec1 removed from dir: %v", err)
+	}
+
+	// Verify stream2 files and unrelated files REMAIN in dir untouched
+	if _, err := os.Stat(seg2); err != nil {
+		t.Errorf("expected seg2 still in dir: %v", err)
+	}
+	if _, err := os.Stat(rec2); err != nil {
+		t.Errorf("expected rec2 still in dir: %v", err)
+	}
+	if _, err := os.Stat(otherFile); err != nil {
+		t.Errorf("expected otherFile still in dir: %v", err)
+	}
+
+	// Calling MoveSegmentsAside with empty dir returns empty string without error
+	p, err := MoveSegmentsAside("", streamID1)
+	if err != nil || p != "" {
+		t.Fatalf("expected ('', nil) for empty dir, got (%q, %v)", p, err)
 	}
 }

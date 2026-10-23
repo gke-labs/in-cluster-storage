@@ -367,6 +367,30 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	return s
 }
 
+func (s *Server) openStreamForVolume(volumeID string, dir string) (walclient.Stream, error) {
+	if s.streamFactory != nil {
+		return s.streamFactory(volumeID)
+	}
+	if dir == "" {
+		dir = s.walDir
+	}
+	if dir == "" {
+		return nil, nil
+	}
+	if s.walErr != nil {
+		return nil, fmt.Errorf("failed to dial WAL buffer target %s: %w", s.walTarget, s.walErr)
+	}
+	streamID := StreamIDForVolume(volumeID)
+	var walOpts []walclient.Option
+	if s.acceptUnversioned {
+		walOpts = append(walOpts, walclient.WithAcceptUnversioned(true))
+	}
+	if s.walClient != nil {
+		walOpts = append(walOpts, walclient.WithGRPCClient(s.walClient))
+	}
+	return walclient.Open(context.Background(), dir, streamID, s.walTarget, walOpts...)
+}
+
 func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	if !isValidVolumeID(volumeID) {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q (must match [A-Za-z0-9._-] and not be '.' or '..')", volumeID)
@@ -378,28 +402,11 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	vol, ok := s.volumes[volumeID]
 	if !ok {
 		var volOpts []VolumeOption
-		if s.streamFactory != nil {
-			stream, err := s.streamFactory(volumeID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create stream for volume %s: %w", volumeID, err)
-			}
-			volOpts = append(volOpts, WithStream(stream))
-		} else if s.walDir != "" {
-			if s.walErr != nil {
-				return nil, fmt.Errorf("failed to dial WAL buffer target %s: %w", s.walTarget, s.walErr)
-			}
-			streamID := StreamIDForVolume(volumeID)
-			var walOpts []walclient.Option
-			if s.acceptUnversioned {
-				walOpts = append(walOpts, walclient.WithAcceptUnversioned(true))
-			}
-			if s.walClient != nil {
-				walOpts = append(walOpts, walclient.WithGRPCClient(s.walClient))
-			}
-			stream, err := walclient.Open(context.Background(), s.walDir, streamID, s.walTarget, walOpts...)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open stream for volume %s: %w", volumeID, err)
-			}
+		stream, err := s.openStreamForVolume(volumeID, s.walDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open stream for volume %s: %w", volumeID, err)
+		}
+		if stream != nil {
 			volOpts = append(volOpts, WithStream(stream))
 		}
 		volOpts = append(volOpts, WithDurability(s.defaultDurability))
@@ -447,7 +454,6 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 			volOpts = append(volOpts, WithAcceptUnversioned(true))
 		}
 
-		var err error
 		vol, err = NewVolume(volumeID, s.backend, s.broadcaster, volOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create volume %s: %w", volumeID, err)
@@ -1474,5 +1480,63 @@ func (s *Server) GetExclusiveHold(ctx context.Context, req *pb.GetExclusiveHoldR
 
 	return &pb.GetExclusiveHoldResponse{
 		Hold: hold.toProto(),
+	}, nil
+}
+
+// RepairVolume repairs a degraded volume by closing its stream and segment store,
+// moving the volume's local segment files aside as <dir>/stream-<id>.<unix-ts>.degraded, and reopening
+// the stream to resume from the buffer witness watermark.
+func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) (*pb.RepairVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	if !isValidVolumeID(volumeID) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid volume ID %q", volumeID)
+	}
+
+	s.mu.RLock()
+	vol, ok := s.volumes[volumeID]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
+	}
+
+	if deg := vol.Degraded(); deg == nil && !req.GetForce() {
+		return nil, status.Errorf(codes.FailedPrecondition, "volume %s is not degraded (use --force to repair anyway)", volumeID)
+	}
+
+	stream := vol.Stream()
+	if stream == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "volume %s has no WAL stream configured", volumeID)
+	}
+
+	if err := stream.Close(); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to close stream for volume %s: %v", volumeID, err)
+	}
+
+	var oldPath string
+	if s.walDir != "" {
+		movedPath, err := walclient.MoveSegmentsAside(s.walDir, vol.StreamID())
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to move segment directory aside for volume %s: %v", volumeID, err)
+		}
+		oldPath = movedPath
+	}
+
+	newStream, err := s.openStreamForVolume(volumeID, s.walDir)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to reopen stream for volume %s: %v", volumeID, err)
+	}
+	if newStream == nil {
+		return nil, status.Errorf(codes.Internal, "no stream opened for volume %s", volumeID)
+	}
+
+	if err := vol.ResetStream(newStream); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to reset volume stream for volume %s: %v", volumeID, err)
+	}
+
+	_, witnessWatermark, _ := newStream.Watermarks()
+
+	return &pb.RepairVolumeResponse{
+		OldPath:      oldPath,
+		NewWatermark: witnessWatermark,
 	}, nil
 }

@@ -22,6 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,16 +110,44 @@ type Stream interface {
 	Close() error
 }
 
+// SegmentStore defines the interface for local segment file operations.
+type SegmentStore interface {
+	Append(rec *wal.ClientRecord) error
+	Close() error
+	TruncateAfter(seq uint64) error
+	DeleteSegmentsBeforeS3Ack(seq uint64) error
+}
+
 type options struct {
-	maxRetainedBytes  int64
-	maxSegmentSize    int64
-	dialOpts          []grpc.DialOption
-	grpcClient        pb.WalBufferClient
-	acceptUnversioned bool
+	maxRetainedBytes            int64
+	maxSegmentSize              int64
+	dialOpts                    []grpc.DialOption
+	grpcClient                  pb.WalBufferClient
+	acceptUnversioned           bool
+	store                       SegmentStore
+	recoveredRecords            []*wal.ClientRecord
+	degradedRetryInitialBackoff time.Duration
+	degradedRetryMaxBackoff     time.Duration
 }
 
 // Option configures Stream options.
 type Option func(*options)
+
+// WithStore injects a custom SegmentStore and recovered records (useful for testing and fault injection).
+func WithStore(store SegmentStore, recovered []*wal.ClientRecord) Option {
+	return func(o *options) {
+		o.store = store
+		o.recoveredRecords = recovered
+	}
+}
+
+// WithDegradedRetryBackoff sets the initial and max backoff durations for retrying failed divergence truncates.
+func WithDegradedRetryBackoff(initial, max time.Duration) Option {
+	return func(o *options) {
+		o.degradedRetryInitialBackoff = initial
+		o.degradedRetryMaxBackoff = max
+	}
+}
 
 // WithAcceptUnversioned configures whether unversioned legacy segments are accepted.
 func WithAcceptUnversioned(accept bool) Option {
@@ -164,14 +195,16 @@ type streamImpl struct {
 	target   string
 	opts     options
 
-	store *wal.ClientSegmentStore
+	store SegmentStore
 
-	mu            sync.RWMutex
-	cond          *sync.Cond
-	localSeq      uint64
-	witnessSeq    uint64
-	s3Seq         uint64
-	retainedBytes int64
+	mu                  sync.RWMutex
+	cond                *sync.Cond
+	localSeq            uint64
+	witnessSeq          uint64
+	s3Seq               uint64
+	retainedBytes       int64
+	degradedTruncateSeq uint64
+	reconciling         bool
 
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
@@ -207,9 +240,18 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		scanOpts = append(scanOpts, wal.WithAcceptUnversioned(true))
 	}
 
-	store, recovered, err := wal.NewClientSegmentStore(dir, fmt.Sprintf("stream-%s", streamID.String()), opt.maxSegmentSize, scanOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open local segment store in %s: %w", dir, err)
+	var store SegmentStore
+	var recovered []*wal.ClientRecord
+	if opt.store != nil {
+		store = opt.store
+		recovered = opt.recoveredRecords
+	} else {
+		realStore, recs, err := wal.NewClientSegmentStore(dir, fmt.Sprintf("stream-%s", streamID.String()), opt.maxSegmentSize, scanOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open local segment store in %s: %w", dir, err)
+		}
+		store = realStore
+		recovered = recs
 	}
 
 	var highestLocalSeq uint64
@@ -279,9 +321,13 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 
 		select {
 		case <-s.initialHelloAckDone:
-			if s.initialHelloAckErr != nil {
+			s.mu.RLock()
+			initErr := s.initialHelloAckErr
+			isDegraded := s.degradedErr != nil
+			s.mu.RUnlock()
+			if initErr != nil && !isDegraded {
 				errutil.CloseAndLog(s, "wal stream")
-				return nil, s.initialHelloAckErr
+				return nil, initErr
 			}
 		case <-time.After(helloTimeout):
 			errutil.CloseAndLog(s, "wal stream")
@@ -311,8 +357,11 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 
 	select {
 	case <-s.initialHelloAckDone:
-		if s.initialHelloAckErr != nil {
-			return 0, s.initialHelloAckErr
+		s.mu.RLock()
+		initErr := s.initialHelloAckErr
+		s.mu.RUnlock()
+		if initErr != nil {
+			return 0, initErr
 		}
 	case <-ctx.Done():
 		return 0, ctx.Err()
@@ -322,13 +371,13 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 
 	recordSize := int64(wal.ClientHeaderSize + len(payload))
 
-	// Degraded mode / backpressure check: block if retained bytes exceed maxRetainedBytes
+	// Degraded mode / backpressure / divergence-reconciliation check: block if retained bytes exceed maxRetainedBytes or while reconciling handshake
 	s.mu.Lock()
-	for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.degradedErr == nil {
+	for (s.reconciling || s.retainedBytes+recordSize > s.opts.maxRetainedBytes) && !s.closed.Load() && s.degradedErr == nil {
 		doneCh := make(chan struct{})
 		go func() {
 			s.mu.Lock()
-			for s.retainedBytes+recordSize > s.opts.maxRetainedBytes && !s.closed.Load() && s.degradedErr == nil {
+			for (s.reconciling || s.retainedBytes+recordSize > s.opts.maxRetainedBytes) && !s.closed.Load() && s.degradedErr == nil {
 				s.cond.Wait()
 			}
 			s.mu.Unlock()
@@ -572,7 +621,7 @@ func (s *streamImpl) Degraded() *DegradedError {
 	return s.degradedErr
 }
 
-func (s *streamImpl) setDegradedLocked(cause error) *DegradedError {
+func (s *streamImpl) setDegradedLocked(cause error, truncateSeq uint64) *DegradedError {
 	if s.degradedErr != nil {
 		return s.degradedErr
 	}
@@ -580,6 +629,8 @@ func (s *streamImpl) setDegradedLocked(cause error) *DegradedError {
 		Cause: cause,
 		At:    time.Now(),
 	}
+	s.degradedTruncateSeq = truncateSeq
+	s.reconciling = true
 	klog.Errorf("WAL client stream %s degraded: %v", s.streamID, s.degradedErr)
 	if s.cond != nil {
 		s.cond.Broadcast()
@@ -613,6 +664,55 @@ func (s *streamImpl) Close() error {
 	return nil
 }
 
+func (s *streamImpl) retryDegradedTruncate() bool {
+	backoff := 1 * time.Second
+	if s.opts.degradedRetryInitialBackoff > 0 {
+		backoff = s.opts.degradedRetryInitialBackoff
+	}
+	maxBackoff := 1 * time.Minute
+	if s.opts.degradedRetryMaxBackoff > 0 {
+		maxBackoff = s.opts.degradedRetryMaxBackoff
+	}
+
+	for {
+		select {
+		case <-s.cancelCtx.Done():
+			return false
+		case <-time.After(backoff):
+		}
+
+		s.mu.RLock()
+		if s.degradedErr == nil {
+			s.mu.RUnlock()
+			return true
+		}
+		targetSeq := s.degradedTruncateSeq
+		degradedAt := s.degradedErr.At
+		s.mu.RUnlock()
+
+		if s.store != nil {
+			if err := s.store.TruncateAfter(targetSeq); err != nil {
+				klog.V(4).Infof("WAL client stream %s: retry truncate to %d failed: %v, retrying in %v", s.streamID, targetSeq, err, backoff)
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			}
+		}
+
+		// Truncate succeeded: clear degraded state, log once at info, and return to loop to re-enter handshake
+		s.mu.Lock()
+		s.degradedErr = nil
+		s.initialHelloAckErr = nil
+		s.cond.Broadcast()
+		s.mu.Unlock()
+
+		klog.Infof("WAL client stream %s: recovered from degraded state after %v", s.streamID, time.Since(degradedAt))
+		return true
+	}
+}
+
 func (s *streamImpl) backgroundReplicationLoop() {
 	defer s.wg.Done()
 
@@ -631,23 +731,33 @@ func (s *streamImpl) backgroundReplicationLoop() {
 		degErr := s.degradedErr
 		s.mu.RUnlock()
 		if degErr != nil {
-			return
+			if !s.retryDegradedTruncate() {
+				return
+			}
+			backoff = 50 * time.Millisecond
+			firstFailure = true
+			continue
 		}
 
 		err := s.runStreamSession()
 		if err != nil && !s.closed.Load() {
+			s.mu.RLock()
+			degErr := s.degradedErr
+			s.mu.RUnlock()
+			if degErr != nil {
+				if !s.retryDegradedTruncate() {
+					return
+				}
+				backoff = 50 * time.Millisecond
+				firstFailure = true
+				continue
+			}
+
 			if firstFailure || backoff >= maxBackoff {
 				klog.Warningf("WAL client stream %s: replication session failed: %v, reconnecting in %v", s.streamID, err, backoff)
 				firstFailure = false
 			} else {
 				klog.V(4).Infof("WAL client replication session ended: %v, reconnecting in %v", err, backoff)
-			}
-
-			s.mu.RLock()
-			degErr := s.degradedErr
-			s.mu.RUnlock()
-			if degErr != nil {
-				return
 			}
 
 			select {
@@ -709,6 +819,12 @@ func (s *streamImpl) runStreamSession() error {
 		})
 		return fmt.Errorf("handleHelloAck failed: %w", err)
 	}
+	s.mu.Lock()
+	s.initialHelloAckErr = nil
+	s.mu.Unlock()
+	s.initialHelloAckOnce.Do(func() {
+		close(s.initialHelloAckDone)
+	})
 
 	if s.target != "" {
 		klog.Infof("WAL client stream %s: replication session established with %s", s.streamID, s.target)
@@ -844,7 +960,7 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 				// leaves memory and disk consistent, allowing divergence to be re-detected on retry.
 				if s.store != nil {
 					if err := s.store.TruncateAfter(witnessHead); err != nil {
-						truncErr := s.setDegradedLocked(fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err))
+						truncErr := s.setDegradedLocked(fmt.Errorf("failed to truncate local segment store to %d: %w", witnessHead, err), witnessHead)
 						s.initialHelloAckOnce.Do(func() {
 							s.initialHelloAckErr = truncErr
 							close(s.initialHelloAckDone)
@@ -873,6 +989,11 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 
 				klog.Warningf("Stream %s: local records above buffer witness watermark (%d) diverged from authoritative buffer history; discarded %d local unacknowledged records",
 					s.streamID, witnessHead, discarded)
+
+				s.reconciling = false
+				if s.cond != nil {
+					s.cond.Broadcast()
+				}
 			}
 		}
 	}
@@ -887,6 +1008,7 @@ func (s *streamImpl) handleHelloAck(helloAck *pb.HelloAck) error {
 		s.cleanupS3AckedLocked(helloAck.S3AckedStreamSeq)
 	}
 
+	s.reconciling = false
 	if s.cond != nil {
 		s.cond.Broadcast()
 	}
@@ -996,4 +1118,51 @@ func TailStream(ctx context.Context, target string, streamID uuid.UUID, fromSeq 
 	}
 
 	return iterator, nil
+}
+
+// MoveSegmentsAside moves all segment files and any .recover backup files for streamID
+// in dir aside into a subdirectory named stream-<id>.<unix-ts>.degraded.
+// It returns the path to the degraded directory.
+func MoveSegmentsAside(dir string, streamID uuid.UUID) (string, error) {
+	if dir == "" {
+		return "", nil
+	}
+
+	targetDir := filepath.Join(dir, fmt.Sprintf("stream-%s.%d.degraded", streamID.String(), time.Now().Unix()))
+	if _, err := os.Stat(targetDir); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("failed to stat degraded directory %s: %w", targetDir, err)
+		}
+	} else {
+		targetDir = filepath.Join(dir, fmt.Sprintf("stream-%s.%d.degraded", streamID.String(), time.Now().UnixNano()))
+	}
+
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create degraded directory %s: %w", targetDir, err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return targetDir, nil
+		}
+		return "", fmt.Errorf("failed to read directory %s: %w", dir, err)
+	}
+
+	prefix := fmt.Sprintf("stream-%s-", streamID.String())
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, prefix) && (strings.HasSuffix(name, ".wal") || strings.Contains(name, ".recover")) {
+			src := filepath.Join(dir, name)
+			dst := filepath.Join(targetDir, name)
+			if err := os.Rename(src, dst); err != nil {
+				return "", fmt.Errorf("failed to move segment file %s aside to %s: %w", src, dst, err)
+			}
+		}
+	}
+
+	return targetDir, nil
 }

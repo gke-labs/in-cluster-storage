@@ -63,6 +63,9 @@ service ObjectFSController {
   rpc ReleaseExclusive(ReleaseExclusiveRequest) returns (ReleaseExclusiveResponse);
   // GetExclusiveHold returns the current exclusive hold status for a volume.
   rpc GetExclusiveHold(GetExclusiveHoldRequest) returns (GetExclusiveHoldResponse);
+  // RepairVolume repairs a degraded volume by moving its local segment directory aside
+  // and reopening its stream to resume from the buffer witness watermark.
+  rpc RepairVolume(RepairVolumeRequest) returns (RepairVolumeResponse);
 }
 
 enum WriteMode {
@@ -594,4 +597,15 @@ message FileChunk {
   string sha256 = 3;
   bytes inline_data = 4;
 }
+
+message RepairVolumeRequest {
+  string volume_id = 1;
+  bool force = 2;
+}
+
+message RepairVolumeResponse {
+  string old_path = 1;
+  uint64 new_watermark = 2;
+}
+
 
