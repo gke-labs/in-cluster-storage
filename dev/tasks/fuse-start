@@ -191,7 +191,7 @@ cleanup() {
   if [[ -n "${CONTROLLER_PID}" ]] && kill -0 "${CONTROLLER_PID}" 2>/dev/null; then
     # Best effort: persist the current metadata as a snapshot so the data in
     # ${STORE_DIR} is complete if it is reused later.
-    if snap="$("${BIN_DIR}/objectfsctl" --server "${SERVER_ADDR}" snapshots create "${OBJECTFS_VOLUME}" 2>/dev/null)"; then
+    if snap="$("${BIN_DIR}/objectfsctl" --server "${SERVER_ADDR}" --insecure snapshots create "${OBJECTFS_VOLUME}" 2>/dev/null)"; then
       echo "Wrote final snapshot ${snap}"
     fi
     kill -TERM "${CONTROLLER_PID}" 2>/dev/null
@@ -218,6 +218,7 @@ echo "Starting objectfs-controller on ${SERVER_ADDR} (backend file://${STORE_DIR
     --backend "file://${STORE_DIR}" \
     --metadata-index "${OBJECTFS_METADATA_INDEX:-sqlite}" \
     --flush-interval 1m \
+    --insecure \
     ${OBJECTFS_CONTROLLER_ARGS:-}
 ) >"${CONTROLLER_LOG}" 2>&1 &
 CONTROLLER_PID=$!
@@ -241,7 +242,7 @@ done
 echo "Mounting volume ${OBJECTFS_VOLUME} at ${MOUNT_DIR} (writeMode=${OBJECTFS_WRITE_MODE}, log ${MOUNT_LOG})"
 (
   trap '' INT
-  exec "${BIN_DIR}/objectfsctl" --server "${SERVER_ADDR}" mount \
+  exec "${BIN_DIR}/objectfsctl" --server "${SERVER_ADDR}" --insecure mount \
     --volume "${OBJECTFS_VOLUME}" \
     --write-mode "${OBJECTFS_WRITE_MODE}" \
     ${OBJECTFS_MOUNT_ARGS:-} \
@@ -278,7 +279,7 @@ objectfs is up.
   logs:         ${CONTROLLER_LOG}
                 ${MOUNT_LOG}
 
-  e.g.  ${BIN_DIR}/objectfsctl --server ${SERVER_ADDR} snapshots create ${OBJECTFS_VOLUME}
+  e.g.  ${BIN_DIR}/objectfsctl --server ${SERVER_ADDR} --insecure snapshots create ${OBJECTFS_VOLUME}
 
 EOM
 

@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"net"
@@ -31,6 +33,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -38,6 +41,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"k8s.io/klog/v2"
 )
 
@@ -62,6 +66,21 @@ var (
 	maxStagingBytes           = flag.Int64("max-staging-bytes", 64*1024*1024, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
 	controllerSyncTimeout     = flag.Duration("controller-sync-timeout", 10*time.Minute, "Timeout for controller coalesced background sync operations")
 	acceptUnversionedSegments = flag.Bool("accept-unversioned-segments", false, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
+	tlsCertFile               = flag.String("tls-cert-file", "", "Path to TLS certificate file")
+	tlsKeyFile                = flag.String("tls-key-file", "", "Path to TLS private key file")
+	insecure                  = flag.Bool("insecure", false, "Disable TLS and token authentication (e.g. for local dev/testing)")
+	authAudience              = flag.String("auth-audience", controller.DefaultAudience, "Audience required in projected ServiceAccount tokens")
+	authAdminSA               = flag.String("auth-admin-sa", "objectfs-admin,objectfs-controller", "Comma-separated list of service accounts granted admin role")
+	authNodeSA                = flag.String("auth-node-sa", "objectfs-node-daemon", "Comma-separated list of service accounts granted node role")
+	authCacheTTL              = flag.Duration("auth-cache-ttl", 5*time.Minute, "Cache TTL for successful TokenReviews")
+	authNegativeTTL           = flag.Duration("auth-negative-ttl", 10*time.Second, "Cache TTL for failed TokenReviews")
+	kubeAPIURL                = flag.String("kube-api-url", "", "Kubernetes API server URL for TokenReview (defaults to in-cluster)")
+	kubeTokenFile             = flag.String("kube-token-file", "", "Path to controller ServiceAccount token for TokenReview")
+	kubeCAFile                = flag.String("kube-ca-file", "", "Path to Kubernetes cluster CA cert")
+	controllerNamespace       = flag.String("namespace", "", "Kubernetes namespace ObjectFS is deployed in (defaults to POD_NAMESPACE env var, or kube-objectfs-system)")
+	initTLS                   = flag.Bool("init-tls", false, "Initialize TLS Secret in the cluster if it does not exist, then exit")
+	initTLSSecret             = flag.String("init-tls-secret", "objectfs-tls", "Secret name for init-tls")
+	initTLSService            = flag.String("init-tls-service", "objectfs-controller", "Service name for init-tls")
 )
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -76,9 +95,72 @@ func parseEndpoint(endpoint string) (string, string, error) {
 	return scheme, addr, nil
 }
 
+type expiryLevel string
+
+const (
+	expiryOK      expiryLevel = "OK"
+	expiryWarning expiryLevel = "WARNING"
+	expiryError   expiryLevel = "ERROR"
+)
+
+func evaluateLeafExpiry(notAfter, now time.Time) expiryLevel {
+	remaining := notAfter.Sub(now)
+	if remaining <= 0 {
+		return expiryError
+	}
+	if remaining < 30*24*time.Hour {
+		return expiryWarning
+	}
+	return expiryOK
+}
+
+func checkLeafExpiry(cert *x509.Certificate) expiryLevel {
+	level := evaluateLeafExpiry(cert.NotAfter, time.Now())
+	remaining := time.Until(cert.NotAfter)
+	switch level {
+	case expiryError:
+		klog.Errorf("TLS leaf certificate expired at %s (expired %s ago). Rotate secret and rollout restart controller and node daemons immediately!", cert.NotAfter.Format(time.RFC3339), (-remaining).Round(time.Minute))
+	case expiryWarning:
+		klog.Warningf("TLS leaf certificate will expire in %d days (at %s). Rotate secret and rollout restart controller and node daemons to avoid outage!", int(remaining.Hours()/24), cert.NotAfter.Format(time.RFC3339))
+	}
+	return level
+}
+
+func startLeafExpiryMonitor(ctx context.Context, cert *x509.Certificate) {
+	ticker := time.NewTicker(24 * time.Hour)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				checkLeafExpiry(cert)
+			}
+		}
+	}()
+}
+
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	ns := *controllerNamespace
+	if ns == "" {
+		ns = os.Getenv("POD_NAMESPACE")
+	}
+	if ns == "" {
+		ns = "kube-objectfs-system"
+	}
+
+	if *initTLS || (len(flag.Args()) > 0 && flag.Args()[0] == "init-tls") {
+		ctx := context.Background()
+		if err := controller.EnsureTLSSecret(ctx, *kubeAPIURL, *kubeTokenFile, *kubeCAFile, ns, *initTLSSecret, *initTLSService); err != nil {
+			klog.Fatalf("failed to initialize TLS Secret: %v", err)
+		}
+		klog.Infof("TLS Secret %s/%s initialized successfully", ns, *initTLSSecret)
+		return
+	}
 
 	// Controller registration uses explicit options: WithDisableWAL(true)
 	// (stream is the source of truth, position and rows move in one batch),
@@ -167,7 +249,89 @@ func main() {
 		klog.Warningf("objectfs-controller: no WAL stream configured (--wal-dir unset): fsync is NOT durable across controller restarts; volumes behave as ephemeral shared disks and metadata is persisted only by the periodic flush (--flush-interval=%s) and on shutdown", *flushInterval)
 	}
 
-	grpcServer := grpc.NewServer()
+	var grpcServerOpts []grpc.ServerOption
+	if *insecure {
+		klog.Warning("Running in insecure mode: TLS and token authentication are disabled on the gRPC port")
+	} else {
+		certPath := *tlsCertFile
+		if certPath == "" && grpcutil.FileExists("/etc/objectfs/tls/tls.crt") {
+			certPath = "/etc/objectfs/tls/tls.crt"
+		}
+		keyPath := *tlsKeyFile
+		if keyPath == "" && grpcutil.FileExists("/etc/objectfs/tls/tls.key") {
+			keyPath = "/etc/objectfs/tls/tls.key"
+		}
+		if certPath == "" || keyPath == "" {
+			// Attempt to ensure TLS secret exists in API server
+			if err := controller.EnsureTLSSecret(ctx, *kubeAPIURL, *kubeTokenFile, *kubeCAFile, ns, *initTLSSecret, *initTLSService); err != nil {
+				klog.V(2).Infof("could not auto-ensure TLS secret: %v", err)
+			}
+			if grpcutil.FileExists("/etc/objectfs/tls/tls.crt") && grpcutil.FileExists("/etc/objectfs/tls/tls.key") {
+				certPath = "/etc/objectfs/tls/tls.crt"
+				keyPath = "/etc/objectfs/tls/tls.key"
+			}
+		}
+		if certPath == "" || keyPath == "" {
+			klog.Fatalf("TLS certificate and key required (--tls-cert-file, --tls-key-file) unless --insecure is specified")
+		}
+
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			klog.Fatalf("failed to load TLS certificate from %s / %s: %v", certPath, keyPath, err)
+		}
+		if len(cert.Certificate) > 0 {
+			leafCert, err := x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				klog.Warningf("could not parse leaf certificate for expiry check: %v", err)
+			} else {
+				checkLeafExpiry(leafCert)
+				startLeafExpiryMonitor(ctx, leafCert)
+			}
+		}
+		tlsCreds := credentials.NewServerTLSFromCert(&cert)
+
+		kubeReviewer, err := controller.NewKubeTokenReviewer(*kubeAPIURL, *kubeTokenFile, *kubeCAFile)
+		if err != nil {
+			klog.Fatalf("failed to initialize Kubernetes TokenReview client: %v", err)
+		}
+		cachedReviewer := controller.NewCachedTokenReviewer(kubeReviewer, *authCacheTTL, *authNegativeTTL)
+
+		var audiences []string
+		for _, a := range strings.Split(*authAudience, ",") {
+			if a = strings.TrimSpace(a); a != "" {
+				audiences = append(audiences, a)
+			}
+		}
+		var adminSAs []string
+		for _, s := range strings.Split(*authAdminSA, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				adminSAs = append(adminSAs, s)
+			}
+		}
+		var nodeSAs []string
+		for _, s := range strings.Split(*authNodeSA, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				nodeSAs = append(nodeSAs, s)
+			}
+		}
+
+		authConfig := controller.AuthConfig{
+			Namespace:            ns,
+			Audiences:            audiences,
+			AdminServiceAccounts: adminSAs,
+			NodeServiceAccounts:  nodeSAs,
+			Insecure:             false,
+		}
+		authInterceptor := controller.NewServerAuthInterceptor(cachedReviewer, authConfig)
+
+		grpcServerOpts = append(grpcServerOpts,
+			grpc.Creds(tlsCreds),
+			grpc.UnaryInterceptor(authInterceptor.UnaryServerInterceptor()),
+			grpc.StreamInterceptor(authInterceptor.StreamServerInterceptor()),
+		)
+	}
+
+	grpcServer := grpc.NewServer(grpcServerOpts...)
 	server := controller.NewServer(backend, serverOpts...)
 	csiController := controller.NewCSIController(server)
 

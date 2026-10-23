@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,5 +149,29 @@ func TestNodeGetVolumeStats(t *testing.T) {
 	}
 	if inodesUsage.GetUsed() != 1 { // root directory inode
 		t.Errorf("expected 1 used inode, got %d", inodesUsage.GetUsed())
+	}
+}
+
+func TestNodeDaemonFailClosed(t *testing.T) {
+	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second)
+	if err != nil {
+		t.Fatalf("newDriver failed: %v", err)
+	}
+	defer func() { _ = driver.Close() }()
+
+	// Explicitly set insecure to false (mimicking production flag default)
+	driver.insecure = false
+	driver.caCertFile = ""
+	driver.tokenFile = ""
+
+	_, err = driver.getClient()
+	if err == nil || !strings.Contains(err.Error(), "CA certificate file required") {
+		t.Fatalf("expected CA certificate file required error, got: %v", err)
+	}
+
+	driver.caCertFile = "/nonexistent/ca.crt"
+	_, err = driver.getClient()
+	if err == nil || !strings.Contains(err.Error(), "CA certificate file not found: /nonexistent/ca.crt") {
+		t.Fatalf("expected CA certificate file not found error, got: %v", err)
 	}
 }

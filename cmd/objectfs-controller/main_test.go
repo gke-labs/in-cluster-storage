@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"crypto/x509"
 	"flag"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -90,5 +92,46 @@ func TestControllerTableRegistration(t *testing.T) {
 	}
 	if !tableDB.DisableWAL() {
 		t.Errorf("tableDB.DisableWAL() = false, want true")
+	}
+}
+
+func TestCheckLeafExpiry(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name      string
+		notAfter  time.Time
+		wantLevel expiryLevel
+	}{
+		{
+			name:      "expired certificate",
+			notAfter:  now.Add(-1 * time.Hour),
+			wantLevel: expiryError,
+		},
+		{
+			name:      "warning when within 30 days of expiry (10 days left)",
+			notAfter:  now.Add(10 * 24 * time.Hour),
+			wantLevel: expiryWarning,
+		},
+		{
+			name:      "ok when well before 30-day window (200 days left)",
+			notAfter:  now.Add(200 * 24 * time.Hour),
+			wantLevel: expiryOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cert := &x509.Certificate{
+				NotAfter: tt.notAfter,
+			}
+			got := evaluateLeafExpiry(cert.NotAfter, now)
+			if got != tt.wantLevel {
+				t.Errorf("evaluateLeafExpiry(%v) = %v, want %v", tt.notAfter, got, tt.wantLevel)
+			}
+			level := checkLeafExpiry(cert)
+			if level != tt.wantLevel {
+				t.Errorf("checkLeafExpiry(%v) = %v, want %v", tt.notAfter, level, tt.wantLevel)
+			}
+		})
 	}
 }

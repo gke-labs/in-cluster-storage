@@ -90,11 +90,29 @@ func startTestUnixServer(t *testing.T) (*controller.Server, string, func()) {
 }
 
 func executeCommand(args ...string) (string, error) {
+	hasAuthFlag := false
+	for _, a := range args {
+		if a == "--insecure" || a == "--ca" || a == "--strict-auth" {
+			hasAuthFlag = true
+			break
+		}
+	}
+	// For --strict-auth test helper, strip the sentinel and do not append --insecure
+	filtered := make([]string, 0, len(args))
+	for _, a := range args {
+		if a != "--strict-auth" {
+			filtered = append(filtered, a)
+		}
+	}
+	if !hasAuthFlag {
+		filtered = append([]string{"--insecure"}, filtered...)
+	}
+
 	cmd := NewRootCommand()
 	buf := new(bytes.Buffer)
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	cmd.SetArgs(args)
+	cmd.SetArgs(filtered)
 	err := cmd.Execute()
 	return buf.String(), err
 }
@@ -682,5 +700,32 @@ func TestVolumesDescribeCommand(t *testing.T) {
 	}
 	if !strings.Contains(out, "Exclusive Hold: none") {
 		t.Errorf("expected 'Exclusive Hold: none' after release, got: %s", out)
+	}
+}
+
+func TestAuthFlags(t *testing.T) {
+	cmd := NewRootCommand()
+	if cmd.PersistentFlags().Lookup("ca") == nil {
+		t.Errorf("missing --ca flag")
+	}
+	if cmd.PersistentFlags().Lookup("token") == nil {
+		t.Errorf("missing --token flag")
+	}
+	if cmd.PersistentFlags().Lookup("insecure") == nil {
+		t.Errorf("missing --insecure flag")
+	}
+}
+
+func TestClientFailClosed(t *testing.T) {
+	// Without --insecure and without --ca, dialServer must fail closed
+	_, err := executeCommand("--strict-auth", "--server", "localhost:50051", "volumes", "list")
+	if err == nil || !strings.Contains(err.Error(), "CA certificate required") {
+		t.Fatalf("expected CA certificate required error, got: %v", err)
+	}
+
+	// With nonexistent CA file, fail closed naming the path
+	_, err = executeCommand("--server", "localhost:50051", "--ca", "/nonexistent/ca.crt", "volumes", "list")
+	if err == nil || !strings.Contains(err.Error(), "CA certificate file not found: /nonexistent/ca.crt") {
+		t.Fatalf("expected CA certificate file not found error, got: %v", err)
 	}
 }

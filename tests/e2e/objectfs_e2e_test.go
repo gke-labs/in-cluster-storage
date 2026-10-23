@@ -187,6 +187,8 @@ spec:
 		initH.KubectlApplyContent("wal-buffer", walManifest)
 		initH.KubectlApplyContent("objectfs", objectfsManifest)
 
+		initH.RunCommand("kubectl", "wait", "--for=condition=complete", "job/objectfs-tls-init", "-n", "default", "--timeout=60s")
+
 		if err := initH.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
 			sharedSingleNodeErr = fmt.Errorf("wal-buffer failed to start: %w", err)
 			return
@@ -357,7 +359,127 @@ spec:
 	}
 
 	h.DeletePod(pod3Name, ns)
-	t.Logf("Successfully verified ObjectFS multi-writer FUSE CSI driver!")
+	t.Logf("Successfully verified ObjectFS multi-writer FUSE CSI driver with node daemon authentication!")
+
+	// Step 4: Verify authentication & admin path:
+	// Launch test admin client pod with app: objectfs-admin label permitted by NetworkPolicy
+	clientPodName := "auth-client-test-pod"
+	clientPodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  labels:
+    app: objectfs-admin
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: objectfs-controller:e2e
+      imagePullPolicy: Never
+      command: ["sleep", "3600"]
+      volumeMounts:
+        - name: objectfs-tls
+          mountPath: /etc/objectfs/tls
+          readOnly: true
+  volumes:
+    - name: objectfs-tls
+      secret:
+        secretName: objectfs-tls
+`, clientPodName)
+
+	h.KubectlApplyContent(clientPodName, clientPodYaml)
+	if err := h.WaitForPodReady(clientPodName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Client test pod failed to start: %v", err)
+	}
+	defer deletePodBounded(t, h, clientPodName, "default", 1*time.Minute)
+
+	// A pod without a valid token is refused with Unauthenticated
+	t.Logf("Verifying request with invalid token is refused with Unauthenticated")
+	out, err := h.RunInPod(clientPodName, "default", "objectfsctl", "--server", "objectfs-controller:50051", "--ca", "/etc/objectfs/tls/ca.crt", "--token", "bogus-invalid-token", "volumes", "list")
+	if err == nil {
+		t.Fatalf("expected request with invalid token to be refused, but it succeeded: %s", out)
+	}
+	if !strings.Contains(out, "Unauthenticated") {
+		t.Fatalf("expected Unauthenticated in output, got: %v (out: %s)", err, out)
+	}
+	t.Logf("Invalid token was correctly refused with Unauthenticated: %s", strings.TrimSpace(out))
+
+	// Token for unauthorized service account (default SA) is refused with PermissionDenied
+	t.Logf("Verifying token for unauthorized service account is refused with PermissionDenied")
+	tokenOut, err := exec.Command("kubectl", "create", "token", "default", "-n", "default", "--audience=objectfs-controller").CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to create token for default serviceaccount: %v (out: %s)", err, tokenOut)
+	}
+	defaultSAToken := strings.TrimSpace(string(tokenOut))
+
+	out, err = h.RunInPod(clientPodName, "default", "objectfsctl", "--server", "objectfs-controller:50051", "--ca", "/etc/objectfs/tls/ca.crt", "--token", defaultSAToken, "volumes", "list")
+	if err == nil {
+		t.Fatalf("expected request with default serviceaccount token to be refused with PermissionDenied, but it succeeded: %s", out)
+	}
+	if !strings.Contains(out, "PermissionDenied") {
+		t.Fatalf("expected PermissionDenied in output, got: %v (out: %s)", err, out)
+	}
+	t.Logf("Default serviceaccount token was correctly refused with PermissionDenied: %s", strings.TrimSpace(out))
+
+	// objectfsctl works through the admin path with objectfs-admin token
+	t.Logf("Verifying admin path: objectfsctl with objectfs-admin token succeeds")
+	adminTokenOut, err := exec.Command("kubectl", "create", "token", "objectfs-admin", "-n", "default", "--audience=objectfs-controller").CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to create token for objectfs-admin: %v (out: %s)", err, adminTokenOut)
+	}
+	adminToken := strings.TrimSpace(string(adminTokenOut))
+
+	volsOut, err := h.RunInPod(clientPodName, "default", "objectfsctl", "--server", "objectfs-controller:50051", "--ca", "/etc/objectfs/tls/ca.crt", "--token", adminToken, "volumes", "list")
+	if err != nil {
+		t.Fatalf("admin objectfsctl volumes list failed: %v (out: %s)", err, volsOut)
+	}
+	if !strings.Contains(volsOut, volumeID) {
+		t.Fatalf("expected volume %s in volumes list, got: %s", volumeID, volsOut)
+	}
+	t.Logf("Admin path successfully listed volumes: %s", strings.TrimSpace(volsOut))
+
+	// Step 5: Verify NetworkPolicy actively blocks pods without app: objectfs-admin or app: objectfs-node-daemon label
+	unauthPodName := "unauth-netpol-client-pod"
+	unauthPodYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  labels:
+    app: unprivileged-client
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: objectfs-controller:e2e
+      imagePullPolicy: Never
+      command: ["sleep", "3600"]
+      volumeMounts:
+        - name: objectfs-tls
+          mountPath: /etc/objectfs/tls
+          readOnly: true
+  volumes:
+    - name: objectfs-tls
+      secret:
+        secretName: objectfs-tls
+`, unauthPodName)
+
+	h.KubectlApplyContent(unauthPodName, unauthPodYaml)
+	if err := h.WaitForPodReady(unauthPodName, "default", 2*time.Minute); err != nil {
+		t.Fatalf("Unprivileged client pod failed to start: %v", err)
+	}
+	defer deletePodBounded(t, h, unauthPodName, "default", 1*time.Minute)
+
+	t.Logf("Verifying NetworkPolicy blocks unprivileged pod even with valid admin token")
+	netpolOut, netpolErr := h.RunInPod(unauthPodName, "default", "objectfsctl", "--server", "objectfs-controller:50051", "--ca", "/etc/objectfs/tls/ca.crt", "--token", adminToken, "volumes", "list")
+	if netpolErr == nil {
+		t.Fatalf("expected NetworkPolicy to block connection from unprivileged pod, but connection succeeded: %s", netpolOut)
+	}
+	if !strings.Contains(netpolOut, "i/o timeout") && !strings.Contains(netpolOut, "Unavailable") && !strings.Contains(netpolOut, "context deadline exceeded") {
+		t.Fatalf("expected network timeout from NetworkPolicy drop, got error: %v, out: %s", netpolErr, netpolOut)
+	}
+	t.Logf("NetworkPolicy correctly blocked unprivileged pod at network level: %s", strings.TrimSpace(netpolOut))
 }
 
 func TestObjectFSStatefulSetE2E(t *testing.T) {
@@ -844,6 +966,8 @@ spec:
 
 		initH.KubectlApplyContent("objectfs", objectfsManifest)
 		initH.KubectlApplyContent("wal-buffer", walManifest)
+
+		initH.RunCommand("kubectl", "wait", "--for=condition=complete", "job/objectfs-tls-init", "-n", "default", "--timeout=60s")
 
 		if err := initH.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
 			sharedMultiNodeErr = fmt.Errorf("wal-buffer failed to start: %w", err)
@@ -2393,7 +2517,7 @@ spec:
 	}
 
 	t.Logf("Executing objectfsctl checkpoint for volume %s", actualVolumeID)
-	h.RunCommand("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "checkpoint", actualVolumeID)
+	h.RunCommand("kubectl", "exec", "objectfs-controller-0", "-n", "default", "-c", "objectfs-controller", "--", "objectfsctl", "--server", "localhost:50051", "--ca", "/etc/objectfs/tls/ca.crt", "--token", "/var/run/secrets/tokens/token", "checkpoint", actualVolumeID)
 
 	// Pod A writes more files AFTER the checkpoint
 	t.Logf("Pod A writing files after checkpoint")

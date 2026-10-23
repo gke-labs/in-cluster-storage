@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -242,5 +243,82 @@ func TestE2EGroups_DriftGuardDetection(t *testing.T) {
 	}
 	if len(duplicates) != 1 || len(duplicates["TestDuplicate"]) != 2 {
 		t.Errorf("expected duplicate TestDuplicate in 2 groups, got %v", duplicates)
+	}
+}
+
+func TestNoCommittedPrivateKeys(t *testing.T) {
+	k8sDir := filepath.Join("..", "..", "k8s")
+	err := filepath.Walk(k8sDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(data, []byte("PRIVATE KEY")) {
+			t.Errorf("file %s contains a committed PRIVATE KEY; TLS secrets must be generated at deploy time, never checked in", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to scan k8s directory: %v", err)
+	}
+}
+
+func TestRBAC_TLSInitSecurity(t *testing.T) {
+	manifestPath := filepath.Join("..", "..", "k8s", "objectfs.yaml")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("failed to read k8s/objectfs.yaml: %v", err)
+	}
+	content := string(data)
+
+	// Verify Job runs under dedicated objectfs-tls-init ServiceAccount
+	if !strings.Contains(content, "serviceAccountName: objectfs-tls-init") {
+		t.Errorf("objectfs-tls-init Job must run under dedicated serviceAccountName: objectfs-tls-init")
+	}
+
+	docs := strings.Split(content, "\n---")
+
+	// Structural RBAC check: find all Roles/ClusterRoles bound to objectfs-controller and assert no secrets rules
+	controllerRoles := make(map[string]bool)
+	for _, doc := range docs {
+		if (strings.Contains(doc, "kind: RoleBinding") || strings.Contains(doc, "kind: ClusterRoleBinding")) &&
+			strings.Contains(doc, "name: objectfs-controller") {
+			for _, line := range strings.Split(doc, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "name:") && !strings.Contains(trimmed, "objectfs-controller") {
+					roleName := strings.TrimSpace(strings.TrimPrefix(trimmed, "name:"))
+					controllerRoles[roleName] = true
+				}
+			}
+		}
+	}
+
+	for _, doc := range docs {
+		for roleName := range controllerRoles {
+			if (strings.Contains(doc, "kind: Role") || strings.Contains(doc, "kind: ClusterRole")) &&
+				strings.Contains(doc, "name: "+roleName) {
+				if strings.Contains(doc, `"secrets"`) {
+					t.Errorf("Role/ClusterRole %s bound to objectfs-controller SA must not grant access to secrets", roleName)
+				}
+			}
+		}
+	}
+
+	// Verify no pod other than objectfs-controller mounts tls.key
+	for _, doc := range docs {
+		if strings.Contains(doc, "tls.key") && !strings.Contains(doc, "name: objectfs-controller") && !strings.Contains(doc, "objectfs-tls-init") {
+			t.Errorf("no pod other than objectfs-controller may mount or reference tls.key")
+		}
+	}
+
+	// Verify DaemonSet explicitly projects only ca.crt
+	if !strings.Contains(content, "key: ca.crt") {
+		t.Errorf("objectfs-node-daemon DaemonSet must explicitly project only ca.crt")
 	}
 }

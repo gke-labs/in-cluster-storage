@@ -62,6 +62,106 @@ roleRef:
 
 ---
 
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: objectfs-admin
+  namespace: kube-objectfs-system
+
+---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: objectfs-tls-init
+  namespace: kube-objectfs-system
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: objectfs-tls-init-role
+  namespace: kube-objectfs-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["objectfs-tls"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: objectfs-tls-init-binding
+  namespace: kube-objectfs-system
+subjects:
+  - kind: ServiceAccount
+    name: objectfs-tls-init
+    namespace: kube-objectfs-system
+roleRef:
+  kind: Role
+  name: objectfs-tls-init-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: objectfs-tls-init
+  namespace: kube-objectfs-system
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: objectfs-tls-init
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: objectfs-tls-init
+      containers:
+        - name: init-tls
+          image: objectfs-controller:latest
+          args:
+            - "--init-tls"
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: objectfs-controller
+  namespace: kube-objectfs-system
+spec:
+  podSelector:
+    matchLabels:
+      app: objectfs-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: objectfs-node-daemon
+        - podSelector:
+            matchLabels:
+              app: objectfs-admin
+      ports:
+        - protocol: TCP
+          port: 50051
+
+---
+
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -107,11 +207,17 @@ spec:
             - "--nodeid=$(NODE_ID)"
             - "--controller-address=objectfs-controller:50051"
             - "--cache-dir=/var/cache/objectfs"
+            - "--ca-cert-file=/etc/objectfs/tls/ca.crt"
+            - "--token-file=/var/run/secrets/tokens/token"
           env:
             - name: NODE_ID
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
@@ -120,6 +226,12 @@ spec:
               mountPropagation: "Bidirectional"
             - name: cache-dir
               mountPath: /var/cache/objectfs
+            - name: objectfs-tls
+              mountPath: /etc/objectfs/tls
+              readOnly: true
+            - name: token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
       volumes:
         - name: socket-dir
           hostPath:
@@ -137,6 +249,19 @@ spec:
           hostPath:
             path: /var/cache/objectfs
             type: DirectoryOrCreate
+        - name: objectfs-tls
+          secret:
+            secretName: objectfs-tls
+            items:
+              - key: ca.crt
+                path: ca.crt
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: objectfs-controller
+                  expirationSeconds: 3600
+                  path: token
 
 ---
 
@@ -174,6 +299,9 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
 
 ---
 
@@ -258,12 +386,19 @@ spec:
             - "--metadata-dir=/var/lib/objectfs/controller/metadata"
             - "--wal-target=wal-buffer-client:50051"
             - "--wal-durability=witness"
+            - "--tls-cert-file=/etc/objectfs/tls/tls.crt"
+            - "--tls-key-file=/etc/objectfs/tls/tls.key"
+            - "--auth-audience=objectfs-controller"
           env:
             - name: OBJECT_STORAGE_BACKEND
               valueFrom:
                 configMapKeyRef:
                   name: objectfs-config
                   key: backend
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - containerPort: 50051
           volumeMounts:
@@ -271,6 +406,12 @@ spec:
               mountPath: /csi
             - name: data-dir
               mountPath: /var/lib/objectfs/controller
+            - name: objectfs-tls
+              mountPath: /etc/objectfs/tls
+              readOnly: true
+            - name: token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
       volumes:
         - name: socket-dir
           emptyDir: {}
@@ -278,6 +419,17 @@ spec:
           hostPath:
             path: /var/lib/objectfs/controller
             type: DirectoryOrCreate
+        - name: objectfs-tls
+          secret:
+            secretName: objectfs-tls
+            optional: true
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: objectfs-controller
+                  expirationSeconds: 3600
+                  path: token
 
 ---
 
