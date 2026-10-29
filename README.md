@@ -101,8 +101,11 @@ The end-to-end test suite runs against local `kind` clusters and is divided into
 # Core single-node ObjectFS and WAL tests
 GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-core
 
-# Multi-node failover, cross-node visibility, and exclusive-local checkpoint tests
+# Multi-node failover and cross-node visibility tests
 GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-multinode
+
+# Exclusive-local checkpoint and hand-off tests
+GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-exclusive
 
 # Fault injection, crash mid-write, outage, and WAL restart tests
 GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-chaos

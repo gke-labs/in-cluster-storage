@@ -30,4 +30,4 @@ fi
 
 RUN_E2E=1 go test -v -count=1 -timeout 12m -run '^(TestObjectFSE2E|TestObjectFSStatefulSetE2E|TestObjectFSPersistentE2E|TestWALE2E|TestWALS3E2E)$' -json ./tests/e2e/ | \
   tee "${ARTIFACTS}/test-results/go/e2e-core.json" | \
-  go run gotest.tools/gotestsum@latest --format testname --raw-command cat
+  go run gotest.tools/gotestsum@v1.13.0 --format testname --raw-command cat

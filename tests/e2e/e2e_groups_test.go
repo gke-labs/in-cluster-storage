@@ -36,8 +36,11 @@ var (
 	}
 
 	multiNodeGroup = map[string]bool{
-		"TestObjectFSMultiNodeFailoverE2E":        true,
-		"TestObjectFSCrossNodeVisibilityE2E":      true,
+		"TestObjectFSMultiNodeFailoverE2E":   true,
+		"TestObjectFSCrossNodeVisibilityE2E": true,
+	}
+
+	exclusiveGroup = map[string]bool{
 		"TestObjectFSExclusiveLocalE2E":           true, // #290
 		"TestObjectFSExclusiveLocalKillE2E":       true, // #288, #307
 		"TestObjectFSExclusiveLocalIntervalE2E":   true, // #288
@@ -113,6 +116,7 @@ func TestE2EGroups_NoDrift(t *testing.T) {
 	groups := map[string]map[string]bool{
 		"core":      coreGroup,
 		"multinode": multiNodeGroup,
+		"exclusive": exclusiveGroup,
 		"chaos":     chaosGroup,
 		"periodic":  periodicGroup,
 	}
@@ -129,7 +133,7 @@ func TestE2EGroups_NoDrift(t *testing.T) {
 
 	// Periodic tests must never be listed in presubmit groups
 	for testName := range periodicGroup {
-		if coreGroup[testName] || multiNodeGroup[testName] || chaosGroup[testName] {
+		if coreGroup[testName] || multiNodeGroup[testName] || exclusiveGroup[testName] || chaosGroup[testName] {
 			t.Errorf("periodic test %s must not be in presubmit groups", testName)
 		}
 	}
@@ -187,6 +191,11 @@ func TestE2EPresubmitScripts_MatchGroups(t *testing.T) {
 			scriptPath: filepath.Join(repoRoot, "dev", "ci", "presubmits", "ap-e2e-multinode"),
 			group:      multiNodeGroup,
 			name:       "multinode",
+		},
+		{
+			scriptPath: filepath.Join(repoRoot, "dev", "ci", "presubmits", "ap-e2e-exclusive"),
+			group:      exclusiveGroup,
+			name:       "exclusive",
 		},
 		{
 			scriptPath: filepath.Join(repoRoot, "dev", "ci", "presubmits", "ap-e2e-chaos"),

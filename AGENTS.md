@@ -1,6 +1,6 @@
 # Developer & Agent Guidelines
 
-This document describes how to set up your environment and run the full end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), how to write commit messages and PR descriptions (section 5), and the Go API rules we hold code to (section 6).
+This document describes how to set up your environment and run the end-to-end (E2E) test suite (`dev/ci/presubmits/ap-e2e-*`) locally or within autonomous agent containers before submitting code changes (sections 1–3), how to handle errors (section 4), how to write commit messages and PR descriptions (section 5), and the Go API rules we hold code to (section 6).
 
 ---
 
@@ -40,15 +40,18 @@ Ensure your `DOCKER_HOST` environment variable is exported and points to the run
 
 ## 2. Running the E2E Tests
 
-Once the prerequisites are satisfied, you can execute the E2E test suite locally using the repository's presubmit wrapper scripts:
+Once the prerequisites are satisfied, you can execute the E2E test suite locally using the repository's named presubmit wrapper scripts:
 
 ```bash
-# Force the Go toolchain to auto-resolve matching versions and execute the E2E runner
-GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e
+# Force the Go toolchain to auto-resolve matching versions and execute an E2E group
+GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-core
+GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-multinode
+GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-exclusive
+GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-chaos
 ```
 
 The E2E suite will:
-1. Spin up shared local `kind` Kubernetes clusters (`objectfs-shared-single` for single-node core tests, `objectfs-shared-multinode` for 2-worker multi-node and chaos tests).
+1. Spin up shared local `kind` Kubernetes clusters (`objectfs-shared-single` for single-node core tests, `objectfs-shared-multinode` for 2-worker multi-node, exclusive, and chaos tests).
 2. Compile and build the `objectfs-controller:e2e`, `objectfs-node-daemon:e2e`, and `wal-buffer:e2e` Docker images once per test process.
 3. Load the built images directly into the `kind` cluster nodes.
 4. Deploy the ObjectFS controller StatefulSet, node daemon DaemonSet, WAL buffer, and FakeS3 object storage (`k8s/wal.yaml` and `k8s/objectfs.yaml`).
@@ -61,7 +64,8 @@ Set `OBJECTFS_E2E_KEEP_CLUSTERS=1` to keep the shared clusters running after tes
 
 The E2E suite is split into named presubmit jobs with per-group timeouts, attribution, and cluster shapes:
 - `ap-e2e-core` (`dev/ci/presubmits/ap-e2e-core`): single-node core ObjectFS and WAL tests (`TestObjectFSE2E`, `TestObjectFSStatefulSetE2E`, `TestObjectFSPersistentE2E`, `TestWALE2E`, `TestWALS3E2E`).
-- `ap-e2e-multinode` (`dev/ci/presubmits/ap-e2e-multinode`): two-worker cluster tests (`TestObjectFSMultiNodeFailoverE2E`, `TestObjectFSCrossNodeVisibilityE2E`, `TestObjectFSExclusiveLocalE2E`, `TestObjectFSExclusiveLocalKillE2E`, `TestObjectFSExclusiveLocalIntervalE2E`, `TestObjectFSExclusiveLocalDaemonKillE2E`).
+- `ap-e2e-multinode` (`dev/ci/presubmits/ap-e2e-multinode`): two-worker cluster tests (`TestObjectFSMultiNodeFailoverE2E`, `TestObjectFSCrossNodeVisibilityE2E`).
+- `ap-e2e-exclusive` (`dev/ci/presubmits/ap-e2e-exclusive`): two-worker cluster exclusive-local tests (`TestObjectFSExclusiveLocalE2E`, `TestObjectFSExclusiveLocalKillE2E`, `TestObjectFSExclusiveLocalIntervalE2E`, `TestObjectFSExclusiveLocalDaemonKillE2E`).
 - `ap-e2e-chaos` (`dev/ci/presubmits/ap-e2e-chaos`): two-worker chaos and fault-injection tests (`TestObjectFSControllerCrashMidWriteE2E`, `TestObjectFSControllerOutageE2E`, `TestObjectFSWalBufferRestartE2E`).
 - `ap-torture` (`dev/ci/periodics/ap-torture`): nightly periodic torture test (`TestObjectFSTortureE2E`).
 
@@ -69,6 +73,7 @@ You can run any group locally before pushing:
 ```bash
 GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-core
 GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-multinode
+GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-exclusive
 GOTOOLCHAIN=auto ./dev/ci/presubmits/ap-e2e-chaos
 ```
 
