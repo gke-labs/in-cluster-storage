@@ -31,6 +31,8 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/grpc"
 )
@@ -45,7 +47,7 @@ func startTestServer(t *testing.T) (*controller.Server, string, func()) {
 
 	grpcServer := grpc.NewServer()
 	backend := controller.NewMemoryBackend()
-	server := controller.NewServer(backend)
+	server := controllertest.NewTestServer(backend)
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
 
 	go func() {
@@ -76,7 +78,7 @@ func startTestUnixServer(t *testing.T) (*controller.Server, string, func()) {
 
 	grpcServer := grpc.NewServer()
 	backend := controller.NewMemoryBackend()
-	server := controller.NewServer(backend)
+	server := controllertest.NewTestServer(backend)
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
 
 	go func() {
@@ -756,14 +758,23 @@ func TestVolumesRepairAndDegradedDisplay(t *testing.T) {
 	volHealthy := "vol-healthy"
 
 	walDir := t.TempDir()
+	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(backend))
 
-	streamRepair, err := walclient.Open(ctx, walDir, controller.StreamIDForVolume(volRepair), "")
+	streamRepair, err := walclient.Open(ctx, walDir, controller.StreamIDForVolume(volRepair), bt.Target,
+		walclient.WithGRPCClient(bt.Client),
+		walclient.WithDialOptions(bt.DialOpts...),
+		walclient.WithoutFsync(),
+	)
 	if err != nil {
 		t.Fatalf("Open streamRepair failed: %v", err)
 	}
 	defer streamRepair.Close()
 
-	streamHealthy, err := walclient.Open(ctx, walDir, controller.StreamIDForVolume(volHealthy), "")
+	streamHealthy, err := walclient.Open(ctx, walDir, controller.StreamIDForVolume(volHealthy), bt.Target,
+		walclient.WithGRPCClient(bt.Client),
+		walclient.WithDialOptions(bt.DialOpts...),
+		walclient.WithoutFsync(),
+	)
 	if err != nil {
 		t.Fatalf("Open streamHealthy failed: %v", err)
 	}
@@ -784,14 +795,19 @@ func TestVolumesRepairAndDegradedDisplay(t *testing.T) {
 	}
 	defer lis.Close()
 
-	server := controller.NewServer(backend,
-		controller.WithServerWAL(walDir, "", walclient.Local),
+	server := controllertest.NewTestServer(backend,
+		controller.WithServerWAL(walDir, bt.Target, walclient.Witness),
+		controller.WithServerWALDialOptions(bt.DialOpts...),
 		controller.WithServerStreamFactory(func(volID string) (walclient.Stream, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			if volID == volRepair {
 				if repaired {
-					return walclient.Open(ctx, walDir, controller.StreamIDForVolume(volRepair), "")
+					return walclient.Open(ctx, walDir, controller.StreamIDForVolume(volRepair), bt.Target,
+						walclient.WithGRPCClient(bt.Client),
+						walclient.WithDialOptions(bt.DialOpts...),
+						walclient.WithoutFsync(),
+					)
 				}
 				return mockRepair, nil
 			}

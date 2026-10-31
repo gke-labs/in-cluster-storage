@@ -35,9 +35,9 @@ import (
 	"golang.org/x/sys/unix"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
-	walpb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
-	walbuffer "github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
@@ -52,7 +52,7 @@ import (
 func createTestClient(t *testing.T) (pb.ObjectFSControllerClient, func()) {
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
 
 	go func() {
@@ -537,7 +537,7 @@ func TestFUSEStableInodesAcrossSnapshots(t *testing.T) {
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
 	backend := controller.NewMemoryBackend()
-	server := controller.NewServer(backend)
+	server := controllertest.NewTestServer(backend)
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
 
 	go func() {
@@ -1001,7 +1001,7 @@ func TestFUSESetAttrAllFields(t *testing.T) {
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
 	backend := controller.NewMemoryBackend()
-	server := controller.NewServer(backend)
+	server := controllertest.NewTestServer(backend)
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
 
 	go func() {
@@ -2051,7 +2051,7 @@ func TestObjectFSWaitForReadyAndRecovery(t *testing.T) {
 
 	// Now start serving the controller on the listener
 	grpcServer := grpc.NewServer()
-	ctrlServer := controller.NewServer(nil)
+	ctrlServer := controllertest.NewTestServer(nil)
 	pb.RegisterObjectFSControllerServer(grpcServer, ctrlServer)
 	go func() {
 		_ = grpcServer.Serve(lis)
@@ -2112,7 +2112,7 @@ func TestObjectFSServerDownReturnsEIOOnTimeout(t *testing.T) {
 func TestStartWatcherReconnectResync(t *testing.T) {
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
-	ctrlServer := controller.NewServer(nil)
+	ctrlServer := controllertest.NewTestServer(nil)
 	pb.RegisterObjectFSControllerServer(grpcServer, ctrlServer)
 	go func() { _ = grpcServer.Serve(lis) }()
 
@@ -2153,7 +2153,7 @@ func TestStartWatcherReconnectResync(t *testing.T) {
 	// Start new server and buffer listener
 	lis2 := bufconn.Listen(1024 * 1024)
 	grpcServer2 := grpc.NewServer()
-	ctrlServer2 := controller.NewServer(nil)
+	ctrlServer2 := controllertest.NewTestServer(nil)
 	pb.RegisterObjectFSControllerServer(grpcServer2, ctrlServer2)
 	go func() { _ = grpcServer2.Serve(lis2) }()
 	defer grpcServer2.Stop()
@@ -2198,7 +2198,7 @@ func TestFsyncSlowSyncSucceedsWithinSyncTimeout(t *testing.T) {
 		return handler(ctx, req)
 	}
 	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(interceptor))
-	ctrlServer := controller.NewServer(nil)
+	ctrlServer := controllertest.NewTestServer(nil)
 	pb.RegisterObjectFSControllerServer(grpcServer, ctrlServer)
 	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
@@ -3930,7 +3930,7 @@ func TestPushDirtyChunksToStaging_DrainAndRetryOnInitialENOSPC(t *testing.T) {
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
 	// Set controller staging cap to 64 KiB
-	server := controller.NewServer(nil, controller.WithServerMaxStagingBytes(64*1024))
+	server := controllertest.NewTestServer(nil, controller.WithServerMaxStagingBytes(64*1024))
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
 
 	go func() {
@@ -4607,38 +4607,6 @@ func TestSharedDiskBlobCacheAcrossMounts(t *testing.T) {
 	}
 }
 
-func startTestWalBuffer(t *testing.T, dir string, backend controller.ObjectStorageBackend) (string, func()) {
-	srv, err := walbuffer.NewServer(t.Context(), walbuffer.ServerConfig{
-		Backend:       backend,
-		DataDir:       dir,
-		FlushInterval: 10 * time.Second,
-		BatchMaxDelay: 2 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("failed to create walbuffer server: %v", err)
-	}
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen for walbuffer: %v", err)
-	}
-
-	grpcServer := grpc.NewServer()
-	walpb.RegisterWalBufferServer(grpcServer, srv)
-
-	go func() {
-		_ = grpcServer.Serve(listener)
-	}()
-
-	cleanup := func() {
-		grpcServer.Stop()
-		_ = srv.Close()
-		_ = listener.Close()
-	}
-
-	return listener.Addr().String(), cleanup
-}
-
 func TestDirtyReadSurvivesControllerRestartWhileSyncInFlight(t *testing.T) {
 	// Reproduces issue #252:
 	// A close-triggered non-blocking sync is in-flight when the controller crashes/restarts.
@@ -4650,14 +4618,17 @@ func TestDirtyReadSurvivesControllerRestartWhileSyncInFlight(t *testing.T) {
 	volumeID := "test-dirty-survive-vol"
 
 	bufDir := t.TempDir()
-	target, cleanupBuf := startTestWalBuffer(t, bufDir, backend)
+	bt, cleanupBuf := buffertest.Start(ctx, t, buffertest.WithDataDir(bufDir), buffertest.WithBackend(backend))
 	defer cleanupBuf()
 
 	// 1. Controller 1 starts with Witness durability against wal-buffer
 	clientDir1 := t.TempDir()
 	lis1 := bufconn.Listen(1024 * 1024)
 	grpcServer1 := grpc.NewServer()
-	ctrl1 := controller.NewServer(backend, controller.WithServerWAL(clientDir1, target, walclient.Witness))
+	ctrl1 := controllertest.NewTestServer(backend,
+		controller.WithServerWAL(clientDir1, bt.Target, walclient.Witness),
+		controller.WithServerWALDialOptions(bt.DialOpts...),
+	)
 	pb.RegisterObjectFSControllerServer(grpcServer1, ctrl1)
 	go func() { _ = grpcServer1.Serve(lis1) }()
 
@@ -4721,7 +4692,10 @@ func TestDirtyReadSurvivesControllerRestartWhileSyncInFlight(t *testing.T) {
 	clientDir2 := t.TempDir()
 	lis2 := bufconn.Listen(1024 * 1024)
 	grpcServer2 := grpc.NewServer()
-	ctrl2 := controller.NewServer(backend, controller.WithServerWAL(clientDir2, target, walclient.Witness))
+	ctrl2 := controllertest.NewTestServer(backend,
+		controller.WithServerWAL(clientDir2, bt.Target, walclient.Witness),
+		controller.WithServerWALDialOptions(bt.DialOpts...),
+	)
 	pb.RegisterObjectFSControllerServer(grpcServer2, ctrl2)
 	go func() { _ = grpcServer2.Serve(lis2) }()
 	defer func() {
@@ -7099,7 +7073,7 @@ func TestSyncClosedInodes_TenClosedInodesOverlapInTime(t *testing.T) {
 
 func TestOpen_ReaderCacheInvalidationOnMovedStreamPosition(t *testing.T) {
 	ctx := t.Context()
-	ctrlServer := controller.NewServer(nil)
+	ctrlServer := controllertest.NewTestServer(nil)
 	vol, err := ctrlServer.GetVolume("test-open-inval-vol")
 	if err != nil {
 		t.Fatalf("GetVolume failed: %v", err)
@@ -7208,7 +7182,7 @@ func TestOpen_ReaderCacheInvalidationOnMovedStreamPosition(t *testing.T) {
 func TestCloseToOpen_TwoNodeReaderCacheInvalidation(t *testing.T) {
 	ctx := t.Context()
 	backend := controller.NewMemoryBackend()
-	ctrlServer := controller.NewServer(backend)
+	ctrlServer := controllertest.NewTestServer(backend)
 	defer func() { _ = ctrlServer.Close() }()
 
 	volumeID := "test-c2o-unit-vol"

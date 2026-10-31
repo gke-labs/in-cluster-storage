@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	"github.com/google/uuid"
 )
 
@@ -31,6 +32,7 @@ func TestClientOpen_UnversionedUpgrade(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
 	streamID := uuid.New()
+	bt, _ := buffertest.Start(ctx, t)
 
 	// Create legacy unversioned client segment file
 	clientRec := &wal.ClientRecord{
@@ -45,7 +47,7 @@ func TestClientOpen_UnversionedUpgrade(t *testing.T) {
 	}
 
 	// 1. Without flag: Open must fail with ErrUnversionedSegment
-	_, err := Open(ctx, dir, streamID, "")
+	_, err := Open(ctx, dir, streamID, bt.Target, WithGRPCClient(bt.Client), WithDialOptions(bt.DialOpts...))
 	if err == nil {
 		t.Fatal("expected error without WithAcceptUnversioned, got nil")
 	}
@@ -54,7 +56,7 @@ func TestClientOpen_UnversionedUpgrade(t *testing.T) {
 	}
 
 	// 2. With flag: Open must succeed, recover the record, and set LocalSequence to 1
-	stream, err := Open(ctx, dir, streamID, "", WithAcceptUnversioned(true))
+	stream, err := Open(ctx, dir, streamID, bt.Target, WithGRPCClient(bt.Client), WithDialOptions(bt.DialOpts...), WithAcceptUnversioned(true))
 	if err != nil {
 		t.Fatalf("unexpected error with WithAcceptUnversioned: %v", err)
 	}
@@ -67,5 +69,17 @@ func TestClientOpen_UnversionedUpgrade(t *testing.T) {
 	recs := stream.RecoveredRecords()
 	if len(recs) != 1 || recs[0].StreamSeq != 1 {
 		t.Fatalf("expected 1 recovered record at seq 1, got %d (%+v)", len(recs), recs)
+	}
+	tailIter, err := stream.Tail(ctx, 0)
+	if err != nil {
+		t.Fatalf("Tail failed: %v", err)
+	}
+	var tailedSeqs []uint64
+	for seq := range tailIter {
+		tailedSeqs = append(tailedSeqs, seq)
+		break
+	}
+	if len(tailedSeqs) != 1 || tailedSeqs[0] != 1 {
+		t.Fatalf("expected 1 tailed record at seq 1, got %v", tailedSeqs)
 	}
 }

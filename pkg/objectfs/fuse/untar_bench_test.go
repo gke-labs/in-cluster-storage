@@ -28,6 +28,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -65,7 +66,7 @@ func TestUntarPackCounts(t *testing.T) {
 
 		rawBackend := controller.NewMemoryBackend()
 		backend := &untarCountingBackend{ObjectStorageBackend: rawBackend}
-		server := controller.NewServer(backend)
+		server := controllertest.NewTestServer(backend)
 		defer func() { _ = server.Close() }()
 
 		lis := bufconn.Listen(4 * 1024 * 1024)

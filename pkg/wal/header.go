@@ -87,6 +87,7 @@ func DefaultSegmentHeader() SegmentHeader {
 // ScanOptions configures options for scanning segment files.
 type ScanOptions struct {
 	AcceptUnversioned bool
+	NoFsync           bool
 }
 
 // ScanOption configures a ScanOptions.
@@ -96,6 +97,13 @@ type ScanOption func(*ScanOptions)
 func WithAcceptUnversioned(accept bool) ScanOption {
 	return func(o *ScanOptions) {
 		o.AcceptUnversioned = accept
+	}
+}
+
+// WithNoFsync configures whether per-record fsync is skipped (for testing and benchmarks only).
+func WithNoFsync(noFsync bool) ScanOption {
+	return func(o *ScanOptions) {
+		o.NoFsync = noFsync
 	}
 }
 

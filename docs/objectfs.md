@@ -463,24 +463,20 @@ To achieve both high write throughput and optimal packing in cloud object storag
    - If the controller restarts before an `Fsync` completes, un-synced staged writes are dropped cleanly.
    - When the client next contacts the restarted controller for `Fsync`, it detects a staging epoch change (`ESTALE`) and automatically re-pushes its still-dirty chunks, ensuring no data loss.
 
-7. **Durability Matrix (controller WAL permanent / witness / local / none: ephemeral shared disk):**
+7. **Durability Matrix (controller WAL permanent / witness / local):**
 
-The durability of an `fsync` operation depends on the configured controller WAL stream replication level:
+The durability of an `fsync` operation depends on the configured controller WAL stream replication level (both `--wal-dir` and `--wal-target` are required):
 
 | Durability Mode | Configuration | Fsync Ack Guarantee | Failure Mode & Recovery Guarantee | Recommended Use Case |
 | :--- | :--- | :--- | :--- | :--- |
 | **Controller WAL `permanent`** | `--wal-durability=permanent` (requires `--wal-dir` and `--wal-target`) | Blocks until chunk packfiles are uploaded to object store AND controller WAL log records are sealed and committed to permanent cloud object storage (GCS/S3). | **Disaster Safe:** Survives total cluster loss; all metadata changes are durably persisted in cloud storage alongside chunk packs. | Archival, compliance, high-value data. |
 | **Controller WAL `witness`** *(default in `k8s/objectfs.yaml`)* | `--wal-durability=witness` (requires `--wal-dir` and `--wal-target`) | Blocks until chunk packfiles are uploaded to object store AND metadata transaction is replicated and fsynced to the central `wal-buffer` witness disk. | **Crash Safe:** Survives controller pod restarts or node failovers; restarted controllers replay authoritative stream tail from `wal-buffer`. | Standard production workloads requiring low commit latency (~2–10 ms). |
-| **Controller WAL `local`** | `--wal-durability=local` (requires `--wal-dir`) | Blocks until chunk packfiles are uploaded to object store AND metadata transaction is appended and fsynced to node-local WAL segment files on host disk. | **Node-bound:** Survives controller restarts on the same node with local WAL directory intact. If the node is lost, metadata since the last snapshot is lost. | Single-node testing and scratch workloads. |
-| **None: ephemeral shared disk** | No `--wal-dir` | Chunk packfiles are uploaded via `PutBlobs`, but metadata transaction is committed only to the controller's local in-memory/SQLite index. | **Non-durable across controller restarts:** `fsync` returns success, but metadata is only persisted to object storage during periodic flushes (`FlushToBackend`, `--flush-interval`, default 1h) or shutdown (`FlushAll`). A controller crash or restart loses all metadata committed since the last flush. | Scratch space shared between pods where losing un-flushed metadata on a controller restart is acceptable, in-process tests, and local dev (`dev/tasks/fuse-start`). |
+| **Controller WAL `local`** | `--wal-durability=local` (requires `--wal-dir` and `--wal-target`) | Blocks until chunk packfiles are uploaded to object store AND metadata transaction is appended and fsynced to node-local WAL segment files on host disk. | **Node-bound:** Survives controller restarts on the same node with local WAL directory intact. If the node is lost, metadata since the last snapshot is lost. | Single-node testing and scratch workloads. |
 
 **WAL Buffer Deployment Requirement for Witness Durability:**
 When `--wal-durability=witness` is used, metadata transactions are acknowledged as soon as they are committed and fsynced to `wal-buffer` local disk. For this guarantee to survive `wal-buffer` pod restarts or rescheduling across nodes:
 - The default deployment manifest (`k8s/wal.yaml`) configures a `PersistentVolumeClaim` via `volumeClaimTemplates` for `data-dir` (using the cluster's default `StorageClass`), ensuring the volume re-attaches across pod restarts and rescheduling.
 - If using `hostPath` storage for local development instead of PVCs, `wal-buffer` **must be node-pinned** (via `nodeSelector: kubernetes.io/hostname: <node>`). Otherwise, rescheduling the pod to a different node mounts an empty directory, regressing the local witness watermark to the last object-store flush and violating witness durability.
-
-**Why Warn When No Controller WAL is Configured?**
-ObjectFS builds a full filesystem on top of structured-data-streams. The controller's WAL stream provides low-latency, crash-consistent linearizable metadata commits without having to take full filesystem index snapshots on every `fsync`. When running without a controller WAL stream, the volume operates as an **ephemeral shared disk**: `fsync` acknowledges success once chunks are packed and uploaded, but metadata modifications remain only in local controller state until the periodic flush or clean shutdown. A controller crash or restart will lose un-flushed metadata since the last snapshot. The controller emits a prominent warning at startup and on volume creation so operators are aware that `fsync` is not durable across controller restarts in this mode.
 
 ### 5. Configurable Write-Through Modes
 ObjectFS supports three distinct write synchronization modes:

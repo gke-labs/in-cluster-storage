@@ -32,6 +32,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
@@ -40,7 +41,7 @@ import (
 func TestVolume_StatsTracking(t *testing.T) {
 	ctx := t.Context()
 	storage := inmemorystorage.New()
-	server := NewServer(storage)
+	server := NewTestServer(storage)
 
 	volumeID := "test-stats-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
@@ -186,13 +187,19 @@ func TestVolume_InodeAllocatorNoReuseAcrossRestart(t *testing.T) {
 	ctx := t.Context()
 	storage := inmemorystorage.New()
 	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(storage))
 
 	volumeID := "test-allocator-vol"
 	var createdInodes []uint64
 
 	// Session 1: Create several files
 	{
-		server1 := NewServer(storage, WithServerLocalStorageDir(filepath.Join(dir, "session1")))
+		server1 := NewTestServer(storage,
+			WithServerLocalStorageDir(filepath.Join(dir, "session1")),
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
+		)
 		vol1, err := server1.getOrCreateVolume(volumeID)
 		if err != nil {
 			t.Fatalf("getOrCreateVolume failed: %v", err)
@@ -221,11 +228,19 @@ func TestVolume_InodeAllocatorNoReuseAcrossRestart(t *testing.T) {
 		if err := vol1.FlushToBackend(ctx); err != nil {
 			t.Fatalf("FlushToBackend failed: %v", err)
 		}
+		if err := server1.Close(); err != nil {
+			t.Fatalf("server1.Close failed: %v", err)
+		}
 	}
 
 	// Session 2: Reload volume from backend
 	{
-		server2 := NewServer(storage, WithServerLocalStorageDir(filepath.Join(dir, "session2")))
+		server2 := NewTestServer(storage,
+			WithServerLocalStorageDir(filepath.Join(dir, "session2")),
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
+		)
+		defer server2.Close()
 		vol2, err := server2.getOrCreateVolume(volumeID)
 		if err != nil {
 			t.Fatalf("getOrCreateVolume failed: %v", err)
@@ -259,15 +274,19 @@ func TestVolume_InodeAllocatorRecomputeWhenStatsDeleted(t *testing.T) {
 	storage := inmemorystorage.New()
 	dir := t.TempDir()
 	localDir := filepath.Join(dir, "local")
+	walDir := filepath.Join(dir, "wal")
+	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(storage))
 
 	volumeID := "test-deleted-stats-vol"
 
 	// Session 1: create 5 files (inodes 8, 16, 24, 32, 40)
 	var createdInodes []uint64
 	{
-		server1 := NewServer(storage,
+		server1 := NewTestServer(storage,
 			WithServerMetadataIndex("sqlite"),
 			WithServerLocalStorageDir(localDir),
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
 		)
 		vol1, err := server1.getOrCreateVolume(volumeID)
 		if err != nil {
@@ -320,9 +339,11 @@ func TestVolume_InodeAllocatorRecomputeWhenStatsDeleted(t *testing.T) {
 
 	// Session 2: reopen volume with same local directory
 	{
-		server2 := NewServer(storage,
+		server2 := NewTestServer(storage,
 			WithServerMetadataIndex("sqlite"),
 			WithServerLocalStorageDir(localDir),
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
 		)
 		vol2, err := server2.getOrCreateVolume(volumeID)
 		if err != nil {
@@ -371,14 +392,16 @@ func TestVolume_CrashWithUnappliedBacklogAndRecovery(t *testing.T) {
 	storage := inmemorystorage.New()
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "wal")
+	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(storage))
 
 	volumeID := "test-crash-backlog-vol"
 	var unappliedInodes []uint64
 
 	// Session 1: Create files remaining in overlay
 	{
-		server1 := NewServer(storage,
-			WithServerWAL(walDir, "", walclient.Local),
+		server1 := NewTestServer(storage,
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
 			WithServerLocalStorageDir(filepath.Join(dir, "session1")),
 			WithServerMetadataApplierBatchSize(1000),
 		)
@@ -418,8 +441,9 @@ func TestVolume_CrashWithUnappliedBacklogAndRecovery(t *testing.T) {
 
 	// Session 2: Recover from backend + WAL stream
 	{
-		server2 := NewServer(storage,
-			WithServerWAL(walDir, "", walclient.Local),
+		server2 := NewTestServer(storage,
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
 			WithServerLocalStorageDir(filepath.Join(dir, "session2")),
 		)
 		_, err := server2.getOrCreateVolume(volumeID)
@@ -457,14 +481,16 @@ func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
 	storage := inmemorystorage.New()
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "wal")
+	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(storage))
 
 	volumeID := "test-recovery-stats-vol"
 
 	// Session 1: Create files with unapplied backlog (large batch size)
 	session1Dir := filepath.Join(dir, "session1")
 	{
-		server1 := NewServer(storage,
-			WithServerWAL(walDir, "", walclient.Local),
+		server1 := NewTestServer(storage,
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
 			WithServerLocalStorageDir(session1Dir),
 			WithServerMetadataApplierBatchSize(1000),
 		)
@@ -558,8 +584,9 @@ func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
 
 	// Session 2: Crash restart with SAME local directory
 	{
-		server2 := NewServer(storage,
-			WithServerWAL(walDir, "", walclient.Local),
+		server2 := NewTestServer(storage,
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
 			WithServerLocalStorageDir(session1Dir),
 		)
 		vol2, err := server2.getOrCreateVolume(volumeID)
@@ -582,8 +609,9 @@ func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
 	// Session 3: Node move with FRESH local storage directory in WAL mode
 	session3Dir := filepath.Join(dir, "session3-fresh")
 	{
-		server3 := NewServer(storage,
-			WithServerWAL(walDir, "", walclient.Local),
+		server3 := NewTestServer(storage,
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
 			WithServerLocalStorageDir(session3Dir),
 		)
 		vol3, err := server3.getOrCreateVolume(volumeID)
@@ -607,7 +635,7 @@ func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
 func TestVolume_DebugStatsCheckCatchesSkippedUpdate(t *testing.T) {
 	ctx := t.Context()
 	storage := inmemorystorage.New()
-	server := NewServer(storage, WithServerStatsCheck())
+	server := NewTestServer(storage, WithServerStatsCheck())
 	defer server.Close()
 
 	vol, err := server.getOrCreateVolume("test-debug-check-vol")
@@ -876,20 +904,25 @@ func TestVolume_ReadsBeforeWritesAssertionPanicsInAllModes(t *testing.T) {
 	}
 }
 
-func TestVolume_MemoryAppenderSequenceNumberContinuityAcrossRestart(t *testing.T) {
+func TestVolume_SequenceNumberContinuityAcrossRestart(t *testing.T) {
 	ctx := t.Context()
 	storage := inmemorystorage.New()
 	dir := t.TempDir()
 	localDir := filepath.Join(dir, "local")
+	walDir := filepath.Join(dir, "wal")
 
 	volumeID := "test-seq-continuity-vol"
 
-	// Session 1: Create several files in no-WAL (memory appender) mode
+	bt, _ := buffertest.Start(ctx, t, buffertest.WithBackend(storage))
+
+	// Session 1: Create several files connected to the WAL buffer
 	var session1Pos uint64
 	{
-		server1 := NewServer(storage,
+		server1 := NewTestServer(storage,
 			WithServerMetadataIndex("sqlite"),
 			WithServerLocalStorageDir(localDir),
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
 		)
 		vol1, err := server1.getOrCreateVolume(volumeID)
 		if err != nil {
@@ -928,15 +961,17 @@ func TestVolume_MemoryAppenderSequenceNumberContinuityAcrossRestart(t *testing.T
 		}
 	}
 
-	// Session 2: Reopen volume on the same local directory in memory (no-WAL) mode
+	// Session 2: Reopen volume on the same local directory against the WAL buffer
 	{
 		var holdApplier atomic.Bool
 		applierStarted := make(chan struct{}, 1)
 		releaseApplier := make(chan struct{})
 
-		server2 := NewServer(storage,
+		server2 := NewTestServer(storage,
 			WithServerMetadataIndex("sqlite"),
 			WithServerLocalStorageDir(localDir),
+			WithServerWAL(walDir, bt.Target, walclient.Witness),
+			WithServerWALDialOptions(bt.DialOpts...),
 			WithServerViewOptions(view.WithFaultHook(func() error {
 				if holdApplier.Load() {
 					select {

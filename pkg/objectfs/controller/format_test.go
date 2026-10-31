@@ -26,6 +26,7 @@ import (
 	sdsv1 "github.com/gke-labs/in-cluster-storage/pkg/api/sds/v1"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/protobuf/proto"
 )
@@ -34,6 +35,7 @@ func TestController_UnversionedUpgrade(t *testing.T) {
 	ctx := t.Context()
 	walDir := t.TempDir()
 	streamID := StreamIDForVolume("vol-legacy")
+	bt, _ := buffertest.Start(ctx, t)
 
 	payload, err := record.EncodeFrame(record.TypeIDPadding, []byte("legacy-padding"))
 	if err != nil {
@@ -53,7 +55,7 @@ func TestController_UnversionedUpgrade(t *testing.T) {
 	}
 
 	// 1. Without flag: Server.walclient.Open fails
-	_, err = walclient.Open(ctx, walDir, streamID, "")
+	_, err = walclient.Open(ctx, walDir, streamID, bt.Target, walclient.WithGRPCClient(bt.Client), walclient.WithDialOptions(bt.DialOpts...))
 	if err == nil {
 		t.Fatal("expected error without acceptUnversioned, got nil")
 	}
@@ -62,8 +64,9 @@ func TestController_UnversionedUpgrade(t *testing.T) {
 	}
 
 	// 2. With flag: Server.walclient.Open succeeds and volume loads
-	srv := NewServer(NewMemoryBackend(),
-		WithServerWAL(walDir, "", walclient.Local),
+	srv := NewTestServer(NewMemoryBackend(),
+		WithServerWAL(walDir, bt.Target, walclient.Witness),
+		WithServerWALDialOptions(bt.DialOpts...),
 		WithServerAcceptUnversioned(true),
 	)
 	defer srv.Close()

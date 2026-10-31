@@ -29,7 +29,7 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
-	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -43,7 +43,7 @@ import (
 // lower/ and upper/ are never mutated or deleted by the daemon while mounted.
 func TestCheckpointAppendPrefixAndRest(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-append-prefix-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -258,7 +258,7 @@ func TestScanUpperLayer_ConcurrencyToleratesDeletedFile(t *testing.T) {
 // receives EVENT_CHECKPOINT_REQUEST with requestID, executes the commit, and acknowledges via AckCheckpoint.
 func TestStartExclusiveLocalSync_ExplicitTrigger(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-sync-explicit-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -345,7 +345,7 @@ func TestStartExclusiveLocalSync_IntervalTrigger(t *testing.T) {
 	daemonCtx, daemonCancel := context.WithCancel(ctx)
 	defer daemonCancel()
 
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-sync-interval-vol"
 
 	lis := bufconn.Listen(1024 * 1024)

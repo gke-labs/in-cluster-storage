@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -381,12 +382,22 @@ func calculatePercentiles(durations []time.Duration) (p50, p90, p99, max time.Du
 	return
 }
 
-func getStreamBytes(vol *Volume) int64 {
-	if vol.memAppender != nil {
-		payloads := vol.memAppender.Payloads()
+func getStreamBytes(ctx context.Context, vol *Volume) int64 {
+	if vol.Stream() != nil {
+		local, _, _ := vol.Stream().Watermarks()
+		if local == 0 {
+			return 0
+		}
+		tailIter, err := vol.Stream().Tail(ctx, 0)
+		if err != nil {
+			return 0
+		}
 		var total int64
-		for _, p := range payloads {
+		for seq, p := range tailIter {
 			total += int64(len(p))
+			if seq >= local {
+				break
+			}
 		}
 		return total
 	}
@@ -640,7 +651,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		// --- A. Create Operations ---
 		dirAttr, _ := vol.Mkdir(ctx, 1, "hot_dir", 0755, 0, 0)
 		_ = vol.FlushOverlay(ctx)
-		streamBeforeCreate := getStreamBytes(vol)
+		streamBeforeCreate := getStreamBytes(ctx, vol)
 		_, walBeforeCreate := getDiskFootprint(localDir)
 		procBeforeCreate := readProcSelfWriteBytes()
 
@@ -651,7 +662,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		createDur := time.Since(startCreate)
 		_ = vol.FlushOverlay(ctx)
 
-		streamAfterCreate := getStreamBytes(vol)
+		streamAfterCreate := getStreamBytes(ctx, vol)
 		_, walAfterCreate := getDiskFootprint(localDir)
 		procAfterCreate := readProcSelfWriteBytes()
 
@@ -671,7 +682,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		_ = vol.FlushOverlay(ctx)
 		data64K := make([]byte, 64*1024)
 
-		streamBeforeWrite := getStreamBytes(vol)
+		streamBeforeWrite := getStreamBytes(ctx, vol)
 		_, walBeforeWrite := getDiskFootprint(localDir)
 		procBeforeWrite := readProcSelfWriteBytes()
 
@@ -682,7 +693,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		writeDur := time.Since(startWrite)
 		_ = vol.FlushOverlay(ctx)
 
-		streamAfterWrite := getStreamBytes(vol)
+		streamAfterWrite := getStreamBytes(ctx, vol)
 		_, walAfterWrite := getDiskFootprint(localDir)
 		procAfterWrite := readProcSelfWriteBytes()
 
@@ -701,7 +712,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		rAttr, _ := vol.CreateFile(ctx, 1, "r_a.txt", 0644, []byte("x"), 0, 0, 0)
 		_ = vol.FlushOverlay(ctx)
 
-		streamBeforeRename := getStreamBytes(vol)
+		streamBeforeRename := getStreamBytes(ctx, vol)
 		_, walBeforeRename := getDiskFootprint(localDir)
 		procBeforeRename := readProcSelfWriteBytes()
 
@@ -716,7 +727,7 @@ func TestBenchmarkMetricsReport(t *testing.T) {
 		renameDur := time.Since(startRename)
 		_ = vol.FlushOverlay(ctx)
 
-		streamAfterRename := getStreamBytes(vol)
+		streamAfterRename := getStreamBytes(ctx, vol)
 		_, walAfterRename := getDiskFootprint(localDir)
 		procAfterRename := readProcSelfWriteBytes()
 

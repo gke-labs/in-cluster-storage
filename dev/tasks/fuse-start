@@ -80,9 +80,9 @@ goarch() {
 build_binaries() {
   local goos="$1" arch="$2" bin_dir="$3"
   mkdir -p "${bin_dir}"
-  echo "Building objectfs-controller and objectfsctl for ${goos}/${arch} into ${bin_dir}"
+  echo "Building objectfs-controller, objectfsctl, and wal-buffer for ${goos}/${arch} into ${bin_dir}"
   GOOS="${goos}" GOARCH="${arch}" CGO_ENABLED=0 \
-    go build -o "${bin_dir}/" ./cmd/objectfs-controller ./cmd/objectfsctl
+    go build -o "${bin_dir}/" ./cmd/objectfs-controller ./cmd/objectfsctl ./cmd/wal-buffer
 }
 
 # ---------------------------------------------------------------------------
@@ -152,10 +152,15 @@ STORE_DIR="${DEV_DIR}/objectstore"
 MOUNT_DIR="${DEV_DIR}/mnt"
 CONTROLLER_LOG="${DEV_DIR}/controller.log"
 MOUNT_LOG="${DEV_DIR}/mount.log"
-mkdir -p "${STORE_DIR}" "${MOUNT_DIR}"
+BUFFER_PORT="${OBJECTFS_BUFFER_PORT:-50052}"
+BUFFER_DIR="${DEV_DIR}/walbuffer"
+BUFFER_LOG="${DEV_DIR}/walbuffer.log"
+WAL_CLIENT_DIR="${DEV_DIR}/walclient"
+mkdir -p "${STORE_DIR}" "${MOUNT_DIR}" "${BUFFER_DIR}" "${WAL_CLIENT_DIR}"
 
 SERVER_ADDR="127.0.0.1:${OBJECTFS_PORT}"
 CONTROLLER_PID=""
+BUFFER_PID=""
 MOUNT_PID=""
 TAIL_PID=""
 
@@ -198,18 +203,44 @@ cleanup() {
     wait "${CONTROLLER_PID}" 2>/dev/null
   fi
 
+  if [[ -n "${BUFFER_PID}" ]] && kill -0 "${BUFFER_PID}" 2>/dev/null; then
+    kill -TERM "${BUFFER_PID}" 2>/dev/null
+    wait "${BUFFER_PID}" 2>/dev/null
+  fi
+
   echo "Data and logs kept in ${DEV_DIR} (delete it when you are done)."
   exit "${exit_code}"
 }
 trap cleanup EXIT INT TERM
 
-# Children are started with SIGINT ignored so that Ctrl-C reaches only this
-# script, which then shuts everything down in order via cleanup().
-# Note: the controller is started without --wal-dir. With a WAL but no
-# --wal-target, WRITE_THROUGH_FSYNC writes (the FUSE default) wait forever for
-# a "permanent" durability ack that nothing can provide, and the whole volume
-# stalls. Metadata therefore lives in memory and is persisted to the object
-# store by the periodic flush and by the snapshot taken on shutdown.
+# Start wal-buffer
+echo "Starting wal-buffer on 127.0.0.1:${BUFFER_PORT} (backend file://${STORE_DIR}, log ${BUFFER_LOG})"
+(
+  trap '' INT
+  exec "${BIN_DIR}/wal-buffer" \
+    --port "${BUFFER_PORT}" \
+    --backend "file://${STORE_DIR}" \
+    --data-dir "${BUFFER_DIR}"
+) >"${BUFFER_LOG}" 2>&1 &
+BUFFER_PID=$!
+
+for i in $(seq 1 100); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/${BUFFER_PORT}") 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "${BUFFER_PID}" 2>/dev/null; then
+    echo "wal-buffer exited; log follows:" >&2
+    cat "${BUFFER_LOG}" >&2
+    exit 1
+  fi
+  if [[ "${i}" == 100 ]]; then
+    echo "timed out waiting for wal-buffer on 127.0.0.1:${BUFFER_PORT}" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+# Start objectfs-controller connected to the local wal-buffer
 echo "Starting objectfs-controller on ${SERVER_ADDR} (backend file://${STORE_DIR}, log ${CONTROLLER_LOG})"
 (
   trap '' INT
@@ -218,6 +249,9 @@ echo "Starting objectfs-controller on ${SERVER_ADDR} (backend file://${STORE_DIR
     --backend "file://${STORE_DIR}" \
     --metadata-index "${OBJECTFS_METADATA_INDEX:-sqlite}" \
     --flush-interval 1m \
+    --wal-dir "${WAL_CLIENT_DIR}" \
+    --wal-target "127.0.0.1:${BUFFER_PORT}" \
+    --wal-durability witness \
     --insecure \
     ${OBJECTFS_CONTROLLER_ARGS:-}
 ) >"${CONTROLLER_LOG}" 2>&1 &

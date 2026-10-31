@@ -33,6 +33,8 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
+	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -71,6 +73,20 @@ func (f *faultyRootApplyFactory) OpenLocal(ctx context.Context, streamID string,
 	return f.idx, true, nil
 }
 
+func openTestStream(t testing.TB, volID string) walclient.Stream {
+	t.Helper()
+	bt, _ := buffertest.Start(t.Context(), t)
+	s, err := walclient.Open(t.Context(), t.TempDir(), StreamIDForVolume(volID), bt.Target,
+		walclient.WithGRPCClient(bt.Client),
+		walclient.WithDialOptions(bt.DialOpts...),
+		walclient.WithoutFsync(),
+	)
+	if err != nil {
+		t.Fatalf("failed to open test stream: %v", err)
+	}
+	return s
+}
+
 func TestRegression_RootInodeInitFailure(t *testing.T) {
 	baseFactory, err := sds.GetIndexFactory("memory")
 	if err != nil {
@@ -83,6 +99,7 @@ func TestRegression_RootInodeInitFailure(t *testing.T) {
 
 	// 1. NewVolume should fail when root inode initialization fails.
 	vol, err := NewVolume("test-vol-root-fail", nil, NewEventBroadcaster(),
+		WithStream(openTestStream(t, "test-vol-root-fail")),
 		WithIndexFactory(factory),
 	)
 	if err == nil {
@@ -95,6 +112,7 @@ func TestRegression_RootInodeInitFailure(t *testing.T) {
 	// 2. loadFromBackendMetadataLocked should also fail when root inode initialization fails.
 	faultyIdx.failApply.Store(false)
 	volSuccess, err := NewVolume("test-vol-root-reload", nil, NewEventBroadcaster(),
+		WithStream(openTestStream(t, "test-vol-root-reload")),
 		WithIndexFactory(factory),
 	)
 	if err != nil {
@@ -210,7 +228,7 @@ func (b *faultyListBackend) ListObjects(ctx context.Context, bucket, prefix stri
 func TestRegression_ListVolumesBackendFailure(t *testing.T) {
 	ctx := t.Context()
 	backend := &faultyListBackend{Backend: inmemorystorage.New()}
-	server := NewServer(backend)
+	server := NewTestServer(backend)
 
 	// ListVolumes succeeds when backend does not fail
 	resp, err := server.ListVolumes(ctx, &pb.ListVolumesRequest{})
@@ -385,6 +403,7 @@ func TestRegression_CorruptLocalIndexRecovery(t *testing.T) {
 
 	vol, err := NewVolume("test-vol-corrupt-idx", backend, NewEventBroadcaster(),
 		WithLocalStorageDir(localDir),
+		WithStream(openTestStream(t, "test-vol-corrupt-idx")),
 	)
 	if err != nil {
 		t.Fatalf("expected volume to start successfully despite corrupt local index, got: %v", err)
@@ -410,7 +429,7 @@ func TestRegression_CorruptLocalIndexRecovery(t *testing.T) {
 func TestRegression_ShutdownFlushFailureSurfacedInClose(t *testing.T) {
 	ctx := t.Context()
 	backend := &faultyPutBackend{Backend: inmemorystorage.New()}
-	server := NewServer(backend)
+	server := NewTestServer(backend, WithServerSyncTimeout(1*time.Second))
 
 	volumeID := "test-vol-shutdown-flush"
 	vol, err := server.GetVolume(volumeID)

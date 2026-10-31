@@ -128,6 +128,7 @@ type options struct {
 	dialOpts                    []grpc.DialOption
 	grpcClient                  pb.WalBufferClient
 	acceptUnversioned           bool
+	noFsync                     bool
 	store                       SegmentStore
 	recoveredRecords            []*wal.ClientRecord
 	degradedRetryInitialBackoff time.Duration
@@ -136,6 +137,14 @@ type options struct {
 
 // Option configures Stream options.
 type Option func(*options)
+
+// WithoutFsync configures the local segment store to skip per-record fsync.
+// This is intended only for tests and benchmarks where fsync latency is not desired.
+func WithoutFsync() Option {
+	return func(o *options) {
+		o.noFsync = true
+	}
+}
 
 // WithStore injects a custom SegmentStore and recovered records (useful for testing and fault injection).
 func WithStore(store SegmentStore, recovered []*wal.ClientRecord) Option {
@@ -246,9 +255,16 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		o(&opt)
 	}
 
+	if opt.grpcClient == nil && target == "" {
+		return nil, errors.New("walclient: target or WithGRPCClient required")
+	}
+
 	var scanOpts []wal.ScanOption
 	if opt.acceptUnversioned {
 		scanOpts = append(scanOpts, wal.WithAcceptUnversioned(true))
+	}
+	if opt.noFsync {
+		scanOpts = append(scanOpts, wal.WithNoFsync(true))
 	}
 
 	var store SegmentStore
@@ -276,11 +292,6 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
-	replicationLevel := Local
-	if opt.grpcClient != nil || target != "" {
-		replicationLevel = Permanent
-	}
-
 	s := &streamImpl{
 		dir:                 dir,
 		streamID:            streamID,
@@ -295,14 +306,14 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		newRecordSignal:     make(chan struct{}, 1),
 		cancelCtx:           cancelCtx,
 		cancelFunc:          cancelFunc,
-		replicationLevel:    replicationLevel,
+		replicationLevel:    Permanent,
 		initialHelloAckDone: make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 
 	if opt.grpcClient != nil {
 		s.grpcClient = opt.grpcClient
-	} else if target != "" {
+	} else {
 		dialOpts := append(grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())), opt.dialOpts...)
 		conn, err := grpc.NewClient(target, dialOpts...)
 		if err != nil {
@@ -312,41 +323,35 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		}
 		s.grpcConn = conn
 		s.grpcClient = pb.NewWalBufferClient(conn)
-	} else {
-		s.initialHelloAckOnce.Do(func() {
-			close(s.initialHelloAckDone)
-		})
 	}
 
 	// Start background replication loop
-	if s.grpcClient != nil {
-		s.wg.Add(1)
-		go s.backgroundReplicationLoop()
+	s.wg.Add(1)
+	go s.backgroundReplicationLoop()
 
-		helloTimeout := 5 * time.Second
-		if deadline, ok := ctx.Deadline(); ok {
-			if d := time.Until(deadline); d < helloTimeout {
-				helloTimeout = d
-			}
+	helloTimeout := 5 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		if d := time.Until(deadline); d < helloTimeout {
+			helloTimeout = d
 		}
+	}
 
-		select {
-		case <-s.initialHelloAckDone:
-			s.mu.RLock()
-			initErr := s.initialHelloAckErr
-			isDegraded := s.degradedErr != nil
-			s.mu.RUnlock()
-			if initErr != nil && !isDegraded {
-				errutil.CloseAndLog(s, "wal stream")
-				return nil, initErr
-			}
-		case <-time.After(helloTimeout):
+	select {
+	case <-s.initialHelloAckDone:
+		s.mu.RLock()
+		initErr := s.initialHelloAckErr
+		isDegraded := s.degradedErr != nil
+		s.mu.RUnlock()
+		if initErr != nil && !isDegraded {
 			errutil.CloseAndLog(s, "wal stream")
-			return nil, fmt.Errorf("timeout waiting for initial HelloAck from WAL buffer target %s", target)
-		case <-ctx.Done():
-			errutil.CloseAndLog(s, "wal stream")
-			return nil, fmt.Errorf("failed to receive initial HelloAck from WAL buffer: %w", ctx.Err())
+			return nil, initErr
 		}
+	case <-time.After(helloTimeout):
+		errutil.CloseAndLog(s, "wal stream")
+		return nil, fmt.Errorf("timeout waiting for initial HelloAck from WAL buffer target %s", target)
+	case <-ctx.Done():
+		errutil.CloseAndLog(s, "wal stream")
+		return nil, fmt.Errorf("failed to receive initial HelloAck from WAL buffer: %w", ctx.Err())
 	}
 
 	return s, nil
@@ -559,7 +564,7 @@ func (s *streamImpl) Wait(ctx context.Context, seq uint64, level Level, requestF
 
 	// 2. Only now is the record guaranteed to be in the server's unflushed set
 	//    (commitItems appends to unflushedRecords before sending the ack).
-	if requestFlush && s.grpcClient != nil {
+	if requestFlush {
 		if _, err := s.grpcClient.Flush(ctx, &pb.FlushRequest{}); err != nil {
 			klog.Warningf("WalBuffer.Flush RPC error (will still wait for permanent ack): %v", err)
 		}
@@ -599,10 +604,8 @@ func (s *streamImpl) Flush(ctx context.Context) error {
 	}
 
 	// 2. Issue Flush RPC
-	if s.grpcClient != nil {
-		if _, err := s.grpcClient.Flush(ctx, &pb.FlushRequest{}); err != nil {
-			klog.Warningf("WalBuffer.Flush RPC error (will still wait for permanent ack): %v", err)
-		}
+	if _, err := s.grpcClient.Flush(ctx, &pb.FlushRequest{}); err != nil {
+		klog.Warningf("WalBuffer.Flush RPC error (will still wait for permanent ack): %v", err)
 	}
 
 	// 3. Wait for permanent watermark
@@ -1113,11 +1116,7 @@ func (s *streamImpl) cleanupS3AckedLocked(s3AckedSeq uint64) {
 
 // Tail returns an iterator yielding (stream_seq, payload) pairs from the remote buffer service starting after fromSeq.
 func (s *streamImpl) Tail(ctx context.Context, fromSeq uint64) (iter.Seq2[uint64, []byte], error) {
-	client := s.grpcClient
-	if client == nil && s.target == "" {
-		return func(yield func(uint64, []byte) bool) {}, nil
-	}
-	return TailStream(ctx, s.target, s.streamID, fromSeq, WithGRPCClient(client), WithDialOptions(s.opts.dialOpts...))
+	return TailStream(ctx, s.target, s.streamID, fromSeq, WithGRPCClient(s.grpcClient), WithDialOptions(s.opts.dialOpts...))
 }
 
 // TailStream tails records belonging to a specific stream starting after fromSeq (stream_seq > fromSeq).

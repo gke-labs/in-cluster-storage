@@ -133,7 +133,11 @@ type Server struct {
 	broadcaster *EventBroadcaster
 
 	walDir                   string
+	walDirErr                error
 	walTarget                string
+	walNoFsync               bool
+	tempWalDir               string
+	testBufferCleanup        func()
 	walDialOpts              []grpc.DialOption
 	walConn                  *grpc.ClientConn
 	walClient                walpb.WalBufferClient
@@ -249,10 +253,23 @@ func WithServerMetadataDir(dir string) ServerOption {
 // WithServerWAL configures the WAL directory, buffer target, and default durability level.
 func WithServerWAL(walDir, walTarget string, durability walclient.Level) ServerOption {
 	return func(s *Server) {
-		s.walDir = walDir
-		s.walTarget = walTarget
+		if walDir != "" {
+			s.walDir = walDir
+		}
+		if walTarget != "" {
+			s.walTarget = walTarget
+		}
 		s.defaultDurability = durability
 	}
+}
+
+// InspectServerTarget applies opts to a zero Server to read the configured WAL target, if any.
+func InspectServerTarget(opts ...ServerOption) string {
+	s := &Server{}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s.walTarget
 }
 
 // WithServerWALDialOptions configures additional gRPC dial options when dialing the WAL buffer.
@@ -345,6 +362,36 @@ func WithServerAcceptUnversioned(accept bool) ServerOption {
 	}
 }
 
+// WithServerWithoutFsync configures the server's WAL client streams to skip per-record fsync.
+// This is intended only for tests and benchmarks.
+func WithServerWithoutFsync() ServerOption {
+	return func(s *Server) {
+		s.walNoFsync = true
+	}
+}
+
+// WithServerWALClient sets an existing gRPC client for the WAL buffer service (for testing).
+func WithServerWALClient(client walpb.WalBufferClient) ServerOption {
+	return func(s *Server) {
+		s.walClient = client
+	}
+}
+
+// WithServerTestCleanup sets a cleanup callback executed when the server is closed (for testing).
+func WithServerTestCleanup(cleanup func()) ServerOption {
+	return func(s *Server) {
+		s.testBufferCleanup = cleanup
+	}
+}
+
+// WithServerTempWALDir sets a temporary directory to be removed on server close (for testing).
+func WithServerTempWALDir(dir string) ServerOption {
+	return func(s *Server) {
+		s.walDir = dir
+		s.tempWalDir = dir
+	}
+}
+
 func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	if backend == nil {
 		backend = NewMemoryBackend()
@@ -363,7 +410,9 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 	for _, opt := range opts {
 		opt(s)
 	}
-	if s.walTarget != "" {
+	if s.walClient != nil {
+		// Existing WAL client provided by test constructor
+	} else if s.walTarget != "" {
 		dialOpts := append(grpcutil.DialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())), s.walDialOpts...)
 		conn, err := grpc.NewClient(s.walTarget, dialOpts...)
 		if err != nil {
@@ -373,6 +422,11 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 			s.walConn = conn
 			s.walClient = walpb.NewWalBufferClient(conn)
 		}
+	} else if s.streamFactory == nil {
+		s.walErr = errors.New("wal target is required: no --wal-target configured")
+	}
+	if s.walDir == "" && s.streamFactory == nil && s.testBufferCleanup == nil {
+		s.walDirErr = errors.New("wal directory is required: no --wal-dir configured")
 	}
 	return s
 }
@@ -381,22 +435,28 @@ func (s *Server) openStreamForVolume(volumeID string, dir string) (walclient.Str
 	if s.streamFactory != nil {
 		return s.streamFactory(volumeID)
 	}
+	if s.walDirErr != nil {
+		return nil, fmt.Errorf("failed to initialize WAL directory: %w", s.walDirErr)
+	}
 	if dir == "" {
 		dir = s.walDir
 	}
-	if dir == "" {
-		return nil, nil
-	}
 	if s.walErr != nil {
-		return nil, fmt.Errorf("failed to dial WAL buffer target %s: %w", s.walTarget, s.walErr)
+		return nil, fmt.Errorf("failed to connect to WAL buffer: %w", s.walErr)
 	}
 	streamID := StreamIDForVolume(volumeID)
 	var walOpts []walclient.Option
 	if s.acceptUnversioned {
 		walOpts = append(walOpts, walclient.WithAcceptUnversioned(true))
 	}
+	if s.walNoFsync {
+		walOpts = append(walOpts, walclient.WithoutFsync())
+	}
 	if s.walClient != nil {
 		walOpts = append(walOpts, walclient.WithGRPCClient(s.walClient))
+	}
+	if len(s.walDialOpts) > 0 {
+		walOpts = append(walOpts, walclient.WithDialOptions(s.walDialOpts...))
 	}
 	return walclient.Open(context.Background(), dir, streamID, s.walTarget, walOpts...)
 }
@@ -499,6 +559,16 @@ func (s *Server) Close() error {
 		s.walConn = nil
 		s.walClient = nil
 	}
+	if s.tempWalDir != "" {
+		if err := os.RemoveAll(s.tempWalDir); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.tempWalDir = ""
+	}
+	if s.testBufferCleanup != nil {
+		s.testBufferCleanup()
+		s.testBufferCleanup = nil
+	}
 	return firstErr
 }
 
@@ -568,6 +638,11 @@ func (s *Server) StopPeriodicFlush() error {
 		return s.FlushAll(context.Background())
 	}
 	return nil
+}
+
+// Target returns the configured WAL buffer target, if any.
+func (s *Server) Target() string {
+	return s.walTarget
 }
 
 // GetVolume returns the Volume instance for the given volumeID, or an error if creation fails.

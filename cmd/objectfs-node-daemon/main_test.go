@@ -25,7 +25,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
-	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -104,7 +104,7 @@ func TestPluginInfo(t *testing.T) {
 
 func TestNodeGetVolumeStats(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-csi-stats-vol"
 
 	lis := bufconn.Listen(1024 * 1024)

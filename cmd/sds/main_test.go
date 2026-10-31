@@ -28,6 +28,7 @@ import (
 	objectfspb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -330,7 +331,7 @@ func TestSdsCatObjectFSStream(t *testing.T) {
 	backend := controller.NewMemoryBackend()
 	volumeID := "cat-test-vol"
 
-	server := controller.NewServer(backend, controller.WithServerWAL(walDir, "", walclient.Local))
+	server := controllertest.NewTestServer(backend, controller.WithServerTempWALDir(walDir))
 	defer func() { _ = server.Close() }()
 
 	_, err := server.Mkdir(ctx, &objectfspb.MkdirRequest{VolumeId: volumeID, ParentInode: 1, Name: "cats", Mode: 0755})

@@ -32,6 +32,8 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/sqlite"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
+	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -67,6 +69,20 @@ func getObjectSize(ctx context.Context, backend *inmemorystorage.Backend, key st
 	var cw countWriter
 	_ = backend.GetObject(ctx, "", key, 0, 0, &cw)
 	return cw.n
+}
+
+func testStream(t testing.TB, volID string) walclient.Stream {
+	t.Helper()
+	bt, _ := buffertest.Start(t.Context(), t)
+	s, err := walclient.Open(t.Context(), t.TempDir(), controller.StreamIDForVolume(volID), bt.Target,
+		walclient.WithGRPCClient(bt.Client),
+		walclient.WithDialOptions(bt.DialOpts...),
+		walclient.WithoutFsync(),
+	)
+	if err != nil {
+		t.Fatalf("failed to open test stream: %v", err)
+	}
+	return s
 }
 
 // TestBenchmarkMeasurements runs the comparison benchmark measurements between SQLite and Table
@@ -244,10 +260,12 @@ func TestBenchmarkMeasurements(t *testing.T) {
 	}
 	t.Logf("\n>>> Scale: %d Entries (Volume Layer) <<<", numVolEntries)
 	for _, mode := range []string{"sqlite", "table"} {
-		vol, err := controller.NewVolume(fmt.Sprintf("bench-read-%s-%d", mode, numVolEntries), inmemorystorage.New(), controller.NewEventBroadcaster(),
+		volID := fmt.Sprintf("bench-read-%s-%d", mode, numVolEntries)
+		vol, err := controller.NewVolume(volID, inmemorystorage.New(), controller.NewEventBroadcaster(),
 			controller.WithMetadataIndex(mode),
 			controller.WithMetadataCacheDisabled(true), // Cache miss
 			controller.WithLocalStorageDir(t.TempDir()),
+			controller.WithStream(testStream(t, volID)),
 		)
 		if err != nil {
 			t.Fatalf("failed to create volume (%s): %v", mode, err)
@@ -573,10 +591,12 @@ func TestBenchmarkMeasurements(t *testing.T) {
 		opCount = 500
 	}
 	for _, mode := range []string{"sqlite", "table"} {
-		vol, err := controller.NewVolume("bench-wa-"+mode, inmemorystorage.New(), controller.NewEventBroadcaster(),
+		volID := "bench-wa-" + mode
+		vol, err := controller.NewVolume(volID, inmemorystorage.New(), controller.NewEventBroadcaster(),
 			controller.WithMetadataIndex(mode),
 			controller.WithLocalStorageDir(t.TempDir()),
 			controller.WithApplierBatchSize(10),
+			controller.WithStream(testStream(t, volID)),
 		)
 		if err != nil {
 			t.Fatalf("failed to create volume (%s): %v", mode, err)
@@ -717,9 +737,11 @@ func TestBenchmarkMeasurements(t *testing.T) {
 
 		var vols []*controller.Volume
 		for i := 0; i < numVols; i++ {
-			v, err := controller.NewVolume(fmt.Sprintf("vol-%s-%d", mode, i), inmemorystorage.New(), controller.NewEventBroadcaster(),
+			volID := fmt.Sprintf("vol-%s-%d", mode, i)
+			v, err := controller.NewVolume(volID, inmemorystorage.New(), controller.NewEventBroadcaster(),
 				controller.WithMetadataIndex(mode),
 				controller.WithLocalStorageDir(t.TempDir()),
+				controller.WithStream(testStream(t, volID)),
 			)
 			if err != nil {
 				t.Fatalf("failed to create volume (%s-%d): %v", mode, i, err)

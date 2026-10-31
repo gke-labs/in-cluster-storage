@@ -197,6 +197,7 @@ type ClientSegmentStore struct {
 	maxSegmentSize    int64
 	filePrefix        string
 	acceptUnversioned bool
+	noFsync           bool
 
 	activeFile *os.File
 	activeMeta *SegmentMeta
@@ -238,6 +239,7 @@ func NewClientSegmentStore(dir string, filePrefix string, maxSegmentSize int64, 
 		maxSegmentSize:    maxSegmentSize,
 		filePrefix:        filePrefix,
 		acceptUnversioned: opt.AcceptUnversioned,
+		noFsync:           opt.NoFsync,
 	}
 
 	var allRecords []*ClientRecord
@@ -285,8 +287,10 @@ func (s *ClientSegmentStore) Append(rec *ClientRecord) error {
 		return fmt.Errorf("failed writing to segment file %s: %w", s.activeMeta.Path, err)
 	}
 
-	if err := s.activeFile.Sync(); err != nil {
-		return fmt.Errorf("failed syncing segment file %s: %w", s.activeMeta.Path, err)
+	if !s.noFsync {
+		if err := s.activeFile.Sync(); err != nil {
+			return fmt.Errorf("failed syncing segment file %s: %w", s.activeMeta.Path, err)
+		}
 	}
 
 	if s.activeMeta.RecordCount == 0 {
@@ -488,6 +492,7 @@ type LogSegmentStore struct {
 	maxSegmentSize    int64
 	filePrefix        string
 	acceptUnversioned bool
+	noFsync           bool
 
 	activeFile *os.File
 	activeMeta *SegmentMeta
@@ -529,6 +534,7 @@ func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64, opt
 		maxSegmentSize:    maxSegmentSize,
 		filePrefix:        filePrefix,
 		acceptUnversioned: opt.AcceptUnversioned,
+		noFsync:           opt.NoFsync,
 	}
 
 	var allRecords []*LogRecord
@@ -589,7 +595,7 @@ func (s *LogSegmentStore) AppendBatch(records []*LogRecord) error {
 		s.activeMeta.RecordCount++
 	}
 
-	if s.activeFile != nil {
+	if s.activeFile != nil && !s.noFsync {
 		if err := s.activeFile.Sync(); err != nil {
 			return fmt.Errorf("failed syncing segment file %s: %w", s.activeMeta.Path, err)
 		}

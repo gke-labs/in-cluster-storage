@@ -30,9 +30,42 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
 )
+
+var (
+	testStoreStreamsMu sync.Mutex
+	testStoreBuffers   = make(map[string]*buffertest.BufferTest)
+)
+
+func testOpenStream(t testing.TB, walDir string, streamID uuid.UUID, backend ObjectStorageBackend) walclient.Stream {
+	t.Helper()
+	sid := streamID.String()
+	testStoreStreamsMu.Lock()
+	bt, ok := testStoreBuffers[sid]
+	if !ok {
+		bt, _ = buffertest.Start(t.Context(), t, buffertest.WithBackend(backend))
+		testStoreBuffers[sid] = bt
+		t.Cleanup(func() {
+			testStoreStreamsMu.Lock()
+			delete(testStoreBuffers, sid)
+			testStoreStreamsMu.Unlock()
+		})
+	}
+	testStoreStreamsMu.Unlock()
+
+	s, err := walclient.Open(t.Context(), walDir, streamID, bt.Target,
+		walclient.WithGRPCClient(bt.Client),
+		walclient.WithDialOptions(bt.DialOpts...),
+		walclient.WithoutFsync(),
+	)
+	if err != nil {
+		t.Fatalf("testOpenStream failed: %v", err)
+	}
+	return s
+}
 
 func TestSQLiteMetadataStoreOperations(t *testing.T) {
 	ctx := t.Context()
@@ -303,10 +336,7 @@ func TestSQLiteMetadataStoreCrashRecoveryWithStream(t *testing.T) {
 	volID := "vol-crash-rec"
 	streamID := StreamIDForVolume(volID)
 
-	stream1, err := walclient.Open(ctx, walDir, streamID, "")
-	if err != nil {
-		t.Fatalf("walclient.Open failed: %v", err)
-	}
+	stream1 := testOpenStream(t, walDir, streamID, backend)
 
 	vol1 := MustNewVolume(t, volID, backend, broadcaster,
 		WithMetadataIndex("sqlite"),
@@ -332,10 +362,7 @@ func TestSQLiteMetadataStoreCrashRecoveryWithStream(t *testing.T) {
 	_ = os.Remove(filepath.Join(localDir, "metadata.sqlite"))
 
 	// Reopen with new stream instance
-	stream2, err := walclient.Open(ctx, walDir, streamID, "")
-	if err != nil {
-		t.Fatalf("walclient.Open run 2 failed: %v", err)
-	}
+	stream2 := testOpenStream(t, walDir, streamID, backend)
 
 	vol2 := MustNewVolume(t, volID, backend, broadcaster,
 		WithMetadataIndex("sqlite"),
@@ -1000,10 +1027,7 @@ func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
 	volID := "vol-sqlite-crash-burst"
 
 	streamID := StreamIDForVolume(volID)
-	stream, err := walclient.Open(ctx, walDir, streamID, "")
-	if err != nil {
-		t.Fatalf("Open WAL stream failed: %v", err)
-	}
+	stream := testOpenStream(t, walDir, streamID, backend)
 
 	var stallApplier atomic.Bool
 	stallApplier.Store(true)
@@ -1045,10 +1069,7 @@ func TestSQLiteCrashRecoveryDuringWriteBurst(t *testing.T) {
 	_ = vol.Close()
 
 	// 2. Restart from backend: open new stream and volume with the same storage dirs
-	newStream, err := walclient.Open(ctx, walDir, streamID, "")
-	if err != nil {
-		t.Fatalf("Reopen WAL stream failed: %v", err)
-	}
+	newStream := testOpenStream(t, walDir, streamID, backend)
 
 	vol2 := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
@@ -1147,10 +1168,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 	volID := "vol-sqlite-tx-boundary"
 
 	streamID := StreamIDForVolume(volID)
-	stream, err := walclient.Open(ctx, walDir, streamID, "")
-	if err != nil {
-		t.Fatalf("Open WAL stream failed: %v", err)
-	}
+	stream := testOpenStream(t, walDir, streamID, backend)
 
 	// 1. Start volume with batchSize = 1 (smaller than a rename's change count)
 	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
@@ -1199,10 +1217,7 @@ func TestSQLiteTransactionBoundaryBatchingAndMidLogRecovery(t *testing.T) {
 	_ = vol.Close()
 
 	// 3. Restart from the EXISTING SQLite database file (without deleting it) + WAL stream replay
-	newStream, err := walclient.Open(ctx, walDir, streamID, "")
-	if err != nil {
-		t.Fatalf("Reopen WAL stream failed: %v", err)
-	}
+	newStream := testOpenStream(t, walDir, streamID, backend)
 
 	vol2 := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("sqlite"),
@@ -1280,6 +1295,9 @@ func TestSQLiteSnapshotFlushNoStarvationUnderContinuousWrites(t *testing.T) {
 
 	// Wait until several writes have completed
 	for writeCount.Load() < 10 {
+		if errVal := writeErr.Load(); errVal != nil {
+			t.Fatalf("Writer goroutine failed early: %v", errVal)
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
@@ -1314,10 +1332,7 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 	streamID := uuid.New()
 	volID := "vol-memory-index-test"
 
-	stream, err := walclient.Open(ctx, walDir, streamID, "")
-	if err != nil {
-		t.Fatalf("OpenStream failed: %v", err)
-	}
+	stream := testOpenStream(t, walDir, streamID, backend)
 
 	vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("memory"),
@@ -1363,10 +1378,7 @@ func TestMemoryMetadataIndexOperationsAndSnapshots(t *testing.T) {
 	}
 
 	// 5. Simulate restart with memory index and stream replay
-	stream2, err := walclient.Open(ctx, walDir, streamID, "")
-	if err != nil {
-		t.Fatalf("OpenStream 2 failed: %v", err)
-	}
+	stream2 := testOpenStream(t, walDir, streamID, backend)
 
 	vol2 := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 		WithMetadataIndex("memory"),
@@ -1399,10 +1411,7 @@ func TestTruncateDownAndReadUntouchedChunks(t *testing.T) {
 			streamID := uuid.New()
 			volID := fmt.Sprintf("vol-trunc-down-%s", indexMode)
 
-			stream, err := walclient.Open(ctx, walDir, streamID, "")
-			if err != nil {
-				t.Fatalf("OpenStream failed: %v", err)
-			}
+			stream := testOpenStream(t, walDir, streamID, backend)
 
 			vol := MustNewVolume(t, volID, backend, NewEventBroadcaster(),
 				WithMetadataIndex(indexMode),

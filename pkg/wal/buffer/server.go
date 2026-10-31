@@ -57,6 +57,7 @@ type ServerConfig struct {
 	StreamSealInterval time.Duration
 	StreamSealBytes    int64
 	AcceptUnversioned  bool
+	NoFsync            bool
 }
 
 type incomingItem struct {
@@ -122,6 +123,7 @@ type Server struct {
 	flushSeq   uint64 // incremented on each successful flush
 
 	stopChan chan struct{}
+	stopOnce sync.Once
 	wg       sync.WaitGroup
 }
 
@@ -196,7 +198,14 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	}
 
 	// 2. Setup local segment store and recover local segments
-	localStore, localRecords, err := wal.NewLogSegmentStore(dataDir, "log", cfg.FlushBytes, wal.WithAcceptUnversioned(cfg.AcceptUnversioned))
+	var scanOpts []wal.ScanOption
+	if cfg.AcceptUnversioned {
+		scanOpts = append(scanOpts, wal.WithAcceptUnversioned(true))
+	}
+	if cfg.NoFsync {
+		scanOpts = append(scanOpts, wal.WithNoFsync(true))
+	}
+	localStore, localRecords, err := wal.NewLogSegmentStore(dataDir, "log", cfg.FlushBytes, scanOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize local segment store: %w", err)
 	}
@@ -306,7 +315,14 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 // Close gracefully stops workers, flushes to permanent storage, and closes local stores.
 func (s *Server) Close() error {
-	close(s.stopChan)
+	var closed bool
+	s.stopOnce.Do(func() {
+		close(s.stopChan)
+		closed = true
+	})
+	if !closed {
+		return nil
+	}
 	// Wake any stream Append notification forwarders waiting on st.cond so they
 	// observe s.stopChan closure and exit their goroutine.
 	s.mu.RLock()

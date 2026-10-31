@@ -591,11 +591,15 @@ func TestServiceUnreachableBackpressure(t *testing.T) {
 
 // 6. Invalid level in Wait returns error.
 func TestInvalidWaitLevel(t *testing.T) {
+	backend := inmemorystorage.New()
+	handle := startBufferServer(t, backend, t.TempDir())
+	defer handle.StopGraceful()
+
 	clientDir := t.TempDir()
 	streamID := uuid.New()
 	ctx := t.Context()
 
-	stream, err := Open(ctx, clientDir, streamID, "")
+	stream, err := Open(ctx, clientDir, streamID, handle.addr)
 	if err != nil {
 		t.Fatalf("open failed: %v", err)
 	}
@@ -806,57 +810,6 @@ func TestTwoStreamsOneServerFlushIsolation(t *testing.T) {
 	_, _, perm2After := stream2.Watermarks()
 	if perm2After != 1 {
 		t.Fatalf("expected perm2=1 to remain unchanged, got %d", perm2After)
-	}
-}
-
-// 12. Target-less stream fast failure on Witness or Permanent durability.
-func TestTargetlessStreamDurabilityFastFail(t *testing.T) {
-	clientDir := t.TempDir()
-	streamID := uuid.New()
-	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
-	defer cancel()
-
-	stream, err := Open(ctx, clientDir, streamID, "")
-	if err != nil {
-		t.Fatalf("open failed: %v", err)
-	}
-	defer stream.Close()
-
-	if stream.ReplicationLevel() != Local {
-		t.Fatalf("expected ReplicationLevel() to be Local for target-less stream, got %v", stream.ReplicationLevel())
-	}
-
-	seq, err := stream.Append(ctx, []byte("test-data"))
-	if err != nil {
-		t.Fatalf("append failed: %v", err)
-	}
-
-	// Local durability should succeed immediately
-	if err := stream.Wait(ctx, seq, Local, false); err != nil {
-		t.Fatalf("Wait(Local) failed: %v", err)
-	}
-
-	// Witness durability should fail fast with ErrDurabilityUnavailable
-	err = stream.Wait(ctx, seq, Witness, false)
-	if !errors.Is(err, ErrDurabilityUnavailable) {
-		t.Fatalf("expected ErrDurabilityUnavailable for Wait(Witness), got: %v", err)
-	}
-
-	// Permanent durability should fail fast with ErrDurabilityUnavailable
-	err = stream.Wait(ctx, seq, Permanent, false)
-	if !errors.Is(err, ErrDurabilityUnavailable) {
-		t.Fatalf("expected ErrDurabilityUnavailable for Wait(Permanent, false), got: %v", err)
-	}
-
-	err = stream.Wait(ctx, seq, Permanent, true)
-	if !errors.Is(err, ErrDurabilityUnavailable) {
-		t.Fatalf("expected ErrDurabilityUnavailable for Wait(Permanent, true), got: %v", err)
-	}
-
-	// Flush should fail fast with ErrDurabilityUnavailable
-	err = stream.Flush(ctx)
-	if !errors.Is(err, ErrDurabilityUnavailable) {
-		t.Fatalf("expected ErrDurabilityUnavailable for Flush(), got: %v", err)
 	}
 }
 
@@ -1124,6 +1077,27 @@ func TestNewNodeAppendsContinueFromWitnessWatermark(t *testing.T) {
 	}
 }
 
+func writeLocalSegmentRecords(t *testing.T, dir string, streamID uuid.UUID, count int, payloadPrefix string) {
+	t.Helper()
+	store, _, err := wal.NewClientSegmentStore(dir, fmt.Sprintf("stream-%s", streamID.String()), wal.DefaultMaxSegmentSize)
+	if err != nil {
+		t.Fatalf("failed to create client segment store: %v", err)
+	}
+	for i := 1; i <= count; i++ {
+		rec := &wal.ClientRecord{
+			StreamID:  streamID,
+			StreamSeq: uint64(i),
+			Payload:   []byte(fmt.Sprintf("%s-%d", payloadPrefix, i)),
+		}
+		if err := store.Append(rec); err != nil {
+			t.Fatalf("store append %d failed: %v", i, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("store close failed: %v", err)
+	}
+}
+
 // 16. Stale local segments (local records at seqs the buffer holds with different content)
 // are discarded rather than resent.
 func TestStaleLocalSegmentsDiscardedRatherThanResent(t *testing.T) {
@@ -1137,18 +1111,8 @@ func TestStaleLocalSegmentsDiscardedRatherThanResent(t *testing.T) {
 	streamID := uuid.New()
 	node1Dir := t.TempDir()
 
-	// Node 1 writes records 1..3 locally without remote target
-	localStream1, err := Open(ctx, node1Dir, streamID, "")
-	if err != nil {
-		t.Fatalf("open localStream1 failed: %v", err)
-	}
-	for i := 1; i <= 3; i++ {
-		_, err := localStream1.Append(ctx, []byte(fmt.Sprintf("stale-node1-rec-%d", i)))
-		if err != nil {
-			t.Fatalf("localStream1 append %d failed: %v", i, err)
-		}
-	}
-	_ = localStream1.Close()
+	// Node 1 writes records 1..3 locally to segment store
+	writeLocalSegmentRecords(t, node1Dir, streamID, 3, "stale-node1-rec")
 
 	// Node 2 writes authoritative records 1..5 to wal-buffer
 	node2Dir := t.TempDir()
@@ -1228,17 +1192,7 @@ func TestDivergentLocalTailAboveWitnessWatermarkDiscarded(t *testing.T) {
 	node1Dir := t.TempDir()
 
 	// 1. Node A writes records 1..5 locally (no remote target)
-	localStream1, err := Open(ctx, node1Dir, streamID, "")
-	if err != nil {
-		t.Fatalf("open localStream1 failed: %v", err)
-	}
-	for i := 1; i <= 5; i++ {
-		_, err := localStream1.Append(ctx, []byte(fmt.Sprintf("nodeA-rec-%d", i)))
-		if err != nil {
-			t.Fatalf("localStream1 append %d failed: %v", i, err)
-		}
-	}
-	_ = localStream1.Close()
+	writeLocalSegmentRecords(t, node1Dir, streamID, 5, "nodeA-rec")
 
 	// 2. Node B writes authoritative records 1..2 to wal-buffer (head = 2)
 	node2Dir := t.TempDir()
@@ -1611,19 +1565,7 @@ func TestDivergenceTruncateRetryRecovery(t *testing.T) {
 
 	// 2. Client writes records 1..5 locally (diverging from authoritative buffer history at seq 2)
 	clientDir := t.TempDir()
-	streamLocal, err := Open(ctx, clientDir, streamID, "")
-	if err != nil {
-		t.Fatalf("Open streamLocal failed: %v", err)
-	}
-	for i := 1; i <= 5; i++ {
-		_, err := streamLocal.Append(ctx, []byte(fmt.Sprintf("divergent-record-%d", i)))
-		if err != nil {
-			t.Fatalf("streamLocal append %d failed: %v", i, err)
-		}
-	}
-	if err := streamLocal.Close(); err != nil {
-		t.Fatalf("streamLocal close failed: %v", err)
-	}
+	writeLocalSegmentRecords(t, clientDir, streamID, 5, "divergent-record")
 
 	// 3. Re-open local store with fault injection wrapping TruncateAfter to fail twice then succeed
 	realStore, recovered, err := wal.NewClientSegmentStore(clientDir, fmt.Sprintf("stream-%s", streamID.String()), 100)
@@ -1768,5 +1710,16 @@ func TestMoveSegmentsAside(t *testing.T) {
 	p, err := MoveSegmentsAside("", streamID1)
 	if err != nil || p != "" {
 		t.Fatalf("expected ('', nil) for empty dir, got (%q, %v)", p, err)
+	}
+}
+
+func TestClientOpen_RequiresTargetOrGRPCClient(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	streamID := uuid.New()
+
+	_, err := Open(ctx, dir, streamID, "")
+	if err == nil {
+		t.Fatal("expected Open without target or gRPC client to fail, got nil")
 	}
 }

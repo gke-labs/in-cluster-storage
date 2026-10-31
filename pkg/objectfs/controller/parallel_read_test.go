@@ -50,7 +50,7 @@ func TestParallelReadFile_SleepingBackend(t *testing.T) {
 	ctx := t.Context()
 	sleepDur := 60 * time.Millisecond
 	rawBackend := newSleepingBackend(NewMemoryBackend(), sleepDur)
-	server := NewServer(rawBackend)
+	server := NewTestServer(rawBackend)
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-parallel-read-vol"
@@ -129,7 +129,7 @@ func TestParallelReadFile_DropVolumeLockDuringBlobIO(t *testing.T) {
 	ctx := t.Context()
 	sleepDur := 250 * time.Millisecond
 	rawBackend := newSleepingBackend(NewMemoryBackend(), sleepDur)
-	server := NewServer(rawBackend)
+	server := NewTestServer(rawBackend)
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-lock-drop-vol"
@@ -207,7 +207,7 @@ func TestWriteFileWithEpoch_DoesNotHoldStagingMuDuringBaseChunkGet(t *testing.T)
 	ctx := t.Context()
 	sleepDur := 250 * time.Millisecond
 	rawBackend := newSleepingBackend(NewMemoryBackend(), sleepDur)
-	server := NewServer(rawBackend)
+	server := NewTestServer(rawBackend)
 	defer func() { _ = server.Close() }()
 
 	volumeID := "test-staging-lock-drop-vol"

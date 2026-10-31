@@ -16,67 +16,43 @@ package sds
 
 import (
 	"context"
-	"net"
 	"testing"
 	"time"
 
-	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
-	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
 	"github.com/google/uuid"
-	"google.golang.org/grpc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 type testServerHandle struct {
-	srv        *buffer.Server
-	addr       string
-	grpcServer *grpc.Server
-	listener   net.Listener
+	bt   *buffertest.BufferTest
+	addr string
 }
 
 func (h *testServerHandle) StopGraceful() {
-	h.grpcServer.Stop()
-	_ = h.srv.Close()
-	_ = h.listener.Close()
+	h.bt.Close()
+}
+
+func (h *testServerHandle) StreamReader(streamID uuid.UUID, opts ...StreamReaderOption) *StreamReader {
+	opts = append([]StreamReaderOption{
+		WithTailOptions(
+			walclient.WithGRPCClient(h.bt.Client),
+			walclient.WithDialOptions(h.bt.DialOpts...),
+		),
+	}, opts...)
+	return NewStreamReader(h.addr, streamID, opts...)
 }
 
 func startBufferServer(t *testing.T, backend objectstore.Backend, dataDir string) *testServerHandle {
 	t.Helper()
-	ctx := t.Context()
-	srv, err := buffer.NewServer(ctx, buffer.ServerConfig{
-		Backend:       backend,
-		DataDir:       dataDir,
-		FlushInterval: 10 * time.Second,
-		BatchMaxDelay: 2 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("failed to start buffer server: %v", err)
-	}
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-
-	grpcServer := grpc.NewServer()
-	pb.RegisterWalBufferServer(grpcServer, srv)
-
-	go func() {
-		_ = grpcServer.Serve(listener)
-	}()
-
-	return &testServerHandle{
-		srv:        srv,
-		addr:       listener.Addr().String(),
-		grpcServer: grpcServer,
-		listener:   listener,
-	}
+	bt, _ := buffertest.Start(t.Context(), t, buffertest.WithBackend(backend), buffertest.WithDataDir(dataDir))
+	return &testServerHandle{bt: bt, addr: bt.Target}
 }
 
 func TestWALAppenderAndStreamReader(t *testing.T) {
@@ -90,7 +66,10 @@ func TestWALAppenderAndStreamReader(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	walStream, err := walclient.Open(ctx, clientDir, streamID, handle.addr)
+	walStream, err := walclient.Open(ctx, clientDir, streamID, handle.bt.Target,
+		walclient.WithGRPCClient(handle.bt.Client),
+		walclient.WithDialOptions(handle.bt.DialOpts...),
+	)
 	if err != nil {
 		t.Fatalf("failed to open WAL stream: %v", err)
 	}
@@ -156,7 +135,7 @@ func TestWALAppenderAndStreamReader(t *testing.T) {
 	}
 
 	// Read everything back using StreamReader
-	reader := NewStreamReader(handle.addr, streamID)
+	reader := handle.StreamReader(streamID)
 	readCtx, readCancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer readCancel()
 
@@ -200,7 +179,7 @@ func TestWALAppenderAndStreamReader(t *testing.T) {
 		t.Fatalf("Import failed: %v", err)
 	}
 
-	reader2 := NewStreamReader(handle.addr, streamID, WithChangeReader(NewChangeReader(record.WithDecoderRegistry(resumedReg))))
+	reader2 := handle.StreamReader(streamID, WithChangeReader(NewChangeReader(record.WithDecoderRegistry(resumedReg))))
 	iter2, err := reader2.Read(readCtx, seq1)
 	if err != nil {
 		t.Fatalf("reader2.Read failed: %v", err)
@@ -232,7 +211,10 @@ func TestStreamReaderWithRecoveredRecords(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	walStream, err := walclient.Open(ctx, clientDir, streamID, handle.addr)
+	walStream, err := walclient.Open(ctx, clientDir, streamID, handle.bt.Target,
+		walclient.WithGRPCClient(handle.bt.Client),
+		walclient.WithDialOptions(handle.bt.DialOpts...),
+	)
 	if err != nil {
 		t.Fatalf("failed to open WAL stream: %v", err)
 	}
@@ -261,7 +243,10 @@ func TestStreamReaderWithRecoveredRecords(t *testing.T) {
 	// Close writer stream and re-open to get RecoveredRecords
 	_ = walStream.Close()
 
-	walStreamRecovered, err := walclient.Open(ctx, clientDir, streamID, handle.addr)
+	walStreamRecovered, err := walclient.Open(ctx, clientDir, streamID, handle.bt.Target,
+		walclient.WithGRPCClient(handle.bt.Client),
+		walclient.WithDialOptions(handle.bt.DialOpts...),
+	)
 	if err != nil {
 		t.Fatalf("failed to re-open WAL stream: %v", err)
 	}
@@ -297,7 +282,10 @@ func TestWALAppenderPermanentDurability(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	walStream, err := walclient.Open(ctx, clientDir, streamID, handle.addr)
+	walStream, err := walclient.Open(ctx, clientDir, streamID, handle.bt.Target,
+		walclient.WithGRPCClient(handle.bt.Client),
+		walclient.WithDialOptions(handle.bt.DialOpts...),
+	)
 	if err != nil {
 		t.Fatalf("failed to open WAL stream: %v", err)
 	}

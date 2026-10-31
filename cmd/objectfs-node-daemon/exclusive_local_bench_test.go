@@ -27,7 +27,7 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
-	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
@@ -37,7 +37,7 @@ import (
 
 func setupTestControllerClient(t testing.TB) (pb.ObjectFSControllerClient, func()) {
 	t.Helper()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	lis := bufconn.Listen(4 * 1024 * 1024)
 	grpcServer := grpc.NewServer()
 	pb.RegisterObjectFSControllerServer(grpcServer, server)

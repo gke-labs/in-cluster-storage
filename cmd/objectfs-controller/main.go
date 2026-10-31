@@ -188,26 +188,24 @@ func main() {
 	if *acceptUnversionedSegments {
 		serverOpts = append(serverOpts, controller.WithServerAcceptUnversioned(true))
 	}
-	// TODO: We always want to assume a WAL, and maybe it would be nice to have a wal-client mode that was local-only e.g. for testing.
-	if *walDir != "" {
-		durability := walclient.Local
-		switch strings.ToLower(*walDurability) {
-		case "witness":
-			durability = walclient.Witness
-		case "permanent":
-			durability = walclient.Permanent
-		case "local":
-			durability = walclient.Local
-		default:
-			klog.Fatalf("invalid wal-durability: %s (must be local, witness, or permanent)", *walDurability)
-		}
-		if *walTarget == "" && durability > walclient.Local {
-			klog.Fatalf("invalid configuration: wal-durability %s requires --wal-target", *walDurability)
-		}
-		serverOpts = append(serverOpts, controller.WithServerWAL(*walDir, *walTarget, durability))
-	} else {
-		klog.Warningf("objectfs-controller: no WAL stream configured (--wal-dir unset): fsync is NOT durable across controller restarts; volumes behave as ephemeral shared disks and metadata is persisted only by the periodic flush (--flush-interval=%s) and on shutdown", *flushInterval)
+	if *walDir == "" {
+		klog.Fatalf("invalid configuration: --wal-dir is required")
 	}
+	if *walTarget == "" {
+		klog.Fatalf("invalid configuration: --wal-target is required")
+	}
+	durability := walclient.Permanent
+	switch strings.ToLower(*walDurability) {
+	case "witness":
+		durability = walclient.Witness
+	case "permanent":
+		durability = walclient.Permanent
+	case "local":
+		durability = walclient.Local
+	default:
+		klog.Fatalf("invalid wal-durability: %s (must be local, witness, or permanent)", *walDurability)
+	}
+	serverOpts = append(serverOpts, controller.WithServerWAL(*walDir, *walTarget, durability))
 
 	var grpcServer *grpc.Server
 	if *insecure {

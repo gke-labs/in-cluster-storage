@@ -31,6 +31,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -222,7 +223,7 @@ func TestScanUpperLayer_OperationList(t *testing.T) {
 // TestReplayOperations verifies replaying scanned operations against a real ObjectFS controller server.
 func TestReplayOperations(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-replay-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -500,7 +501,7 @@ func TestCheckpointFailure_NeverDiscardsUpperLayer(t *testing.T) {
 // TestMaterialiseVolume verifies eager materialisation downloads directories and files.
 func TestMaterialiseVolume(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-mat-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -646,7 +647,7 @@ func TestScanUpperLayer_SpecialFilesSkipped(t *testing.T) {
 // any leftover uncommitted upper/ from a previous session before mounting fresh.
 func TestPublishExclusiveLocal_RecoversLeftoverUpper(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "recover-leftover-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -764,7 +765,7 @@ func TestPublishExclusiveLocal_FailsIfLeftoverUpperReplayFails(t *testing.T) {
 
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
-	fakeServer := &failingReplayServer{Server: controller.NewServer(nil)}
+	fakeServer := &failingReplayServer{Server: controllertest.NewTestServer(nil)}
 	pb.RegisterObjectFSControllerServer(grpcServer, fakeServer)
 	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
@@ -826,7 +827,7 @@ func TestPublishExclusiveLocal_FailsIfCleanupAfterRecoveryFails(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "recover-cleanup-fail-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -933,7 +934,7 @@ func TestPublishExclusiveLocal_FailsIfCleanupAfterRecoveryFails(t *testing.T) {
 // are already present with matching size and mtime from a previous attempt.
 func TestMaterialiseVolume_Resumable(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-resume-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -1006,7 +1007,7 @@ func TestMaterialiseVolume_Resumable(t *testing.T) {
 
 func TestPublishExclusiveLocal_HoldConflictReturnsAborted(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-conflict-publish-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -1078,7 +1079,7 @@ func TestPublishExclusiveLocal_HoldConflictReturnsAborted(t *testing.T) {
 
 func TestUnpublishExclusiveLocal_ReleasesHoldAfterFinalCheckpoint(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-unpublish-release-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -1161,7 +1162,7 @@ func TestUnpublishExclusiveLocal_ReleasesHoldAfterFinalCheckpoint(t *testing.T) 
 
 func TestUnpublishExclusiveLocal_ReplayFailurePreservesHoldUntilRetrySucceeds(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
 	volumeID := "test-unpublish-retry-hold-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -1300,7 +1301,8 @@ func TestUnpublishExclusiveLocal_ReplayFailurePreservesHoldUntilRetrySucceeds(t 
 
 func TestMaterialiseVolume_XAttrs(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
+	defer func() { _ = server.Close() }()
 	volumeID := "test-mat-xattr-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -1403,7 +1405,8 @@ func TestMaterialiseVolume_XAttrs(t *testing.T) {
 
 func TestMaterialiseVolume_FailingSetXAttrReturnsError(t *testing.T) {
 	ctx := t.Context()
-	server := controller.NewServer(nil)
+	server := controllertest.NewTestServer(nil)
+	defer func() { _ = server.Close() }()
 	volumeID := "test-mat-fail-xattr-vol"
 
 	lis := bufconn.Listen(1024 * 1024)

@@ -30,6 +30,7 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
@@ -57,10 +58,11 @@ func TestStreamImpl_Close(t *testing.T) {
 	ctx := t.Context()
 	streamID := uuid.New()
 	dir := t.TempDir()
+	bt, _ := buffertest.Start(ctx, t)
 
-	stream, err := Open(ctx, dir, streamID, "")
+	stream, err := Open(ctx, dir, streamID, bt.Target, WithGRPCClient(bt.Client), WithDialOptions(bt.DialOpts...))
 	if err != nil {
-		t.Fatalf("failed to open local stream: %v", err)
+		t.Fatalf("failed to open stream: %v", err)
 	}
 
 	_, err = stream.Append(ctx, []byte("test-record"))
@@ -105,18 +107,22 @@ func TestOpen_DivergenceTruncateFailureDegraded(t *testing.T) {
 	clientDir := t.TempDir()
 
 	// 1. Client writes records 1..5 locally with small segment size so multiple segments exist
-	localStream, err := Open(ctx, clientDir, streamID, "", WithMaxSegmentSize(100))
+	store, _, err := wal.NewClientSegmentStore(clientDir, fmt.Sprintf("stream-%s", streamID.String()), 100)
 	if err != nil {
-		t.Fatalf("open localStream failed: %v", err)
+		t.Fatalf("failed to create client segment store: %v", err)
 	}
 	for i := 1; i <= 5; i++ {
-		_, err := localStream.Append(ctx, []byte(fmt.Sprintf("nodeA-rec-%d", i)))
-		if err != nil {
-			t.Fatalf("localStream append %d failed: %v", i, err)
+		rec := &wal.ClientRecord{
+			StreamID:  streamID,
+			StreamSeq: uint64(i),
+			Payload:   []byte(fmt.Sprintf("nodeA-rec-%d", i)),
+		}
+		if err := store.Append(rec); err != nil {
+			t.Fatalf("store append %d failed: %v", i, err)
 		}
 	}
-	if err := localStream.Close(); err != nil {
-		t.Fatalf("close localStream failed: %v", err)
+	if err := store.Close(); err != nil {
+		t.Fatalf("store close failed: %v", err)
 	}
 
 	// 2. Another node writes authoritative records 1..2 to wal-buffer (witness watermark = 2)
