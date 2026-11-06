@@ -2798,6 +2798,17 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				NodeId:          nodeID,
 				ConsistencyMode: consistency,
 			})
+			if err == nil {
+				header, headerErr := stream.Header()
+				if headerErr != nil {
+					err = headerErr
+				} else if header == nil {
+					_, err = stream.Recv()
+					if err == nil {
+						err = status.Error(codes.Internal, "stream terminated without headers")
+					}
+				}
+			}
 			if err != nil {
 				if !hasDisconnected {
 					hasDisconnected = true
