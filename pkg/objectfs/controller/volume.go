@@ -80,6 +80,9 @@ const (
 	closeCoalesceWindow = 75 * time.Millisecond
 )
 
+// ErrVolumeDeleted is returned when an operation is attempted on a volume that has been deleted.
+var ErrVolumeDeleted = errors.New("volume not found")
+
 type syncResult struct {
 	pos uint64
 	err error
@@ -179,6 +182,7 @@ type Volume struct {
 
 	closed   bool
 	closedCh chan struct{}
+	deleted  bool
 
 	snapshotMu       sync.Mutex
 	batchCheckMu     sync.Mutex
@@ -1605,6 +1609,155 @@ func (v *Volume) Close() error {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// recordTombstone writes a VolumeInfo marker with the given deleted state to a stream.
+func recordTombstone(ctx context.Context, stream walclient.Stream, volumeID string, deleted bool) error {
+	if stream == nil {
+		return errors.New("wal stream is required for deletion marker")
+	}
+	localHead, witnessHead, _ := stream.Watermarks()
+	var writerOptions []record.WriterOption
+	if localHead > 0 {
+		writerOptions = []record.WriterOption{record.WithStreamHeaderEmitted(true)}
+	}
+	writer := sds.NewWriter(sds.NewWALAppender(stream, walclient.Local), writerOptions...)
+	var lastVolumeInfo *pb.VolumeInfo
+	if targetHead := max(localHead, witnessHead); targetHead > 0 {
+		changeReader := sds.NewChangeReader(record.WithDecoderRegistry(writer.Registry()))
+		changeReader.SetAcceptUnversioned(true)
+		tailIterator, err := stream.Tail(ctx, 0)
+		if err != nil {
+			return fmt.Errorf("failed to tail stream for deletion marker: %w", err)
+		}
+		for seq, payload := range tailIterator {
+			changes, feedError := changeReader.Feed(seq, payload)
+			if feedError != nil {
+				return fmt.Errorf("failed to decode stream record at seq %d for deletion marker: %w", seq, feedError)
+			}
+			for _, ch := range changes {
+				if ch.TypeName == VolumeInfoTypeName {
+					if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil {
+						lastVolumeInfo = vi
+					}
+				}
+			}
+			if seq >= targetHead {
+				break
+			}
+		}
+	}
+	if err := registerMetadataTypes(writer); err != nil {
+		return fmt.Errorf("failed to register metadata types for deletion marker: %w", err)
+	}
+	tx := writer.Begin()
+	volumeInfo := &pb.VolumeInfo{VolumeId: volumeID, Deleted: deleted}
+	key, err := pkVolumeInfo.Extract(volumeInfo)
+	if err != nil {
+		return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
+	}
+	var beforeMessage proto.Message
+	if lastVolumeInfo != nil {
+		beforeMessage = lastVolumeInfo
+	}
+	tx.RecordRead(VolumeInfoTypeName, key, beforeMessage)
+	if lastVolumeInfo != nil {
+		if _, err := tx.Update(ctx, volumeInfo); err != nil {
+			return fmt.Errorf("failed to update deletion marker: %w", err)
+		}
+	} else {
+		if _, err := tx.Insert(ctx, volumeInfo); err != nil {
+			return fmt.Errorf("failed to insert deletion marker: %w", err)
+		}
+	}
+	if _, err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit deletion marker: %w", err)
+	}
+	return stream.Flush(ctx)
+}
+
+// recordDeletionMarker records a VolumeInfo deletion marker (deleted=true) directly to a stream.
+// It is used as a fallback when a volume cannot be loaded into memory or is not currently loaded.
+func recordDeletionMarker(ctx context.Context, stream walclient.Stream, volumeID string) error {
+	return recordTombstone(ctx, stream, volumeID, true)
+}
+
+// RecordDeletion appends a VolumeInfo record with deleted=true to the metadata stream
+// and flushes it to the WAL.
+func (v *Volume) RecordDeletion(ctx context.Context) error {
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return nil
+	}
+	if v.stream == nil {
+		v.mu.Unlock()
+		return errors.New("volume stream is required for deletion")
+	}
+	if v.metadataStream == nil {
+		v.mu.Unlock()
+		return recordDeletionMarker(ctx, v.stream, v.volumeID)
+	}
+	volumeInfo := &pb.VolumeInfo{VolumeId: v.volumeID, Deleted: true}
+	key, err := pkVolumeInfo.Extract(volumeInfo)
+	if err != nil {
+		v.mu.Unlock()
+		return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
+	}
+	var beforeMessage proto.Message
+	exists := false
+	if v.metadataView != nil {
+		msg, ok, err := v.metadataView.Get(ctx, VolumeInfoTypeName, key)
+		if err != nil {
+			v.mu.Unlock()
+			return fmt.Errorf("failed to get VolumeInfo: %w", err)
+		}
+		if ok && msg != nil {
+			beforeMessage, exists = msg, true
+		}
+	}
+	tx := v.beginTxLocked("recordDeletion")
+	if tx == nil {
+		v.mu.Unlock()
+		return fmt.Errorf("failed to begin transaction for deletion")
+	}
+	v.recordReadLocked(tx, VolumeInfoTypeName, key, beforeMessage)
+	if exists {
+		if _, err := tx.Update(ctx, volumeInfo); err != nil {
+			v.mu.Unlock()
+			return fmt.Errorf("failed to update VolumeInfo deletion marker: %w", err)
+		}
+	} else {
+		if _, err := tx.Insert(ctx, volumeInfo); err != nil {
+			v.mu.Unlock()
+			return fmt.Errorf("failed to insert VolumeInfo deletion marker: %w", err)
+		}
+	}
+	commitSeq, err := v.commitTxLocked(ctx, tx)
+	if err != nil {
+		v.mu.Unlock()
+		return fmt.Errorf("failed to commit deletion marker: %w", err)
+	}
+	v.deleted = true
+	waitFn := v.makeWaitFn(commitSeq, nil)
+	v.mu.Unlock()
+
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return fmt.Errorf("failed to wait for deletion marker: %w", err)
+		}
+	}
+	if err := v.stream.Flush(ctx); err != nil {
+		return fmt.Errorf("failed to flush stream after deletion marker: %w", err)
+	}
+	return nil
+}
+
+// IsDeleted reports whether the volume has been marked deleted.
+func (v *Volume) IsDeleted() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.deleted
 }
 
 // logMutationLocked appends a mutation record to the WAL stream under v.mu.
@@ -6137,8 +6290,11 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				}
 			}
 			if ch.TypeName == VolumeInfoTypeName {
-				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-					v.consistencyMode = vi.GetConsistencyMode()
+				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil {
+					v.deleted = vi.GetDeleted()
+					if vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+						v.consistencyMode = vi.GetConsistencyMode()
+					}
 				}
 			}
 		}
@@ -6324,8 +6480,11 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			return fmt.Errorf("failed to get VolumeInfo: %w", err)
 		}
 		if ok && msg != nil {
-			if vi, ok := msg.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-				v.consistencyMode = vi.GetConsistencyMode()
+			if vi, ok := msg.(*pb.VolumeInfo); ok && vi != nil {
+				v.deleted = vi.GetDeleted()
+				if vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+					v.consistencyMode = vi.GetConsistencyMode()
+				}
 			}
 		}
 	}
@@ -6334,6 +6493,9 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize next inode from stats: %w", err)
 	}
 	v.assertStatsMatchLocked("after loadFromBackendMetadataLocked")
+	if v.deleted {
+		return ErrVolumeDeleted
+	}
 	return nil
 }
 
