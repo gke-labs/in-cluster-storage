@@ -2114,12 +2114,6 @@ func (v *Volume) getOrLoadInodeLocked(ctx context.Context, tx *sds.Tx, inodeID u
 		return nil, fmt.Errorf("inode %d: %w", inodeID, syscall.ENOENT)
 	}
 	inode := msg.(*pb.Inode)
-	if inode.GetIsDir() && inode.GetParentIno() != 0 {
-		if v.dirParents == nil {
-			v.dirParents = make(map[uint64]uint64)
-		}
-		v.dirParents[inode.GetIno()] = inode.GetParentIno()
-	}
 	node := &CachedInode{
 		Row: inode,
 	}
@@ -5020,16 +5014,28 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			}
 
 			if newParentInodeID != oldParentInodeID {
-				currCheck := newParentInodeID
-				for currCheck != 0 && currCheck != v.rootInodeID {
-					if currCheck == childInode.Row.GetIno() {
+				currentInodeID := newParentInodeID
+				visitedInodes := make(map[uint64]struct{})
+				for currentInodeID != 0 && currentInodeID != v.rootInodeID {
+					if currentInodeID == childInode.Row.GetIno() {
 						return nil, nil, fmt.Errorf("cannot move directory into its own subdirectory: %w", syscall.EINVAL)
 					}
-					pIno, ok := v.dirParents[currCheck]
-					if !ok || pIno == currCheck {
+					if _, alreadyVisited := visitedInodes[currentInodeID]; alreadyVisited {
+						return nil, nil, fmt.Errorf("directory ancestry forms a cycle at inode %d: %w", currentInodeID, syscall.ELOOP)
+					}
+					visitedInodes[currentInodeID] = struct{}{}
+					ancestorInode, err := v.getOrLoadInodeLocked(ctx, tx, currentInodeID)
+					if err != nil {
+						return nil, nil, err
+					}
+					parentInodeID := ancestorInode.Row.GetParentIno()
+					if parentInodeID == 0 {
+						parentInodeID = v.dirParents[currentInodeID]
+					}
+					if parentInodeID == 0 {
 						break
 					}
-					currCheck = pIno
+					currentInodeID = parentInodeID
 				}
 				if v.dirParents == nil {
 					v.dirParents = make(map[uint64]uint64)
