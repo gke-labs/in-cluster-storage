@@ -228,9 +228,7 @@ func TestVolume_InodeAllocatorNoReuseAcrossRestart(t *testing.T) {
 		if err := vol1.FlushToBackend(ctx); err != nil {
 			t.Fatalf("FlushToBackend failed: %v", err)
 		}
-		if err := server1.Close(); err != nil {
-			t.Fatalf("server1.Close failed: %v", err)
-		}
+		shutdownTestServer(t, server1)
 	}
 
 	// Session 2: Reload volume from backend
@@ -240,7 +238,6 @@ func TestVolume_InodeAllocatorNoReuseAcrossRestart(t *testing.T) {
 			WithServerWAL(walDir, bt.Target, walclient.Witness),
 			WithServerWALDialOptions(bt.DialOpts...),
 		)
-		defer server2.Close()
 		vol2, err := server2.getOrCreateVolume(volumeID)
 		if err != nil {
 			t.Fatalf("getOrCreateVolume failed: %v", err)
@@ -316,9 +313,7 @@ func TestVolume_InodeAllocatorRecomputeWhenStatsDeleted(t *testing.T) {
 		if err := vol1.FlushToBackend(ctx); err != nil {
 			t.Fatalf("FlushToBackend failed: %v", err)
 		}
-		if err := server1.Close(); err != nil {
-			t.Fatalf("server1.Close failed: %v", err)
-		}
+		shutdownTestServer(t, server1)
 	}
 
 	// Delete VolumeStats row from SQLite to simulate pre-existing index without stats
@@ -349,11 +344,6 @@ func TestVolume_InodeAllocatorRecomputeWhenStatsDeleted(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getOrCreateVolume run 2 failed: %v", err)
 		}
-		defer func() {
-			if err := server2.Close(); err != nil {
-				t.Errorf("server2.Close failed: %v", err)
-			}
-		}()
 
 		st := vol2.Stats()
 		if st.Stats.GetMaxIno() != 40 {
@@ -434,9 +424,7 @@ func TestVolume_CrashWithUnappliedBacklogAndRecovery(t *testing.T) {
 				t.Fatalf("Release %d failed: err=%v, resp=%v", i, err, relResp)
 			}
 		}
-		if err := server1.Close(); err != nil {
-			t.Fatalf("server1.Close failed: %v", err)
-		}
+		shutdownTestServer(t, server1)
 	}
 
 	// Session 2: Recover from backend + WAL stream
@@ -450,11 +438,6 @@ func TestVolume_CrashWithUnappliedBacklogAndRecovery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getOrCreateVolume failed: %v", err)
 		}
-		defer func() {
-			if err := server2.Close(); err != nil {
-				t.Errorf("server2.Close failed: %v", err)
-			}
-		}()
 
 		for i := 0; i < 5; i++ {
 			resp, err := server2.CreateFile(ctx, &pb.CreateFileRequest{
@@ -579,7 +562,7 @@ func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
 		}
 
 		// Simulate crash: close server1 stream, without flushing applier to SQLite
-		_ = server1.Close()
+		shutdownTestServer(t, server1)
 	}
 
 	// Session 2: Crash restart with SAME local directory
@@ -603,7 +586,7 @@ func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
 		if !proto.Equal(live2, recount) {
 			t.Fatalf("live stats after crash recovery does not match recount:\n  live:    %+v\n  recount: %+v", live2, recount)
 		}
-		_ = server2.Close()
+		shutdownTestServer(t, server2)
 	}
 
 	// Session 3: Node move with FRESH local storage directory in WAL mode
@@ -628,7 +611,7 @@ func TestVolume_LiveStatsMatchesFullRecountAfterRecovery(t *testing.T) {
 		if !proto.Equal(live3, recount) {
 			t.Fatalf("live stats after node move does not match recount:\n  live:    %+v\n  recount: %+v", live3, recount)
 		}
-		_ = server3.Close()
+		shutdownTestServer(t, server3)
 	}
 }
 
@@ -636,7 +619,6 @@ func TestVolume_DebugStatsCheckCatchesSkippedUpdate(t *testing.T) {
 	ctx := t.Context()
 	storage := inmemorystorage.New()
 	server := NewTestServer(t, storage, WithServerStatsCheck())
-	defer server.Close()
 
 	vol, err := server.getOrCreateVolume("test-debug-check-vol")
 	if err != nil {
@@ -956,9 +938,7 @@ func TestVolume_SequenceNumberContinuityAcrossRestart(t *testing.T) {
 		if session1Pos == 0 {
 			t.Fatal("expected session 1 position > 0")
 		}
-		if err := server1.Close(); err != nil {
-			t.Fatalf("server1.Close failed: %v", err)
-		}
+		shutdownTestServer(t, server1)
 	}
 
 	// Session 2: Reopen volume on the same local directory against the WAL buffer
@@ -995,9 +975,7 @@ func TestVolume_SequenceNumberContinuityAcrossRestart(t *testing.T) {
 		}
 		defer func() {
 			unblockApplier()
-			if err := server2.Close(); err != nil {
-				t.Errorf("server2.Close failed: %v", err)
-			}
+			shutdownTestServer(t, server2)
 		}()
 
 		holdApplier.Store(true)

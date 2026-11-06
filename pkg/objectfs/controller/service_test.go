@@ -1584,11 +1584,10 @@ func TestSnapshotRestoreWriteThenRestart(t *testing.T) {
 	if err := server1.FlushAll(ctx); err != nil {
 		t.Fatalf("FlushAll failed: %v", err)
 	}
-	_ = server1.Close()
+	shutdownTestServer(t, server1)
 
 	// Restart controller from backend + WAL
 	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
-	defer func() { _ = server2.Close() }()
 
 	// Read /doc.txt -> should be post-restore write ("version 3 data post-restore")
 	readDoc, err := testReadFile(ctx, server2, volumeID, "/doc.txt", 0, 1024)
@@ -1716,11 +1715,10 @@ func TestSnapshotRestoreRebuildFromLog(t *testing.T) {
 		t.Fatalf("temp.txt unexpectedly found in rebuilt index; restore record was not honoured!")
 	}
 
-	_ = server1.Close()
+	shutdownTestServer(t, server1)
 
 	// Compare with fresh recovered server
 	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
-	defer func() { _ = server2.Close() }()
 
 	read1, err := testReadFile(ctx, server2, volumeID, "/file1.txt", 0, 1024)
 	if err != nil {
@@ -1749,7 +1747,7 @@ func TestVolume_RebuildIndexTargetlessWALStream(t *testing.T) {
 		WithServerLocalStorageDir(localDir),
 		WithServerMetadataIndex("sqlite"),
 	)
-	defer server.Close()
+	defer func() { shutdownTestServer(t, server) }()
 
 	vol, err := server.getOrCreateVolume(volumeID)
 	if err != nil {
@@ -1873,11 +1871,11 @@ func TestSnapshotRestoreInodeMonotonicity(t *testing.T) {
 		t.Fatalf("Inode collision in running process: inoPost=%d <= ino3=%d (ino1=%d, ino2=%d)", inoPost, ino3, ino1, ino2)
 	}
 
-	_ = server1.Close()
+	shutdownTestServer(t, server1)
 
 	// 5. Restart controller and create another file after recovery
 	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
-	defer func() { _ = server2.Close() }()
+	defer func() { shutdownTestServer(t, server2) }()
 
 	fRestartAttr, err := testCreateFile(ctx, server2, volumeID, "/file_restart.txt", 0644, []byte("frestart"), 0, 0)
 	if err != nil {
@@ -2474,19 +2472,10 @@ func TestDeleteSnapshotReplayDependencyRule(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	snapshotName2 := createTestSnapshot(t, ctx, server1, volumeID, "/file2.txt", "second content")
 
-	err := server1.Close()
-	if err != nil {
-		t.Fatalf("server1 Close failed: %v", err)
-	}
+	shutdownTestServer(t, server1)
 
 	// Restart server and recover volume; it restores from snapshot 2 (the latest snapshot)
 	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
-	defer func() {
-		closeErr := server2.Close()
-		if closeErr != nil {
-			t.Logf("server2 Close error: %v", closeErr)
-		}
-	}()
 
 	recoveredVolume, err := server2.GetVolume(volumeID)
 	if err != nil {
@@ -2567,7 +2556,7 @@ func TestStreamsChangeLogLogging(t *testing.T) {
 	walDir := t.TempDir()
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "wal-vol-test"
 
@@ -2689,11 +2678,11 @@ func TestStreamsCrashRecoveryReplay(t *testing.T) {
 	}
 
 	// Simulate crash: close server1 without flushing snapshot to backend
-	_ = server1.Close()
+	shutdownTestServer(t, server1)
 
 	// Step 4: Start new server instance with same backend and walDir
 	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
-	defer func() { _ = server2.Close() }()
+	defer func() { shutdownTestServer(t, server2) }()
 
 	vol2 := mustGetVolume(t, server2, volumeID)
 	if vol2 == nil {
@@ -2745,7 +2734,7 @@ func TestStreamsDurabilityModes(t *testing.T) {
 
 	// Create server with Witness durability
 	server := NewTestServer(t, backend, WithServerWAL(clientDir, target, walclient.Witness))
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	ctx := t.Context()
 
@@ -3002,7 +2991,7 @@ func TestTargetlessWALDurabilityLocalOnly(t *testing.T) {
 		WithServerWAL(walDir, bt.Target, walclient.Local),
 		WithServerWALDialOptions(bt.DialOpts...),
 	)
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-vol-targetless-wal"
 
@@ -3133,7 +3122,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 		}),
 		WithServerDurability(walclient.Witness),
 	)
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-concurrency-vol"
 
@@ -3227,7 +3216,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 		}),
 		WithServerDurability(walclient.Witness),
 	)
-	defer func() { _ = server2.Close() }()
+	defer func() { shutdownTestServer(t, server2) }()
 
 	vol2 := "test-wait-fail-vol"
 	writeCtx, cancelWrite := context.WithCancel(ctx)
@@ -3282,7 +3271,7 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 		}),
 		WithServerDurability(walclient.Witness),
 	)
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-all-mutations-vol"
 
@@ -3804,7 +3793,7 @@ func TestSDSStepReplayScratch(t *testing.T) {
 		t.Fatalf("Expected /docs/sub to not exist in replayed volume")
 	}
 
-	_ = server.Close()
+	shutdownTestServer(t, server)
 }
 
 func TestSDSCatOnObjectFSStream(t *testing.T) {
@@ -3883,7 +3872,7 @@ func TestSDSCatOnObjectFSStream(t *testing.T) {
 		t.Fatalf("Expected at least 2 TxCommits in stream, got %d", seenCommits)
 	}
 
-	_ = server.Close()
+	shutdownTestServer(t, server)
 }
 
 func TestTruncateUpwardAndSparseRead(t *testing.T) {
@@ -3935,7 +3924,7 @@ func TestLargeFileBlobFirstAndSparseWrite(t *testing.T) {
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend)
 	volumeID := "large-vol"
-	defer server.Close()
+	defer func() { shutdownTestServer(t, server) }()
 
 	// 1. Create a 1 GiB sparse file with writes at offset 0, 512 MiB, and 1 GiB - 64 KiB
 	targetSize := int64(1 * 1024 * 1024 * 1024) // 1 GiB
@@ -4020,7 +4009,7 @@ func TestWriteThenTruncateAndUnlinkOrdering(t *testing.T) {
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend)
 	volumeID := "order-vol"
-	defer server.Close()
+	defer func() { shutdownTestServer(t, server) }()
 
 	// 1. Write then immediately Truncate
 	createResp, err := testCreateFile(ctx, server, volumeID, "/truncate-test.bin", 0644, nil, 0, 0)
@@ -4087,7 +4076,7 @@ func TestTinyFileInlineLogging(t *testing.T) {
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend)
 	volumeID := "tiny-vol"
-	defer server.Close()
+	defer func() { shutdownTestServer(t, server) }()
 
 	tinyData := []byte("tiny inline content < 4KB")
 	createResp, err := testCreateFile(ctx, server, volumeID, "/tiny.txt", 0644, tinyData, 0, 0)
@@ -4117,7 +4106,7 @@ func TestHugeSparseTruncateAndUnlink(t *testing.T) {
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend)
 	volumeID := "huge-vol"
-	defer server.Close()
+	defer func() { shutdownTestServer(t, server) }()
 
 	// Create file
 	createResp, err := testCreateFile(ctx, server, volumeID, "/huge.bin", 0644, []byte("initial chunk data"), 0, 0)
@@ -4497,7 +4486,7 @@ func TestSnapshotRestartRecoveryFromSnapshotPlusStream(t *testing.T) {
 	}
 
 	// Close initial server
-	_ = server1.Close()
+	shutdownTestServer(t, server1)
 
 	// 4. Start second server instance simulating crash restart recovery
 	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
@@ -4551,7 +4540,7 @@ func TestSnapshotRestartRecoveryFromSnapshotPlusStream(t *testing.T) {
 		t.Fatalf("Expected non-zero position on listed snapshot")
 	}
 
-	_ = server2.Close()
+	shutdownTestServer(t, server2)
 }
 
 func TestSnapshotSafePositionAndS3Watermark(t *testing.T) {
@@ -4565,7 +4554,7 @@ func TestSnapshotSafePositionAndS3Watermark(t *testing.T) {
 	volumeID := "test-sds-safe-watermark"
 
 	server := NewTestServer(t, backend, WithServerWAL(clientDir, target, walclient.Permanent))
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	// 1. Create file with Permanent durability
 	_, err := testCreateFile(ctx, server, volumeID, "/safe_test.txt", 0644, []byte("safe watermark test content"), 0, 0)
@@ -4983,16 +4972,13 @@ func TestServerMetadataDirPersistenceAcrossRestart(t *testing.T) {
 	}
 
 	// Close first server
-	if err := server1.Close(); err != nil {
-		t.Fatalf("server1.Close failed: %v", err)
-	}
+	shutdownTestServer(t, server1)
 
 	// 2. Second server instance starts with same WAL and metadata dirs
 	server2 := NewTestServer(t, backend,
 		WithServerWAL(walDir, "", walclient.Local),
 		WithServerMetadataDir(metadataDir),
 	)
-	defer server2.Close()
 
 	// Read back file
 	readResp, err := server2.ReadFile(ctx, &pb.ReadFileRequest{
@@ -5105,7 +5091,7 @@ func TestAuthoritativeRecoveryOnNewNodeWithoutSnapshot(t *testing.T) {
 	}
 
 	// Close Server 1 (simulating node crash / controller moving away)
-	_ = server1.Close()
+	shutdownTestServer(t, server1)
 
 	// 2. Controller 2 starts on Node 2 with EMPTY walDir2 and EMPTY metaDir2 against the same wal-buffer & backend
 	walDir2 := t.TempDir()
@@ -5115,7 +5101,7 @@ func TestAuthoritativeRecoveryOnNewNodeWithoutSnapshot(t *testing.T) {
 		WithServerMetadataDir(metaDir2),
 		WithServerMetadataIndex("sqlite"),
 	)
-	defer func() { _ = server2.Close() }()
+	defer func() { shutdownTestServer(t, server2) }()
 
 	// Verify all N files are present and readable on Server 2
 	for i := 1; i <= N; i++ {
@@ -5152,7 +5138,6 @@ func TestAuthoritativeRecoveryOnNewNodeWithoutSnapshot(t *testing.T) {
 		WithServerMetadataDir(metaDir3),
 		WithServerMetadataIndex("sqlite"),
 	)
-	defer func() { _ = server3.Close() }()
 
 	afterResp, err := testReadFile(ctx, server3, volumeID, "/after_restart.txt", 0, 1024)
 	if err != nil {
@@ -5218,7 +5203,7 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 	if err != nil || cfResp.GetError() != 0 {
 		t.Fatalf("Server 2 CreateFile failed: %v (code %d)", err, cfResp.GetError())
 	}
-	_ = server2.Close()
+	shutdownTestServer(t, server2)
 
 	// 3. Controller moves back to Node 1 with stale local WAL directory and stale SQLite DB
 	server1Restarted := NewTestServer(t, backend,
@@ -5226,7 +5211,6 @@ func TestAuthoritativeRecoveryIgnoresStaleNodeSegments(t *testing.T) {
 		WithServerMetadataDir(node1MetaDir),
 		WithServerMetadataIndex("sqlite"),
 	)
-	defer func() { _ = server1Restarted.Close() }()
 
 	// Authoritative file from wal-buffer must be present
 	authResp, err := testReadFile(ctx, server1Restarted, volumeID, "/authoritative_file.txt", 0, 1024)
@@ -5688,11 +5672,11 @@ func TestInlineToChunkedTransitionUploadsChunk0OnRestart(t *testing.T) {
 	if err := vol1.FlushToBackend(ctx); err != nil {
 		t.Fatalf("FlushToBackend failed: %v", err)
 	}
-	_ = server1.Close()
+	shutdownTestServer(t, server1)
 
 	// Restart server from the same backend & WAL
 	server2 := NewTestServer(t, backend, WithServerWAL(walDir, "", walclient.Local))
-	defer func() { _ = server2.Close() }()
+	defer func() { shutdownTestServer(t, server2) }()
 
 	readResp, err := server2.ReadFile(ctx, &pb.ReadFileRequest{
 		VolumeId: volumeID,
@@ -6361,9 +6345,6 @@ func TestControllerWALStreamDegraded(t *testing.T) {
 	)
 
 	closeAll := sync.OnceFunc(func() {
-		if err := server.Close(); err != nil {
-			t.Errorf("server.Close failed: %v", err)
-		}
 		if err := stream2.Close(); err != nil {
 			t.Errorf("stream2.Close failed: %v", err)
 		}
@@ -6747,7 +6728,7 @@ func TestSharedWALBufferConnectionAcrossVolumes(t *testing.T) {
 		WithServerWAL(clientDir, target, walclient.Witness),
 		WithServerWALDialOptions(grpc.WithContextDialer(testDialer)),
 	)
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	ctx := t.Context()
 
@@ -6782,16 +6763,14 @@ func TestSharedWALBufferConnectionAcrossVolumes(t *testing.T) {
 		t.Fatalf("expected exactly 1 dialed connection across volumes, got %d", got)
 	}
 
-	if err := server.Close(); err != nil {
-		t.Fatalf("server.Close failed: %v", err)
-	}
+	shutdownTestServer(t, server)
 }
 
 func TestExclusiveHold_AcquireRenewRelease(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend, WithExclusiveLeaseTTL(10*time.Second))
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-hold-vol"
 
@@ -6877,7 +6856,7 @@ func TestExclusiveHold_ConflictRejection(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend, WithExclusiveLeaseTTL(10*time.Second))
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-conflict-vol"
 
@@ -6951,7 +6930,7 @@ func TestExclusiveHold_LeaseExpiry(t *testing.T) {
 	backend := NewMemoryBackend()
 	// Configure short lease TTL (50ms) to test expiry
 	server := NewTestServer(t, backend, WithExclusiveLeaseTTL(50*time.Millisecond))
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-expiry-vol"
 
@@ -6997,7 +6976,7 @@ func TestExclusiveHold_ControllerRestart_RenewReestablishes(t *testing.T) {
 	backend := NewMemoryBackend()
 	// Server 1
 	server1 := NewTestServer(t, backend, WithExclusiveLeaseTTL(10*time.Second))
-	defer func() { _ = server1.Close() }()
+	defer func() { shutdownTestServer(t, server1) }()
 
 	volumeID := "test-restart-vol"
 
@@ -7012,7 +6991,7 @@ func TestExclusiveHold_ControllerRestart_RenewReestablishes(t *testing.T) {
 
 	// Simulate controller restart: new server instance with same backend, but empty memory lease table
 	server2 := NewTestServer(t, backend, WithExclusiveLeaseTTL(10*time.Second))
-	defer func() { _ = server2.Close() }()
+	defer func() { shutdownTestServer(t, server2) }()
 
 	// Periodic renew from node-1 arrives at restarted controller: must re-establish hold
 	renewResp, err := server2.RenewExclusive(ctx, &pb.RenewExclusiveRequest{
@@ -7055,7 +7034,7 @@ func TestControllerRepairVolume(t *testing.T) {
 	server := NewTestServer(t, storage,
 		WithServerWAL(walDir, walTarget, walclient.Witness),
 	)
-	defer server.Close()
+	defer func() { shutdownTestServer(t, server) }()
 
 	// 1. Initialize data on both volumes using shared walDir
 	init1, err := server.CreateFile(ctx, &pb.CreateFileRequest{
@@ -7230,11 +7209,11 @@ func TestControllerRepairVolume(t *testing.T) {
 
 type faultInjectingTruncateStore struct {
 	walclient.SegmentStore
-	fail bool
+	fail atomic.Bool
 }
 
 func (f *faultInjectingTruncateStore) TruncateAfter(ctx context.Context, seq uint64) error {
-	if f.fail {
+	if f.fail.Load() {
 		return fmt.Errorf("injected TruncateAfter failure on store")
 	}
 	return f.SegmentStore.TruncateAfter(ctx, seq)
@@ -7274,9 +7253,7 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 	if err != nil || fsyncB.GetError() != 0 {
 		t.Fatalf("Fsync on serverB failed: %v, resp: %v", err, fsyncB)
 	}
-	if err := serverB.Close(); err != nil {
-		t.Fatalf("Close serverB failed: %v", err)
-	}
+	shutdownTestServer(t, serverB)
 
 	// 2. Server 1 writes local records in local mode (not replicated to buffer), producing divergent records ahead of buffer
 	server1 := NewTestServer(t, storage, WithServerWAL(walDir, "", walclient.Local))
@@ -7291,9 +7268,7 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 			t.Fatalf("CreateFile on server1 %d failed: %v, resp: %v", i, err, initResp)
 		}
 	}
-	if err := server1.Close(); err != nil {
-		t.Fatalf("Close server1 failed: %v", err)
-	}
+	shutdownTestServer(t, server1)
 
 	// 3. Controller restart with fault STILL PRESENT:
 	// Inject fault so TruncateAfter fails
@@ -7303,8 +7278,8 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 	}
 	faultStore := &faultInjectingTruncateStore{
 		SegmentStore: realStore,
-		fail:         true,
 	}
+	faultStore.fail.Store(true)
 	faultStream := func(volID string) (walclient.Stream, error) {
 		return walclient.Open(ctx, walDir, streamID, walTarget,
 			walclient.WithStore(faultStore, recovered),
@@ -7365,14 +7340,29 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 		t.Fatalf("expected Fsync to fail with EIO on degraded volume, got err=%v, resp=%v", err, fsyncResp2)
 	}
 
-	if err := server2.Close(); err != nil {
-		t.Fatalf("Close server2 failed: %v", err)
+	// Shutdown drains the volume, so the store must be healthy for the final sync of staged writes to succeed.
+	faultStore.fail.Store(false)
+	var lastStats *pb.GetVolumeStatsResponse
+	var lastStatsErr error
+	var statsRecovered bool
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer waitCancel()
+	for !statsRecovered && waitCtx.Err() == nil {
+		lastStats, lastStatsErr = server2.GetVolumeStats(waitCtx, &pb.GetVolumeStatsRequest{VolumeId: volumeID})
+		if lastStatsErr == nil && lastStats.GetDegraded() == nil {
+			statsRecovered = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	if !statsRecovered {
+		t.Fatalf("timed out waiting for volume to recover from degraded state: lastStats=%+v, lastErr=%v, waitErr=%v", lastStats, lastStatsErr, waitCtx.Err())
+	}
+	shutdownTestServer(t, server2)
 
 	// 4. Controller restart with fault CLEARED:
 	// Real store truncate succeeds, controller recovers the volume by itself
 	server3 := NewTestServer(t, storage, WithServerWAL(walDir, walTarget, walclient.Permanent))
-	defer server3.Close()
 
 	statsResp3, err := server3.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: volumeID})
 	if err != nil {
@@ -7406,7 +7396,7 @@ func TestControllerXAttrOperations(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend)
-	defer server.Close()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-xattr-vol"
 
@@ -7720,16 +7710,13 @@ func TestControllerXAttrPersistenceAcrossRestart(t *testing.T) {
 	}
 
 	// Close server1
-	if err := server1.Close(); err != nil {
-		t.Fatalf("server1.Close failed: %v", err)
-	}
+	shutdownTestServer(t, server1)
 
 	// 2. Second server instance opens with same metadata and WAL
 	server2 := NewTestServer(t, backend,
 		WithServerWAL(walDir, "", walclient.Local),
 		WithServerMetadataDir(metadataDir),
 	)
-	defer server2.Close()
 
 	getResp, err := testGetXAttr(ctx, server2, volumeID, fileIno, "user.persistent")
 	if err != nil || getResp.GetError() != 0 {

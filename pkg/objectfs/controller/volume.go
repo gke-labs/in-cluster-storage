@@ -135,6 +135,7 @@ type packInfo struct {
 }
 
 type Volume struct {
+	// Lock order: stagingMu may be held while taking mu for reading; mu must never be held while taking stagingMu.
 	mu           sync.RWMutex
 	volumeID     string
 	rootInodeID  uint64
@@ -156,6 +157,7 @@ type Volume struct {
 	uploadContext   context.Context
 	cancelUpload    context.CancelFunc
 
+	// Lock order: stagingMu may be held while taking mu for reading; mu must never be held while taking stagingMu.
 	stagingMu       sync.Mutex
 	stagingEpoch    int64
 	stagingSeq      uint64
@@ -177,6 +179,11 @@ type Volume struct {
 	consistencyMode    pb.ConsistencyMode
 	syncInProgress     bool
 	syncCond           *sync.Cond
+	syncTrigger        pb.FsyncRequest_SyncTrigger
+	syncCommitSeq      uint64
+	syncStartTime      time.Time
+	stagingClosed      bool
+	stopping           bool
 
 	stream     walclient.Stream
 	durability walclient.Level
@@ -638,6 +645,9 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 	defer v.stagingMu.Unlock()
 
 	v.syncInProgress = false
+	v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED
+	v.syncCommitSeq = 0
+	v.syncStartTime = time.Time{}
 	for sIno := range snapshotChunks {
 		delete(v.syncingInodes, sIno)
 	}
@@ -681,11 +691,13 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 	}
 	v.coalesceWaiters = remainingWaiters
 
-	if (len(remainingWaiters) > 0 || len(v.stagedChunks) > 0) && v.coalesceTimer == nil {
-		v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
-	}
-	if len(v.closeInodes) > 0 && v.closeTimer == nil {
-		v.closeTimer = time.AfterFunc(closeCoalesceWindow, v.triggerCloseSync)
+	if v.rejectMutationLocked() == nil {
+		if (len(remainingWaiters) > 0 || len(v.stagedChunks) > 0) && v.coalesceTimer == nil {
+			v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
+		}
+		if len(v.closeInodes) > 0 && v.closeTimer == nil {
+			v.closeTimer = time.AfterFunc(closeCoalesceWindow, v.triggerCloseSync)
+		}
 	}
 
 	v.syncCond.Broadcast()
@@ -695,7 +707,7 @@ func (v *Volume) finishSync(snapshotSeq uint64, err error, snapshotChunks map[ui
 func (v *Volume) triggerCoalesceSync() {
 	v.stagingMu.Lock()
 	v.coalesceTimer = nil
-	if v.syncInProgress {
+	if v.rejectMutationLocked() != nil || v.syncInProgress {
 		v.stagingMu.Unlock()
 		return
 	}
@@ -715,6 +727,7 @@ func (v *Volume) triggerCoalesceSync() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_PERIODIC
 	requirePermanent := v.stream.ReplicationLevel() >= walclient.Permanent
 	if _, err := v.executeSyncLocked(ctx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC, requirePermanent, nil); err != nil {
 		klog.Warningf("ObjectFS volume %s coalesce sync failed: %v", v.volumeID, err)
@@ -757,11 +770,16 @@ func (v *Volume) waitForSyncIdleLocked() {
 func (v *Volume) triggerCloseSync() {
 	v.stagingMu.Lock()
 	v.closeTimer = nil
-	v.waitForSyncIdleLocked()
-	if len(v.closeInodes) == 0 {
+	if v.rejectMutationLocked() != nil {
 		v.stagingMu.Unlock()
 		return
 	}
+	v.waitForSyncIdleLocked()
+	if v.rejectMutationLocked() != nil || len(v.closeInodes) == 0 {
+		v.stagingMu.Unlock()
+		return
+	}
+	v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_CLOSE
 	targetInodes := v.closeInodes
 	v.closeInodes = make(map[uint64]struct{})
 
@@ -794,6 +812,12 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 	}
 
 	v.stagingMu.Lock()
+	if err := v.rejectMutationLocked(); err != nil {
+		epoch := v.stagingEpoch
+		pos := v.Position()
+		v.stagingMu.Unlock()
+		return epoch, pos, err
+	}
 	if reqEpoch != 0 && reqEpoch != v.stagingEpoch {
 		epoch := v.stagingEpoch
 		v.stagingMu.Unlock()
@@ -834,6 +858,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 			return epoch, pos, v.finishSync(snapSeq, nil, nil, pos, nil)
 		}
 
+		v.syncTrigger = trigger
 		pos, err := v.executeSyncLocked(ctx, trigger, requirePermanent, nil)
 		return epoch, pos, err
 	}
@@ -920,6 +945,12 @@ func (v *Volume) uploadPacks(ctx context.Context, packIDsToUpload []uint64) (int
 			v.stagingMu.Unlock()
 		})
 		defer stopTimer()
+		stopUploadTimer := context.AfterFunc(v.uploadContext, func() {
+			v.stagingMu.Lock()
+			v.syncCond.Broadcast()
+			v.stagingMu.Unlock()
+		})
+		defer stopUploadTimer()
 
 		for _, packID := range packIDsToUpload {
 			v.stagingMu.Lock()
@@ -928,9 +959,13 @@ func (v *Volume) uploadPacks(ctx context.Context, packIDsToUpload []uint64) (int
 				if !ok || info.state != packUploading {
 					break
 				}
-				if uploadCtx.Err() != nil {
+				if uploadCtx.Err() != nil || v.uploadContext.Err() != nil {
 					v.stagingMu.Unlock()
-					return 0, 0, uploadCtx.Err()
+					syncErr := uploadCtx.Err()
+					if syncErr == nil {
+						syncErr = v.uploadContext.Err()
+					}
+					return 0, 0, syncErr
 				}
 				v.syncCond.Wait()
 			}
@@ -1160,6 +1195,10 @@ func (v *Volume) waitForCommit(ctx context.Context, waitFn func(context.Context)
 func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_SyncTrigger, requirePermanent bool, inodeFilter map[uint64]struct{}) (uint64, error) {
 	// Must be called with v.stagingMu held.
 	// Invariant: ALWAYS returns with v.stagingMu UNLOCKED.
+	if v.stagingClosed {
+		v.stagingMu.Unlock()
+		return 0, fmt.Errorf("volume closed")
+	}
 	syncStartTime := time.Now()
 	syncCtx, syncSpan := scoped.StartSpan(ctx, spanVolumeSync)
 	defer syncSpan.End()
@@ -1232,6 +1271,8 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	}
 
 	v.syncInProgress = true
+	v.syncStartTime = syncStartTime
+	v.syncCommitSeq = 0
 	if v.syncingInodes == nil {
 		v.syncingInodes = make(map[uint64]struct{})
 	}
@@ -1265,6 +1306,10 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	reqLevel := v.durability
 	waitFn := v.makeWaitFn(commitSeq, &reqLevel)
 	v.mu.Unlock()
+
+	v.stagingMu.Lock()
+	v.syncCommitSeq = commitSeq
+	v.stagingMu.Unlock()
 
 	if err := v.waitForCommit(syncCtx, waitFn, requirePermanent); err != nil {
 		return 0, v.finishSync(snapshotSeq, err, snapshotChunks, 0, inodeFilter)
@@ -1629,10 +1674,122 @@ func (v *Volume) commitTxLocked(ctx context.Context, tx *sds.Tx) (uint64, error)
 	return commitSeq, nil
 }
 
-// Close closes the volume, local storage, and any underlying WAL streams.
-func (v *Volume) Close() error {
+// ErrVolumeStopping indicates that the volume is stopping and no new mutations or syncs can be accepted.
+var ErrVolumeStopping = errors.New("volume is stopping")
+
+func (v *Volume) rejectMutation() error {
 	v.stagingMu.Lock()
-	v.waitForSyncIdleLocked()
+	defer v.stagingMu.Unlock()
+	return v.rejectMutationLocked()
+}
+
+func (v *Volume) rejectMutationLocked() error {
+	if v.stopping || v.stagingClosed {
+		return ErrVolumeStopping
+	}
+	return nil
+}
+
+// Stop gracefully drains the volume by stopping new mutations and sync requests,
+// initiating one final sync of all staged chunks if none is currently in flight,
+// and waiting for any in-flight sync to complete, bounded by ctx.
+// If ctx is already done, Stop returns immediately without marking the volume
+// stopping or starting a sync, preserving crash semantics when followed by Close.
+// It is idempotent; subsequent calls wait for the active drain without starting another sync.
+func (v *Volume) Stop(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("volume %s stop: %w", v.volumeID, err)
+	}
+
+	v.stagingMu.Lock()
+	if v.stagingClosed {
+		v.stagingMu.Unlock()
+		return nil
+	}
+	v.stopping = true
+	v.startFinalSyncLocked()
+
+	if !v.syncInProgress {
+		return v.finishStopLocked()
+	}
+
+	stopTimer := context.AfterFunc(ctx, func() {
+		v.stagingMu.Lock()
+		v.syncCond.Broadcast()
+		v.stagingMu.Unlock()
+	})
+	defer stopTimer()
+
+	for v.syncInProgress && ctx.Err() == nil {
+		v.syncCond.Wait()
+	}
+
+	if v.syncInProgress {
+		elapsed := time.Since(v.syncStartTime)
+		klog.Warningf("ObjectFS volume %s stop timed out waiting for sync in flight: trigger=%v, commitSeq=%d, elapsed=%v",
+			v.volumeID, v.syncTrigger, v.syncCommitSeq, elapsed)
+		v.stagingMu.Unlock()
+		return fmt.Errorf("volume %s stop timed out waiting for in-flight sync: %w", v.volumeID, ctx.Err())
+	}
+	return v.finishStopLocked()
+}
+
+func (v *Volume) startFinalSyncLocked() {
+	if len(v.stagedChunks) == 0 || v.syncInProgress {
+		return
+	}
+	if v.coalesceTimer != nil {
+		v.coalesceTimer.Stop()
+		v.coalesceTimer = nil
+	}
+	if v.closeTimer != nil {
+		v.closeTimer.Stop()
+		v.closeTimer = nil
+	}
+	v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED
+	requirePermanent := v.stream.ReplicationLevel() >= walclient.Permanent
+	syncStarted := make(chan struct{})
+	go func() {
+		v.stagingMu.Lock()
+		if v.stagingClosed || v.syncInProgress || len(v.stagedChunks) == 0 {
+			close(syncStarted)
+			v.stagingMu.Unlock()
+			return
+		}
+		close(syncStarted)
+		if _, err := v.executeSyncLocked(v.uploadContext, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED, requirePermanent, nil); err != nil {
+			klog.Warningf("ObjectFS volume %s stop sync failed: %v", v.volumeID, err)
+		}
+	}()
+	v.stagingMu.Unlock()
+	<-syncStarted
+	v.stagingMu.Lock()
+}
+
+func (v *Volume) finishStopLocked() error {
+	defer v.stagingMu.Unlock()
+	if len(v.stagedChunks) > 0 {
+		var drainErrors []error
+		for _, err := range v.lastSyncError {
+			if err != nil {
+				drainErrors = append(drainErrors, err)
+			}
+		}
+		stagedCount := len(v.stagedChunks)
+		if len(drainErrors) > 0 {
+			return fmt.Errorf("volume %s stop failed to drain %d staged chunks: %w", v.volumeID, stagedCount, errors.Join(drainErrors...))
+		}
+		return fmt.Errorf("volume %s stop failed to drain %d staged chunks", v.volumeID, stagedCount)
+	}
+	return nil
+}
+
+func (v *Volume) closeStagingLocked() bool {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+	v.stopping = true
+	v.stagingClosed = true
+	drained := !v.syncInProgress && len(v.stagedChunks) == 0
 	if v.coalesceTimer != nil {
 		v.coalesceTimer.Stop()
 		v.coalesceTimer = nil
@@ -1650,18 +1807,17 @@ func (v *Volume) Close() error {
 	if v.cancelUpload != nil {
 		v.cancelUpload()
 	}
-	v.stagingMu.Unlock()
+	return drained
+}
 
-	v.uploadWaitGroup.Wait()
-
-	v.stagingMu.Lock()
-	if removeErr := v.removeStagingDirLocked(); removeErr != nil {
-		klog.Warningf("failed removing staging directory: %v", removeErr)
-	}
-	v.syncCond.Broadcast()
-	v.stagingMu.Unlock()
-
+// Close closes the volume, local storage, and any underlying WAL streams.
+// Close never blocks on the object store or the WAL.
+func (v *Volume) Close() error {
 	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return nil
+	}
 	v.closed = true
 	if v.closedCh != nil {
 		select {
@@ -1672,6 +1828,16 @@ func (v *Volume) Close() error {
 	}
 	mView := v.metadataView
 	v.mu.Unlock()
+
+	drained := v.closeStagingLocked()
+	v.uploadWaitGroup.Wait()
+
+	v.stagingMu.Lock()
+	if removeErr := v.removeStagingDirLocked(); removeErr != nil {
+		klog.Warningf("failed removing staging directory: %v", removeErr)
+	}
+	v.syncCond.Broadcast()
+	v.stagingMu.Unlock()
 
 	var firstErr error
 	if mView != nil {
@@ -1685,7 +1851,9 @@ func (v *Volume) Close() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	v.assertStatsMatchLocked("at Close")
+	if drained {
+		v.assertStatsMatchLocked("at Close")
+	}
 
 	if err := v.stream.Close(); err != nil && firstErr == nil {
 		firstErr = err
@@ -2314,6 +2482,9 @@ func (v *Volume) GetAttr(ctx context.Context, inodeID uint64) (*pb.EntryAttr, er
 
 func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, atimeNow bool, mtime *time.Time, mtimeNow bool, ctime *time.Time, ctimeNow bool) (*pb.EntryAttr, error) {
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -2452,6 +2623,9 @@ func (v *Volume) SetXAttr(ctx context.Context, inodeID uint64, name string, valu
 	}
 
 	waitFn, attr, err := func() (func(context.Context) error, *pb.EntryAttr, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -2579,6 +2753,9 @@ func (v *Volume) RemoveXAttr(ctx context.Context, inodeID uint64, name string) e
 	}
 
 	waitFn, attr, err := func() (func(context.Context) error, *pb.EntryAttr, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -2790,6 +2967,9 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 	}
 
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -2920,6 +3100,9 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 	}
 
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -3249,6 +3432,9 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 	}
 
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -3377,6 +3563,9 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 	}
 
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -3884,6 +4073,7 @@ func (v *Volume) resetStagingDirLocked() error {
 func (v *Volume) uploadPackFile(ctx context.Context, packID uint64) (string, error) {
 	v.stagingMu.Lock()
 	info, ok := v.packs[packID]
+	closeContext := v.uploadContext
 	v.stagingMu.Unlock()
 	if !ok || info.pack == nil {
 		return "", fmt.Errorf("pack %d not found", packID)
@@ -3891,6 +4081,11 @@ func (v *Volume) uploadPackFile(ctx context.Context, packID uint64) (string, err
 	if v.blobStore == nil {
 		return "", nil
 	}
+	putContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopCancel := context.AfterFunc(closeContext, cancel)
+	defer stopCancel()
+
 	pack := info.pack
 	packPath := v.scratchPackPath(packID)
 	file, openErr := os.Open(packPath)
@@ -3911,7 +4106,7 @@ func (v *Volume) uploadPackFile(ctx context.Context, packID uint64) (string, err
 	packStream := blob.NewByteStreamFromFile(file, pack.ByteSize(), false)
 
 	uploadStartTime := time.Now()
-	if err := v.blobStore.PutPackFile(ctx, packKey, packStream, pack.Entries(), pack); err != nil {
+	if err := v.blobStore.PutPackFile(putContext, packKey, packStream, pack.Entries(), pack); err != nil {
 		errutil.CloseAndLog(packStream, "failed pack stream")
 		return packKey, fmt.Errorf("failed to upload sealed pack %s: %w", packKey, err)
 	}
@@ -4136,6 +4331,10 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	// To avoid holding stagingMu across backend GetBlob, check staged chunks under stagingMu,
 	// fetch missing base chunks outside stagingMu (and outside v.mu), then reacquire stagingMu.
 	v.stagingMu.Lock()
+	if err := v.rejectMutationLocked(); err != nil {
+		v.stagingMu.Unlock()
+		return 0, 0, time.Time{}, 0, err
+	}
 	if v.stagedBytes+dataLength > v.maxStagingBytes {
 		v.stagingMu.Unlock()
 		return 0, 0, time.Time{}, 0, syscall.ENOSPC
@@ -4188,6 +4387,9 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
 
+	if err := v.rejectMutationLocked(); err != nil {
+		return 0, 0, time.Time{}, 0, err
+	}
 	if v.stagedBytes+dataLength > v.maxStagingBytes {
 		return 0, 0, time.Time{}, 0, syscall.ENOSPC
 	}
@@ -4280,6 +4482,10 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 	v.mu.RUnlock()
 
 	v.stagingMu.Lock()
+	if err := v.rejectMutationLocked(); err != nil {
+		v.stagingMu.Unlock()
+		return nil, err
+	}
 	if chunks, ok := v.stagedChunks[inodeID]; ok {
 		cs := int64(v.chunkSize)
 		if cs == 0 {
@@ -4309,6 +4515,9 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 	v.stagingMu.Unlock()
 
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -4516,6 +4725,9 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 	}
 
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -4808,6 +5020,9 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 	v.stagingMu.Unlock()
 
 	waitFn, commitSeq, err := func() (func(context.Context) error, uint64, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, 0, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -4910,6 +5125,9 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (
 	}
 
 	waitFn, commitSeq, err := func() (func(context.Context) error, uint64, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, 0, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -5012,6 +5230,9 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 	}
 
 	attr, waitFn, err := func() (*pb.EntryAttr, func(context.Context) error, error) {
+		if err := v.rejectMutation(); err != nil {
+			return nil, nil, err
+		}
 		v.mu.Lock()
 		defer v.mu.Unlock()
 
@@ -5385,6 +5606,7 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 		}
 
 		waitReason = "staged_inode_sync"
+		v.syncTrigger = trigger
 		_, err := v.syncInodesLocked(barrierCtx, map[uint64]struct{}{inodeID: {}}, trigger)
 		v.stagingMu.Lock()
 		if err != nil {
@@ -5549,8 +5771,13 @@ func (v *Volume) flushToBackendLocked(ctx context.Context) error {
 
 func (v *Volume) FlushToBackend(ctx context.Context) error {
 	v.stagingMu.Lock()
+	if err := v.rejectMutationLocked(); err != nil {
+		v.stagingMu.Unlock()
+		return err
+	}
 	v.waitForSyncIdleLocked()
 	if len(v.stagedChunks) > 0 {
+		v.syncTrigger = pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED
 		if _, err := v.executeSyncLocked(ctx, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED, false, nil); err != nil {
 			return err
 		}

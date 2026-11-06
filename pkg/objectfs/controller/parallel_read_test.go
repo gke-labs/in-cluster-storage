@@ -83,7 +83,6 @@ func TestParallelReadFile_SleepingBackend(t *testing.T) {
 	sleepDur := 60 * time.Millisecond
 	rawBackend := newSleepingBackend(NewMemoryBackend(), sleepDur)
 	server := NewTestServer(t, rawBackend)
-	defer func() { _ = server.Close() }()
 
 	volumeID := "test-parallel-read-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
@@ -164,11 +163,6 @@ func TestParallelReadFile_DropVolumeLockDuringBlobIO(t *testing.T) {
 	release := make(chan struct{})
 	rawBackend := newGatedGetBackend(NewMemoryBackend(), entered, release)
 	server := NewTestServer(t, rawBackend)
-	defer func() {
-		if closeError := server.Close(); closeError != nil {
-			t.Errorf("server.Close failed: %v", closeError)
-		}
-	}()
 
 	volumeID := "test-lock-drop-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
@@ -263,11 +257,6 @@ func TestWriteFileWithEpoch_DoesNotHoldStagingMuDuringBaseChunkGet(t *testing.T)
 	release := make(chan struct{})
 	rawBackend := newGatedGetBackend(NewMemoryBackend(), entered, release)
 	server := NewTestServer(t, rawBackend)
-	defer func() {
-		if closeError := server.Close(); closeError != nil {
-			t.Errorf("server.Close failed: %v", closeError)
-		}
-	}()
 
 	volumeID := "test-staging-lock-drop-vol"
 	vol, err := server.getOrCreateVolume(volumeID)

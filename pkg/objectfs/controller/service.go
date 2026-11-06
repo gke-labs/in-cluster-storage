@@ -125,6 +125,13 @@ func volInitError(err error) error {
 	return status.Errorf(codes.Internal, "%v", err)
 }
 
+func checkRPCErr(err error) error {
+	if errors.Is(err, ErrVolumeStopping) {
+		return status.Errorf(codes.Unavailable, "%v", err)
+	}
+	return nil
+}
+
 type Server struct {
 	pb.UnimplementedObjectFSControllerServer
 	mu          sync.RWMutex
@@ -553,8 +560,23 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	return volume, nil
 }
 
-// Close stops periodic flushing and closes all active volumes and streams.
-func (s *Server) Close() error {
+func (s *Server) stopVolumes(ctx context.Context, volumes []*Volume) []error {
+	stopErrors := make([]error, len(volumes))
+	var waitGroup sync.WaitGroup
+	for index, volume := range volumes {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			stopErrors[index] = volume.Stop(ctx)
+		}()
+	}
+	waitGroup.Wait()
+	return stopErrors
+}
+
+// Shutdown gracefully stops periodic flushing, drains all volumes concurrently
+// under ctx, and closes all active volumes and streams.
+func (s *Server) Shutdown(ctx context.Context) error {
 	var errs []error
 	var ran bool
 	s.closeOnce.Do(func() {
@@ -562,6 +584,19 @@ func (s *Server) Close() error {
 		if err := s.StopPeriodicFlush(); err != nil {
 			errs = append(errs, err)
 		}
+		s.mu.Lock()
+		volumes := make([]*Volume, 0, len(s.volumes))
+		for _, volume := range s.volumes {
+			volumes = append(volumes, volume)
+		}
+		s.mu.Unlock()
+
+		for _, err := range s.stopVolumes(ctx, volumes) {
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		for _, volume := range s.volumes {
@@ -804,6 +839,9 @@ func (s *Server) SetAttr(ctx context.Context, req *pb.SetAttrRequest) (*pb.SetAt
 	}
 	if req.Size != nil {
 		if _, err := vol.TruncateFile(ctx, req.GetInode(), req.GetSize()); err != nil {
+			if rpcErr := checkRPCErr(err); rpcErr != nil {
+				return nil, rpcErr
+			}
 			return &pb.SetAttrResponse{Error: volErrToSyscall(err)}, nil
 		}
 	}
@@ -824,6 +862,9 @@ func (s *Server) SetAttr(ctx context.Context, req *pb.SetAttrRequest) (*pb.SetAt
 
 	attr, err := vol.SetAttr(ctx, req.GetInode(), req.Mode, req.Uid, req.Gid, atime, req.GetAtimeNow(), mtime, req.GetMtimeNow(), ctime, req.GetCtimeNow())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.SetAttrResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.SetAttrResponse{Attr: attr}, nil
@@ -869,6 +910,9 @@ func (s *Server) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MkdirResp
 	}
 	attr, err := vol.Mkdir(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetUid(), req.GetGid())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.MkdirResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.MkdirResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
@@ -884,6 +928,9 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 	}
 	attr, err := vol.CreateFile(ctx, req.GetParentInode(), req.GetName(), req.GetMode(), req.GetInitialContent(), req.GetUid(), req.GetGid(), req.GetRdev())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 	fh := vol.AllocFh(attr.GetInode().GetIno())
@@ -922,6 +969,9 @@ func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*pb.W
 	}
 	bytesWritten, newSize, modTime, stagingEpoch, err := vol.WriteFileWithEpoch(ctx, req.GetInode(), req.GetOffset(), req.GetData(), req.GetWriteMode())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.WriteFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.WriteFileResponse{
@@ -943,6 +993,9 @@ func (s *Server) TruncateFile(ctx context.Context, req *pb.TruncateFileRequest) 
 	}
 	attr, err := vol.TruncateFile(ctx, req.GetInode(), req.GetSize())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.TruncateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.TruncateFileResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
@@ -958,6 +1011,9 @@ func (s *Server) PunchHole(ctx context.Context, req *pb.PunchHoleRequest) (*pb.P
 	}
 	attr, err := vol.PunchHole(ctx, req.GetInode(), req.GetOffset(), req.GetLength(), req.GetKeepSize())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.PunchHoleResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.PunchHoleResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
@@ -973,6 +1029,9 @@ func (s *Server) Unlink(ctx context.Context, req *pb.UnlinkRequest) (*pb.UnlinkR
 	}
 	pos, err := vol.Unlink(ctx, req.GetParentInode(), req.GetName())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.UnlinkResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.UnlinkResponse{Success: true, StreamPosition: pos}, nil
@@ -988,6 +1047,9 @@ func (s *Server) Rmdir(ctx context.Context, req *pb.RmdirRequest) (*pb.RmdirResp
 	}
 	pos, err := vol.Rmdir(ctx, req.GetParentInode(), req.GetName())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.RmdirResponse{Success: false, Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.RmdirResponse{Success: true, StreamPosition: pos}, nil
@@ -1003,6 +1065,9 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	}
 	attr, err := vol.Rename(ctx, req.GetOldParentInode(), req.GetOldName(), req.GetNewParentInode(), req.GetNewName())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.RenameResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.RenameResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
@@ -1018,6 +1083,9 @@ func (s *Server) Fsync(ctx context.Context, req *pb.FsyncRequest) (*pb.FsyncResp
 	}
 	stagingEpoch, pos, err := vol.FsyncWithEpoch(ctx, req.GetInode(), req.GetBlocking(), req.GetStagingEpoch(), req.GetTrigger())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.FsyncResponse{Success: false, Error: volErrToSyscall(err), StagingEpoch: stagingEpoch, StreamPosition: pos}, nil
 	}
 	return &pb.FsyncResponse{Success: true, StagingEpoch: stagingEpoch, StreamPosition: pos}, nil
@@ -1033,6 +1101,9 @@ func (s *Server) Symlink(ctx context.Context, req *pb.SymlinkRequest) (*pb.Symli
 	}
 	attr, err := vol.Symlink(ctx, req.GetParentInode(), req.GetName(), req.GetTarget(), req.GetUid(), req.GetGid())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.SymlinkResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.SymlinkResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
@@ -1063,6 +1134,9 @@ func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkRespons
 	}
 	attr, err := vol.Link(ctx, req.GetOldInode(), req.GetNewParentInode(), req.GetNewName())
 	if err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.LinkResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.LinkResponse{Attr: attr, StreamPosition: attr.GetStreamPosition()}, nil
@@ -1121,6 +1195,9 @@ func (s *Server) SetXAttr(ctx context.Context, req *pb.SetXAttrRequest) (*pb.Set
 		return nil, volInitError(err)
 	}
 	if err := vol.SetXAttr(ctx, req.GetInode(), req.GetName(), req.GetValue(), req.GetFlags()); err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.SetXAttrResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.SetXAttrResponse{}, nil
@@ -1150,6 +1227,9 @@ func (s *Server) RemoveXAttr(ctx context.Context, req *pb.RemoveXAttrRequest) (*
 		return nil, volInitError(err)
 	}
 	if err := vol.RemoveXAttr(ctx, req.GetInode(), req.GetName()); err != nil {
+		if rpcErr := checkRPCErr(err); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return &pb.RemoveXAttrResponse{Error: volErrToSyscall(err)}, nil
 	}
 	return &pb.RemoveXAttrResponse{}, nil

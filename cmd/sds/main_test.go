@@ -332,7 +332,13 @@ func TestSdsCatObjectFSStream(t *testing.T) {
 	volumeID := "cat-test-vol"
 
 	server := controllertest.NewTestServer(backend, controller.WithServerTempWALDir(walDir))
-	defer func() { _ = server.Close() }()
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			t.Errorf("server.Shutdown failed: %v", err)
+		}
+	}()
 
 	_, err := server.Mkdir(ctx, &objectfspb.MkdirRequest{VolumeId: volumeID, ParentInode: 1, Name: "cats", Mode: 0755})
 	if err != nil {

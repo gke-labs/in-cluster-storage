@@ -69,7 +69,6 @@ func TestController_UnversionedUpgrade(t *testing.T) {
 		WithServerWALDialOptions(bt.DialOpts...),
 		WithServerAcceptUnversioned(true),
 	)
-	defer srv.Close()
 
 	vol, err := srv.getOrCreateVolume("vol-legacy")
 	if err != nil {

@@ -19,6 +19,7 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -3950,7 +3951,9 @@ func TestPushDirtyChunksToStaging_DrainAndRetryOnInitialENOSPC(t *testing.T) {
 		_ = conn.Close()
 		grpcServer.Stop()
 		_ = lis.Close()
-		_ = server.Close()
+		if err := server.Shutdown(t.Context()); err != nil {
+			t.Errorf("server.Shutdown failed: %v", err)
+		}
 	}()
 
 	client := pb.NewObjectFSControllerClient(conn)
@@ -4685,7 +4688,11 @@ func TestDirtyReadSurvivesControllerRestartWhileSyncInFlight(t *testing.T) {
 
 	// 5. Controller 1 crashes/stops while sync is in flight (Fsync was never completed/acked)
 	grpcServer1.Stop()
-	_ = ctrl1.Close()
+	crashCtx, crashCancel := context.WithCancel(ctx)
+	crashCancel()
+	if err := ctrl1.Shutdown(crashCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected ctrl1.Shutdown to return context.Canceled on crash, got: %v", err)
+	}
 	_ = lis1.Close()
 
 	// 6. Controller 2 starts on the same backend & wal-buffer (uncommitted staged chunks lost)
@@ -4700,7 +4707,9 @@ func TestDirtyReadSurvivesControllerRestartWhileSyncInFlight(t *testing.T) {
 	go func() { _ = grpcServer2.Serve(lis2) }()
 	defer func() {
 		grpcServer2.Stop()
-		_ = ctrl2.Close()
+		if err := ctrl2.Shutdown(t.Context()); err != nil {
+			t.Errorf("ctrl2.Shutdown failed: %v", err)
+		}
 	}()
 
 	lisMu.Lock()
@@ -7189,7 +7198,11 @@ func TestCloseToOpen_TwoNodeReaderCacheInvalidation(t *testing.T) {
 	ctx := t.Context()
 	backend := controller.NewMemoryBackend()
 	ctrlServer := controllertest.NewTestServer(backend)
-	defer func() { _ = ctrlServer.Close() }()
+	defer func() {
+		if err := ctrlServer.Shutdown(t.Context()); err != nil {
+			t.Errorf("ctrlServer.Shutdown failed: %v", err)
+		}
+	}()
 
 	volumeID := "test-c2o-unit-vol"
 	vol, err := ctrlServer.GetVolume(volumeID)

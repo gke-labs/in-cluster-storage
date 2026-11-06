@@ -908,7 +908,13 @@ func TestVolumesRepairAndDegradedDisplay(t *testing.T) {
 			return nil, fmt.Errorf("unknown volume %s", volID)
 		}),
 	)
-	defer server.Close()
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			t.Errorf("server.Shutdown failed: %v", err)
+		}
+	}()
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterObjectFSControllerServer(grpcServer, server)

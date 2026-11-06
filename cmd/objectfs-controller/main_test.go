@@ -140,6 +140,22 @@ func TestOpenBarrierTimeoutFlag(t *testing.T) {
 	}
 }
 
+func TestShutdownTimeoutFlag(t *testing.T) {
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	options.AddFlags(flagSet)
+	flagOption := flagSet.Lookup("shutdown-timeout")
+	if flagOption == nil {
+		t.Fatal("flag --shutdown-timeout not registered")
+	}
+	if flagOption.DefValue != "20s" {
+		t.Errorf("default value = %q, want 20s", flagOption.DefValue)
+	}
+	if options.ShutdownTimeout != 20*time.Second {
+		t.Errorf("options.ShutdownTimeout = %v, want 20s", options.ShutdownTimeout)
+	}
+}
+
 func TestOptionsParseAndValidate(t *testing.T) {
 	options := NewOptions()
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -179,6 +195,7 @@ func TestOptionsParseAndValidate(t *testing.T) {
 		{"missing wal target", func(o *Options) { o.WALTarget = "" }, "--wal-target"},
 		{"invalid metadata index", func(o *Options) { o.MetadataIndex = "memory" }, "accepted values"},
 		{"invalid csi endpoint", func(o *Options) { o.CSIEndpoint = "http://invalid" }, "invalid endpoint"},
+		{"non-positive shutdown timeout", func(o *Options) { o.ShutdownTimeout = 0 }, "--shutdown-timeout"},
 	}
 
 	for _, testCase := range tests {

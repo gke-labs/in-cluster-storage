@@ -17,10 +17,12 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"os"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
@@ -67,11 +69,18 @@ func NewTestServer(t testing.TB, backend ObjectStorageBackend, opts ...ServerOpt
 	}
 
 	t.Cleanup(func() {
-		if err := server.Close(); err != nil {
-			t.Errorf("server.Close failed on test cleanup: %v", err)
-		}
+		shutdownTestServer(t, server)
 	})
 	return server
+}
+
+func shutdownTestServer(t testing.TB, server *Server) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Errorf("server.Shutdown failed: %v", err)
+	}
 }
 
 func TestNewTestServer_CleanupWaitsForBufferLoops(t *testing.T) {

@@ -459,9 +459,9 @@ func TestRegression_ShutdownFlushFailureSurfacedInClose(t *testing.T) {
 	// Inject backend failure
 	backend.failPut.Store(true)
 
-	// Close must return error so controller exits non-zero on failed final flush
-	if err := server.Close(); err == nil {
-		t.Fatal("expected server.Close() to fail when final flush fails, got nil")
+	// Shutdown must return error so controller exits non-zero on failed final flush
+	if err := server.Shutdown(t.Context()); err == nil {
+		t.Fatal("expected server.Shutdown() to fail when final flush fails, got nil")
 	}
 }
 
@@ -474,7 +474,7 @@ func (s *failingCloseStream) Close() error {
 	return s.closeErr
 }
 
-func TestServer_Close_ReturnsAllErrorsJoined(t *testing.T) {
+func TestServer_Shutdown_ReturnsAllErrorsJoined(t *testing.T) {
 	volumeA := &Volume{
 		stream: &failingCloseStream{closeErr: errors.New("volume a close failed")},
 	}
@@ -492,9 +492,9 @@ func TestServer_Close_ReturnsAllErrorsJoined(t *testing.T) {
 		},
 	}
 
-	err := server.Close()
+	err := server.Shutdown(t.Context())
 	if err == nil {
-		t.Fatal("expected server.Close() to fail, got nil")
+		t.Fatal("expected server.Shutdown() to fail, got nil")
 	}
 	if !strings.Contains(err.Error(), "volume a close failed") {
 		t.Errorf("expected error to contain %q, got: %v", "volume a close failed", err)
@@ -503,7 +503,7 @@ func TestServer_Close_ReturnsAllErrorsJoined(t *testing.T) {
 		t.Errorf("expected error to contain %q, got: %v", "volume b close failed", err)
 	}
 
-	if err := server.Close(); err != nil {
-		t.Errorf("expected subsequent server.Close() to return nil, got: %v", err)
+	if err := server.Shutdown(t.Context()); err != nil {
+		t.Errorf("expected subsequent server.Shutdown() to return nil, got: %v", err)
 	}
 }

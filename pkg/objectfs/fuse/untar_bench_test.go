@@ -67,7 +67,13 @@ func TestUntarPackCounts(t *testing.T) {
 		rawBackend := controller.NewMemoryBackend()
 		backend := &untarCountingBackend{ObjectStorageBackend: rawBackend}
 		server := controllertest.NewTestServer(backend)
-		defer func() { _ = server.Close() }()
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+			defer shutdownCancel()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				t.Errorf("server.Shutdown failed: %v", err)
+			}
+		}()
 
 		lis := bufconn.Listen(4 * 1024 * 1024)
 		grpcServer := grpc.NewServer()

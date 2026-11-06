@@ -1302,7 +1302,7 @@ func TestUnpublishExclusiveLocal_ReplayFailurePreservesHoldUntilRetrySucceeds(t 
 func TestMaterialiseVolume_XAttrs(t *testing.T) {
 	ctx := t.Context()
 	server := controllertest.NewTestServer(nil)
-	defer func() { _ = server.Close() }()
+	defer shutdownTestServer(t, server)
 	volumeID := "test-mat-xattr-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -1406,7 +1406,7 @@ func TestMaterialiseVolume_XAttrs(t *testing.T) {
 func TestMaterialiseVolume_FailingSetXAttrReturnsError(t *testing.T) {
 	ctx := t.Context()
 	server := controllertest.NewTestServer(nil)
-	defer func() { _ = server.Close() }()
+	defer shutdownTestServer(t, server)
 	volumeID := "test-mat-fail-xattr-vol"
 
 	lis := bufconn.Listen(1024 * 1024)
@@ -1471,5 +1471,14 @@ func TestMaterialiseVolume_FailingSetXAttrReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "setxattr") || !strings.Contains(err.Error(), "user.test_attr") || !strings.Contains(err.Error(), "file.txt") {
 		t.Errorf("expected error naming path and attribute, got: %v", err)
+	}
+}
+
+func shutdownTestServer(t testing.TB, server *controller.Server) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Errorf("server.Shutdown failed: %v", err)
 	}
 }

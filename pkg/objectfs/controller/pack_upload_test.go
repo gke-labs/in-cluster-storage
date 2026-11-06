@@ -75,12 +75,6 @@ func TestSync_WaitsForInFlightUpload(t *testing.T) {
 	backend := newRecordingBackend(NewMemoryBackend())
 	backend.setGate(gateEntered, gateRelease)
 	server := NewTestServer(t, backend)
-	defer func() {
-		if closeError := server.Close(); closeError != nil {
-			t.Errorf("server.Close failed: %v", closeError)
-		}
-	}()
-
 	volumeID := "test-sync-wait-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
 	if err != nil {
@@ -139,12 +133,6 @@ func TestSync_FailedBackgroundUploadRetriedBySync(t *testing.T) {
 	t.Run("retry succeeds", func(t *testing.T) {
 		backend := newRecordingBackend(NewMemoryBackend())
 		server := NewTestServer(t, backend)
-		defer func() {
-			if closeError := server.Close(); closeError != nil {
-				t.Errorf("server.Close failed: %v", closeError)
-			}
-		}()
-
 		volumeID := "test-fail-retry-success-vol"
 		vol, err := server.getOrCreateVolume(volumeID)
 		if err != nil {
@@ -207,12 +195,6 @@ func TestSync_FailedBackgroundUploadRetriedBySync(t *testing.T) {
 	t.Run("retry fails and surfaces", func(t *testing.T) {
 		backend := newRecordingBackend(NewMemoryBackend())
 		server := NewTestServer(t, backend)
-		defer func() {
-			if closeError := server.Close(); closeError != nil {
-				t.Errorf("server.Close failed: %v", closeError)
-			}
-		}()
-
 		volumeID := "test-fail-retry-surfaces-vol"
 		vol, err := server.getOrCreateVolume(volumeID)
 		if err != nil {
@@ -268,12 +250,6 @@ func TestEviction_SkipsUploadingPacks(t *testing.T) {
 	backend := newRecordingBackend(NewMemoryBackend())
 	backend.setGate(gateEntered, gateRelease)
 	server := NewTestServer(t, backend)
-	defer func() {
-		if closeError := server.Close(); closeError != nil {
-			t.Errorf("server.Close failed: %v", closeError)
-		}
-	}()
-
 	volumeID := "test-evict-skip-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
 	if err != nil {
@@ -325,12 +301,6 @@ func TestSync_DoesNotPayForPacksSealedEarlier(t *testing.T) {
 	ctx := t.Context()
 	backend := newRecordingBackend(NewMemoryBackend())
 	server := NewTestServer(t, backend)
-	defer func() {
-		if closeError := server.Close(); closeError != nil {
-			t.Errorf("server.Close failed: %v", closeError)
-		}
-	}()
-
 	volumeID := "test-sync-early-sealed-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
 	if err != nil {

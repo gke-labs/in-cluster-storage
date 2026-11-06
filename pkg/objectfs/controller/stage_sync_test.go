@@ -155,7 +155,7 @@ func TestStageAndSync_SinglePackMultiInode(t *testing.T) {
 	backend := newRecordingBackend(rawBackend)
 	server := NewTestServer(t, backend)
 	volumeID := "test-single-pack-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	const numFiles = 5
 	const chunksPerFile = 4
@@ -251,7 +251,7 @@ func TestStageAndSync_CrossNodeVisibility(t *testing.T) {
 	ctx := t.Context()
 	server := NewTestServer(t, NewMemoryBackend())
 	volumeID := "test-cross-node-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	initialContent := []byte("hello-initial-content")
 	createResp, err := testCreateFile(ctx, server, volumeID, "/shared.txt", 0644, initialContent, 0, 0)
@@ -349,12 +349,11 @@ func TestStageAndSync_ControllerCrashBeforeSyncRePush(t *testing.T) {
 	oldEpoch := wResp1.GetStagingEpoch()
 
 	// Simulate crash of server1 (close without fsync)
-	_ = server1.Close()
+	shutdownTestServer(t, server1)
 
 	// Server 2 starts up (new controller instance with same backend & wal-buffer)
 	clientDir2 := t.TempDir()
 	server2 := NewTestServer(t, backend, WithServerWAL(clientDir2, target, walclient.Witness))
-	defer func() { _ = server2.Close() }()
 
 	// Client calls Fsync using oldEpoch: must fail with ESTALE
 	fsyncResp1, err := server2.Fsync(ctx, &pb.FsyncRequest{
@@ -415,7 +414,7 @@ func TestStageAndSync_TruncateComposition(t *testing.T) {
 	ctx := t.Context()
 	server := NewTestServer(t, NewMemoryBackend())
 	volumeID := "test-trunc-comp-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	const cs = 64 * 1024
 
@@ -540,7 +539,7 @@ func TestStageAndSync_CoalesceWindowBurst(t *testing.T) {
 	backend := newRecordingBackend(rawBackend)
 	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(200*time.Millisecond))
 	volumeID := "test-coalesce-burst-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	const numFiles = 10
 	var wg sync.WaitGroup
@@ -601,7 +600,7 @@ func TestStageAndSync_BlockingFsyncPreemptsCoalesceWindow(t *testing.T) {
 	// Long coalesce window (5 seconds)
 	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(5*time.Second))
 	volumeID := "test-preempt-window-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	// File 1 writes and issues non-blocking sync
 	cResp1, _ := testCreateFile(ctx, server, volumeID, "/file1.bin", 0644, nil, 0, 0)
@@ -658,7 +657,7 @@ func TestStageAndSync_CloseTriggerStartsCoalescedSyncImmediately(t *testing.T) {
 	backend := newRecordingBackend(rawBackend)
 	// 10s coalesce window so any difference is unambiguous
 	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(10*time.Second))
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	// 1. Periodic non-blocking Fsync: must wait for the coalesce window
 	volPeriodic := "vol-periodic-wait"
@@ -733,7 +732,7 @@ func TestStageAndSync_CloseTriggerPreemptsActiveWindow(t *testing.T) {
 	// 10s coalesce window so any difference is unambiguous
 	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(10*time.Second))
 	volumeID := "test-close-preempt-window-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	// File 1 writes and issues non-blocking CLOSE sync (starts floor window)
 	cResp1, _ := testCreateFile(ctx, server, volumeID, "/file1.bin", 0644, nil, 0, 0)
@@ -813,7 +812,7 @@ func TestStageAndSync_TenConcurrentCloseRequestsCoalesceIntoOnePack(t *testing.T
 	backend := newRecordingBackend(rawBackend)
 	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(10*time.Second))
 	volumeID := "test-ten-concurrent-close-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	const numFiles = 10
 	inodes := make([]uint64, numFiles)
@@ -879,7 +878,7 @@ func TestStageAndSync_CloseTriggerSyncsOnlyClosedInodeLeavesStagedWindow(t *test
 	// 500ms coalesce window so the periodic window sync fires without a long delay
 	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(500*time.Millisecond))
 	volumeID := "test-close-per-inode-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	// 1. Inode B stages a large write (256 KiB) and issues non-blocking periodic Fsync
 	cRespB, _ := testCreateFile(ctx, server, volumeID, "/fileB.bin", 0644, nil, 0, 0)
@@ -992,7 +991,7 @@ func TestStageAndSync_NonBlockingSyncFailureSurfacesOnBlockingFsync(t *testing.T
 	backend := newRecordingBackend(rawBackend)
 	server := NewTestServer(t, backend, WithServerSyncCoalesceWindow(50*time.Millisecond))
 	volumeID := "test-error-surface-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	cResp, _ := testCreateFile(ctx, server, volumeID, "/err_file.bin", 0644, nil, 0, 0)
 	ino := cResp.GetAttr().GetInode().GetIno()
@@ -1033,7 +1032,7 @@ func TestStageAndSync_MaxStagingBytesEnforced(t *testing.T) {
 	ctx := t.Context()
 	server := NewTestServer(t, NewMemoryBackend(), WithServerMaxStagingBytes(128*1024))
 	volumeID := "test-staging-cap-vol"
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	cResp, _ := testCreateFile(ctx, server, volumeID, "/cap.bin", 0644, nil, 0, 0)
 	ino := cResp.GetAttr().GetInode().GetIno()
@@ -1090,7 +1089,6 @@ func TestStageAndSync_EmptyCoalesceTimerFireDoesNotDeadlock(t *testing.T) {
 
 	s := NewTestServer(t, NewMemoryBackend(), WithServerSyncCoalesceWindow(50*time.Millisecond))
 	vol := "test-empty-coalesce-vol"
-	defer func() { _ = s.Close() }()
 
 	cResp, err := testCreateFile(ctx, s, vol, "/tmpfile", 0644, nil, 0, 0)
 	if err != nil {
@@ -1157,7 +1155,6 @@ func TestStageAndSync_NonBlockingSyncWaiterNotAcknowledgedByEarlierSync(t *testi
 	}
 	s := NewTestServer(t, gateBackend, WithServerSyncCoalesceWindow(50*time.Millisecond))
 	vol := "test-waiter-seq-vol"
-	defer func() { _ = s.Close() }()
 
 	// 1. Stage file 1
 	c1, _ := testCreateFile(ctx, s, vol, "/file1.bin", 0644, nil, 0, 0)
@@ -1257,12 +1254,11 @@ func TestFsyncDurability_WithWAL_DurableAcrossRestart(t *testing.T) {
 	}
 
 	// 3. Crash restart: close server1 without FlushAll
-	_ = server1.Close()
+	shutdownTestServer(t, server1)
 
 	// 4. Recover on server2 from backend + WAL
 	clientDir2 := t.TempDir()
 	server2 := NewTestServer(t, backend, WithServerWAL(clientDir2, target, walclient.Witness))
-	defer func() { _ = server2.Close() }()
 
 	readResp2, err := testReadFile(ctx, server2, volumeID, "/f", 0, 1024)
 	if err != nil || readResp2.GetError() != 0 {
@@ -1296,7 +1292,7 @@ func TestOpenBarrier_StagedInodeBlocksAndReturnsFreshAttrs(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend)
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-barrier-staged-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
@@ -1367,7 +1363,7 @@ func TestOpenBarrier_CleanInodeDoesNotBlock(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend)
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-barrier-clean-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
@@ -1433,7 +1429,7 @@ func TestOpenBarrier_TimeoutReturnsEIO(t *testing.T) {
 	server := NewTestServer(t, blockingBackend, WithServerOpenBarrierTimeout(50*time.Millisecond))
 	defer func() {
 		close(blockingBackend.blockCh)
-		_ = server.Close()
+		shutdownTestServer(t, server)
 	}()
 
 	volumeID := "test-barrier-timeout-vol"
@@ -1488,9 +1484,7 @@ func TestOpenBarrier_WaitsOnInFlightSync(t *testing.T) {
 		default:
 			close(blockingBackend.blockCh)
 		}
-		if err := server.Close(); err != nil {
-			t.Logf("server.Close failed: %v", err)
-		}
+		shutdownTestServer(t, server)
 	}()
 
 	volumeID := "test-barrier-wait-inflight-vol"
@@ -1600,7 +1594,7 @@ func TestOpenBarrier_DegradedReturnsEIOImmediately(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend)
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-barrier-degraded-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
@@ -1659,7 +1653,7 @@ func TestWatchVolume_ConflictingConsistencyModeRejected(t *testing.T) {
 	ctx := t.Context()
 	backend := NewMemoryBackend()
 	server := NewTestServer(t, backend)
-	defer func() { _ = server.Close() }()
+	defer func() { shutdownTestServer(t, server) }()
 
 	volumeID := "test-watch-conflict-vol"
 	vol, err := server.getOrCreateVolume(volumeID)
@@ -1777,9 +1771,7 @@ func TestOpenBarrier_SurvivesControllerRestartOverSameMetadataDir(t *testing.T) 
 	if err := vol1.FlushOverlay(ctx); err != nil {
 		t.Fatalf("FlushOverlay failed on server1: %v", err)
 	}
-	if err := server1.Close(); err != nil {
-		t.Fatalf("server1.Close failed: %v", err)
-	}
+	shutdownTestServer(t, server1)
 
 	// 2. Controller 2 starts with same metadataDir over the same backend
 	server2 := NewTestServer(t, backend,
@@ -1788,7 +1780,6 @@ func TestOpenBarrier_SurvivesControllerRestartOverSameMetadataDir(t *testing.T) 
 		WithServerWAL(walDir, bt.Target, walclient.Witness),
 		WithServerWALDialOptions(bt.DialOpts...),
 	)
-	defer func() { _ = server2.Close() }()
 
 	vol2, err := server2.getOrCreateVolume(volumeID)
 	if err != nil {
@@ -1983,9 +1974,7 @@ func TestStageAndSync_ScratchOpenPack_RestartClearsScratchAndBumpsEpoch(t *testi
 	writePayload := bytes.Repeat([]byte("staged-not-synced-"), 1000)
 	oldEpoch := helper.write(0, writePayload)
 
-	if err := helper.server.Close(); err != nil {
-		t.Errorf("helper.server.Close failed: %v", err)
-	}
+	shutdownTestServer(t, helper.server)
 	createScratchRemnant(t, helper.scratchDirectory)
 
 	server2 := NewTestServer(t, helper.backend, WithServerMetadataDir(helper.metadataDirectory))
@@ -2033,9 +2022,7 @@ func TestStagedPackRetainedUntilAllReferencingInodesCommit(t *testing.T) {
 	server := NewTestServer(t, rawBackend, WithServerMaxStagingBytes(64*1024*1024))
 	volumeID := "test-pack-retention-vol"
 	defer func() {
-		if closeErr := server.Close(); closeErr != nil {
-			t.Errorf("server.Close failed: %v", closeErr)
-		}
+		shutdownTestServer(t, server)
 	}()
 
 	volume, err := server.getOrCreateVolume(volumeID)
@@ -2157,9 +2144,7 @@ func TestPackObjectKeysDistinctAcrossRestart(t *testing.T) {
 	server := NewTestServer(t, backend, WithServerMaxStagingBytes(64*1024*1024))
 	volumeID := "test-distinct-keys-vol"
 	defer func() {
-		if closeErr := server.Close(); closeErr != nil {
-			t.Errorf("server.Close failed: %v", closeErr)
-		}
+		shutdownTestServer(t, server)
 	}()
 
 	volume, err := server.getOrCreateVolume(volumeID)
@@ -2349,11 +2334,6 @@ func TestSync_SingleDurabilityWaitPerCommit(t *testing.T) {
 				}),
 				WithServerDurability(testCase.durability),
 			)
-			defer func() {
-				if err := server.Close(); err != nil {
-					t.Errorf("server.Close failed: %v", err)
-				}
-			}()
 
 			volumeID := "test-single-wait-" + strings.ToLower(testCase.name)
 			createResponse, err := testCreateFile(ctx, server, volumeID, "/multi_chunk.bin", 0644, nil, 0, 0)
@@ -2509,11 +2489,6 @@ func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
 	backend := newRecordingBackend(rawBackend)
 	server := NewTestServer(t, backend, WithServerMaxStagingBytes(64*1024*1024))
 	volumeID := "test-c2o-repro-vol"
-	t.Cleanup(func() {
-		if closeError := server.Close(); closeError != nil {
-			t.Errorf("server.Close failed: %v", closeError)
-		}
-	})
 
 	volume, err := server.getOrCreateVolume(volumeID)
 	if err != nil {
@@ -2640,5 +2615,435 @@ func TestCloseToOpen_MultiChunkBarrierRepro(t *testing.T) {
 	}
 	if !bytes.Equal(readResponse.GetData(), data[:1024]) {
 		t.Fatalf("ReadFile content mismatch on committed multi-chunk file")
+	}
+}
+
+func TestVolume_Stop_TimesOutAndIsRetryable(t *testing.T) {
+	ctx := t.Context()
+	memoryBackend := NewMemoryBackend()
+	backend := newRecordingBackend(memoryBackend)
+	server := NewTestServer(t, backend, WithServerSyncTimeout(50*time.Millisecond))
+	volumeID := "test-stop-timeout-vol"
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	createResponse, err := testCreateFile(ctx, server, volumeID, "/test.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	data := []byte("staged write data")
+	if _, _, _, _, writeError := volume.WriteFileWithEpoch(ctx, inodeID, 0, data, pb.WriteMode_FSYNC); writeError != nil {
+		t.Fatalf("WriteFile failed: %v", writeError)
+	}
+
+	gateEntered := make(chan struct{}, 1)
+	gateRelease := make(chan struct{})
+	backend.setGate(gateEntered, gateRelease)
+	var gateReleaseOnce sync.Once
+	t.Cleanup(func() {
+		gateReleaseOnce.Do(func() {
+			close(gateRelease)
+		})
+	})
+
+	syncDone := make(chan error, 1)
+	go func() {
+		syncDone <- volume.Fsync(ctx, inodeID)
+	}()
+
+	select {
+	case <-gateEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for pack upload to reach storage gate")
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer stopCancel()
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- volume.Stop(stopCtx)
+	}()
+
+	var stopError error
+	select {
+	case stopError = <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for volume.Stop")
+	}
+
+	if !errors.Is(stopError, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got: %v", stopError)
+	}
+
+	if _, _, _, _, writeError := volume.WriteFileWithEpoch(ctx, inodeID, 0, []byte("post-stop data"), pb.WriteMode_FSYNC); !errors.Is(writeError, ErrVolumeStopping) {
+		t.Fatalf("expected ErrVolumeStopping on post-stop write, got: %v", writeError)
+	}
+
+	gateReleaseOnce.Do(func() {
+		close(gateRelease)
+	})
+
+	select {
+	case syncErr := <-syncDone:
+		if syncErr != nil {
+			t.Fatalf("in-flight sync failed after release: %v", syncErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync goroutine left parked after backend release")
+	}
+
+	secondStopCtx, secondStopCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer secondStopCancel()
+	if secondStopError := volume.Stop(secondStopCtx); secondStopError != nil {
+		t.Fatalf("expected second Stop to return nil, got: %v", secondStopError)
+	}
+
+	if closeError := volume.Close(); closeError != nil {
+		t.Fatalf("expected Close to return nil, got: %v", closeError)
+	}
+}
+
+func TestVolume_Close_WithoutStopCancelsParkedSync(t *testing.T) {
+	ctx := t.Context()
+	memoryBackend := NewMemoryBackend()
+	backend := newRecordingBackend(memoryBackend)
+	server := NewTestServer(t, backend, WithServerSyncTimeout(50*time.Millisecond))
+	volumeID := "test-close-without-stop-vol"
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	createResponse, err := testCreateFile(ctx, server, volumeID, "/test.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	data := []byte("staged write data")
+	if _, _, _, _, writeError := volume.WriteFileWithEpoch(ctx, inodeID, 0, data, pb.WriteMode_FSYNC); writeError != nil {
+		t.Fatalf("WriteFile failed: %v", writeError)
+	}
+
+	gateEntered := make(chan struct{}, 1)
+	gateRelease := make(chan struct{})
+	backend.setGate(gateEntered, gateRelease)
+	var gateReleaseOnce sync.Once
+	t.Cleanup(func() {
+		gateReleaseOnce.Do(func() {
+			close(gateRelease)
+		})
+	})
+
+	syncDone := make(chan error, 1)
+	go func() {
+		syncDone <- volume.Fsync(ctx, inodeID)
+	}()
+
+	select {
+	case <-gateEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for pack upload to reach storage gate")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- volume.Close()
+	}()
+
+	var closeError error
+	select {
+	case closeError = <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for volume.Close")
+	}
+	if closeError != nil {
+		t.Fatalf("expected Close to return nil, got: %v", closeError)
+	}
+
+	gateReleaseOnce.Do(func() {
+		close(gateRelease)
+	})
+
+	select {
+	case syncErr := <-syncDone:
+		if syncErr == nil {
+			t.Fatal("expected parked sync to fail after Close, got nil")
+		}
+		if !errors.Is(syncErr, context.Canceled) && !strings.Contains(syncErr.Error(), "closed") {
+			t.Fatalf("expected cancellation or closed error, got: %v", syncErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync goroutine left parked after Close")
+	}
+
+	volume.stagingMu.Lock()
+	armed := volume.coalesceTimer != nil
+	volume.stagingMu.Unlock()
+	if armed {
+		t.Fatal("coalesceTimer was re-armed on closed volume")
+	}
+
+	if _, statErr := os.Stat(volume.stagingDir); !os.IsNotExist(statErr) {
+		t.Fatalf("staging directory still exists or reappeared after close: %v", statErr)
+	}
+}
+
+func TestVolume_Stop_FlushesStagedWrites(t *testing.T) {
+	ctx := t.Context()
+	memoryBackend := NewMemoryBackend()
+	backend := newRecordingBackend(memoryBackend)
+	server := NewTestServer(t, backend)
+	volumeID := "test-stop-flushes-vol"
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	createResponse, err := testCreateFile(ctx, server, volumeID, "/test.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	data := []byte("staged write data that is flushed by Stop")
+	if _, _, _, _, writeError := volume.WriteFileWithEpoch(ctx, inodeID, 0, data, pb.WriteMode_FSYNC); writeError != nil {
+		t.Fatalf("WriteFile failed: %v", writeError)
+	}
+
+	if count := backend.getPackCount(); count != 0 {
+		t.Fatalf("expected 0 uploaded packs before Stop, got %d", count)
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer stopCancel()
+	if stopError := volume.Stop(stopCtx); stopError != nil {
+		t.Fatalf("Stop failed: %v", stopError)
+	}
+
+	if count := backend.getPackCount(); count == 0 {
+		t.Fatal("expected at least 1 uploaded pack after Stop, got 0")
+	}
+
+	readResponse, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Inode:    inodeID,
+		Offset:   0,
+		Size:     int64(len(data)),
+	})
+	if err != nil || readResponse.GetError() != 0 {
+		t.Fatalf("ReadFile failed after Stop: %v, code=%d", err, readResponse.GetError())
+	}
+	if !bytes.Equal(readResponse.GetData(), data) {
+		t.Fatalf("ReadFile content mismatch: got %q, want %q", string(readResponse.GetData()), string(data))
+	}
+}
+
+func TestVolume_Stop_FailsWhenDrainFails(t *testing.T) {
+	ctx := t.Context()
+	memoryBackend := NewMemoryBackend()
+	backend := newRecordingBackend(memoryBackend)
+	server := NewTestServer(t, backend)
+	volumeID := "test-stop-drain-fail-vol"
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	createResponse, err := testCreateFile(ctx, server, volumeID, "/test.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	data := []byte("staged write data that will fail to drain")
+	if _, _, _, _, writeError := volume.WriteFileWithEpoch(ctx, inodeID, 0, data, pb.WriteMode_FSYNC); writeError != nil {
+		t.Fatalf("WriteFile failed: %v", writeError)
+	}
+
+	backend.mu.Lock()
+	backend.failPut = true
+	backend.mu.Unlock()
+
+	stopCtx, stopCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer stopCancel()
+	stopError := volume.Stop(stopCtx)
+
+	backend.mu.Lock()
+	backend.failPut = false
+	backend.mu.Unlock()
+
+	if stopError == nil {
+		t.Fatal("expected Stop to fail when drain fails, got nil")
+	}
+	if !strings.Contains(stopError.Error(), "failed to drain") {
+		t.Fatalf("expected error containing 'failed to drain', got: %v", stopError)
+	}
+}
+
+func TestVolume_Stop_DoneContextReturnsErrorWithoutSync(t *testing.T) {
+	ctx := t.Context()
+	memoryBackend := NewMemoryBackend()
+	backend := newRecordingBackend(memoryBackend)
+	server := NewTestServer(t, backend)
+	volumeID := "test-stop-done-ctx-vol"
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	createResponse, err := testCreateFile(ctx, server, volumeID, "/test.bin", 0644, nil, 0, 0)
+	if err != nil || createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	inodeID := createResponse.GetAttr().GetInode().GetIno()
+
+	data := []byte("staged write data")
+	if _, _, _, _, writeError := volume.WriteFileWithEpoch(ctx, inodeID, 0, data, pb.WriteMode_FSYNC); writeError != nil {
+		t.Fatalf("WriteFile failed: %v", writeError)
+	}
+
+	doneCtx, doneCancel := context.WithCancel(ctx)
+	doneCancel()
+
+	stopErr := volume.Stop(doneCtx)
+	if !errors.Is(stopErr, context.Canceled) {
+		t.Fatalf("expected Stop with done context to return error wrapping context.Canceled, got: %v", stopErr)
+	}
+
+	volume.stagingMu.Lock()
+	stagedCount := len(volume.stagedChunks)
+	syncInProgress := volume.syncInProgress
+	stopping := volume.stopping
+	volume.stagingMu.Unlock()
+
+	if syncInProgress {
+		t.Fatal("expected no sync in progress after Stop with done context")
+	}
+	if stopping {
+		t.Fatal("expected volume not marked stopping after Stop with done context")
+	}
+	if stagedCount == 0 {
+		t.Fatal("expected staged chunks to remain staged after Stop with done context")
+	}
+	if backend.getPackCount() != 0 {
+		t.Fatalf("expected 0 packs uploaded to backend, got %d", backend.getPackCount())
+	}
+}
+
+// TestVolume_LockOrder_CreateFileAndFsyncStress is a stress test verifying that
+// Volume.mu and Volume.stagingMu maintain strict lock ordering and never deadlock.
+// Goroutine A loops CreateFile (acquiring v.mu), while goroutine B loops blocking
+// Fsync on an inode with nothing staged (taking stagingMu, then Position() which
+// takes v.mu.RLock()). Main calls Stop after a few hundred iterations and then Close.
+// The stress body runs in a background goroutine bounded by a 30s select on the test
+// goroutine, failing loudly via t.Fatal if a deadlock hangs execution.
+func TestVolume_LockOrder_CreateFileAndFsyncStress(t *testing.T) {
+	ctx := t.Context()
+	memoryBackend := NewMemoryBackend()
+	server := NewTestServer(t, memoryBackend)
+	volumeID := "test-lock-order-stress-vol"
+
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	createResp, err := testCreateFile(ctx, server, volumeID, "/base.txt", 0644, nil, 0, 0)
+	if err != nil || createResp.GetError() != 0 {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	baseInode := createResp.GetAttr().GetInode().GetIno()
+
+	var errMu sync.Mutex
+	var firstErr error
+	recordErr := func(e error) {
+		errMu.Lock()
+		defer errMu.Unlock()
+		if firstErr == nil {
+			firstErr = e
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		var wg sync.WaitGroup
+		stopSignal := make(chan struct{})
+		var iterations atomic.Int64
+
+		// Goroutine A: loops CreateFile
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stopSignal:
+					return
+				default:
+				}
+				name := fmt.Sprintf("/stress_%d.txt", i)
+				_, createErr := testCreateFile(ctx, server, volumeID, name, 0644, nil, 0, 0)
+				if createErr != nil && status.Code(createErr) != codes.Unavailable && !errors.Is(createErr, ErrVolumeStopping) {
+					recordErr(fmt.Errorf("CreateFile unexpected error: %w", createErr))
+				}
+				iterations.Add(1)
+			}
+		}()
+
+		// Goroutine B: loops blocking Fsync on an inode with nothing staged (the Position() path)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopSignal:
+					return
+				default:
+				}
+				if fsyncErr := volume.Fsync(ctx, baseInode); fsyncErr != nil && !errors.Is(fsyncErr, ErrVolumeStopping) {
+					recordErr(fmt.Errorf("Fsync unexpected error: %w", fsyncErr))
+				}
+			}
+		}()
+
+		// Wait until goroutine A passes a few hundred iterations
+		for iterations.Load() < 300 {
+			time.Sleep(time.Millisecond)
+		}
+
+		stopCtx, stopCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer stopCancel()
+		if stopErr := volume.Stop(stopCtx); stopErr != nil {
+			recordErr(fmt.Errorf("volume.Stop failed: %w", stopErr))
+		}
+
+		close(stopSignal)
+		wg.Wait()
+
+		if closeErr := volume.Close(); closeErr != nil {
+			recordErr(fmt.Errorf("volume.Close failed: %w", closeErr))
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("hang guard: deadlock in CreateFile and Fsync lock ordering")
+	}
+
+	if firstErr != nil {
+		t.Errorf("stress test error: %v", firstErr)
 	}
 }

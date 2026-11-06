@@ -70,6 +70,7 @@ type Options struct {
 	MaxStagingBytes           int64
 	ControllerSyncTimeout     time.Duration
 	OpenBarrierTimeout        time.Duration
+	ShutdownTimeout           time.Duration
 	AcceptUnversionedSegments bool
 }
 
@@ -89,6 +90,7 @@ func NewOptions() *Options {
 		MaxStagingBytes:          64 * 1024 * 1024,
 		ControllerSyncTimeout:    10 * time.Minute,
 		OpenBarrierTimeout:       30 * time.Second,
+		ShutdownTimeout:          20 * time.Second,
 	}
 }
 
@@ -143,6 +145,7 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.Int64Var(&o.MaxStagingBytes, "max-staging-bytes", o.MaxStagingBytes, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
 	flagSet.DurationVar(&o.ControllerSyncTimeout, "controller-sync-timeout", o.ControllerSyncTimeout, "Timeout for controller coalesced background sync operations")
 	flagSet.DurationVar(&o.OpenBarrierTimeout, "open-barrier-timeout", o.OpenBarrierTimeout, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
+	flagSet.DurationVar(&o.ShutdownTimeout, "shutdown-timeout", o.ShutdownTimeout, "Timeout for graceful volume drain during controller shutdown (below the pod termination grace period)")
 	flagSet.BoolVar(&o.AcceptUnversionedSegments, "accept-unversioned-segments", o.AcceptUnversionedSegments, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
 }
 
@@ -159,6 +162,9 @@ func (o *Options) Validate() error {
 	}
 	if o.WALTarget == "" {
 		return fmt.Errorf("invalid configuration: --wal-target is required")
+	}
+	if o.ShutdownTimeout <= 0 {
+		return fmt.Errorf("invalid configuration: --shutdown-timeout must be positive, got %v", o.ShutdownTimeout)
 	}
 	if err := validateMetadataIndex(o.MetadataIndex); err != nil {
 		return err
@@ -406,8 +412,10 @@ func run(options Options) error {
 
 	klog.Infof("ObjectFS Controller listening on port %d (flushInterval=%v)", options.Port, options.FlushInterval)
 	serveErr := grpcServer.Serve(listener)
-	if err := server.Close(); err != nil {
-		klog.Errorf("failed to close server on shutdown: %v", err)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), options.ShutdownTimeout)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		klog.Errorf("failed to shutdown server: %v", err)
 		klog.Flush()
 		os.Exit(1)
 	}

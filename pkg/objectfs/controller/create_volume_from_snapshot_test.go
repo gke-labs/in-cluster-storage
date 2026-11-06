@@ -121,9 +121,7 @@ func TestCreateVolumeFromSnapshot(t *testing.T) {
 	if err := server1.FlushAll(ctx); err != nil {
 		t.Fatalf("FlushAll server1 failed: %v", err)
 	}
-	if err := server1.Close(); err != nil {
-		t.Fatalf("Close server1 failed: %v", err)
-	}
+	shutdownTestServer(t, server1)
 
 	server2 := NewTestServer(t, backend, WithServerWAL(walDirectory, "", walclient.Local))
 
