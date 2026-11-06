@@ -2744,7 +2744,10 @@ func TestStreamsDurabilityModes(t *testing.T) {
 	volumeID := "durability-vol"
 
 	// Create server with Witness durability
-	server := NewTestServer(t, backend, WithServerWAL(clientDir, target, walclient.Witness))
+	server := NewTestServer(t, backend,
+		WithServerWAL(clientDir, target, walclient.Witness),
+		WithServerMetadataDurability(pb.MetadataDurability_OPERATION),
+	)
 	defer func() { _ = server.Close() }()
 
 	ctx := t.Context()
@@ -3132,6 +3135,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 			return fakeStream, nil
 		}),
 		WithServerDurability(walclient.Witness),
+		WithServerMetadataDurability(pb.MetadataDurability_OPERATION),
 	)
 	defer func() { _ = server.Close() }()
 
@@ -3226,6 +3230,7 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 			return fakeStream2, nil
 		}),
 		WithServerDurability(walclient.Witness),
+		WithServerMetadataDurability(pb.MetadataDurability_OPERATION),
 	)
 	defer func() { _ = server2.Close() }()
 
@@ -3265,6 +3270,8 @@ func TestStreamsDurabilityConcurrency(t *testing.T) {
 	if err != nil || attr.GetError() != 0 || attr.GetAttr().GetInode().GetIno() == 0 {
 		t.Fatalf("Expected in-memory state to remain intact after durability wait failure: %v (attr: %v)", err, attr)
 	}
+
+	close(fakeStream2.waitGate)
 }
 
 func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
@@ -3281,6 +3288,7 @@ func TestStreamsDurabilityConcurrencyAllMutations(t *testing.T) {
 			return fakeStream, nil
 		}),
 		WithServerDurability(walclient.Witness),
+		WithServerMetadataDurability(pb.MetadataDurability_OPERATION),
 	)
 	defer func() { _ = server.Close() }()
 
@@ -6358,11 +6366,14 @@ func TestControllerWALStreamDegraded(t *testing.T) {
 			}
 			return nil, fmt.Errorf("unexpected volume %s", volumeID)
 		}),
+		WithServerMetadataDurability(pb.MetadataDurability_OPERATION),
 	)
 
 	closeAll := sync.OnceFunc(func() {
-		if err := server.Close(); err != nil {
-			t.Errorf("server.Close failed: %v", err)
+		closeErr := server.Close()
+		var degErr *walclient.DegradedError
+		if !errors.As(closeErr, &degErr) {
+			t.Errorf("server.Close error = %v, want DegradedError", closeErr)
 		}
 		if err := stream2.Close(); err != nil {
 			t.Errorf("stream2.Close failed: %v", err)
@@ -6756,9 +6767,24 @@ func TestSharedWALBufferConnectionAcrossVolumes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("vol-1 mkdir failed: %v", err)
 	}
+	dir1Ino, err := resolvePath(ctx, server, "vol-1", "/dir1")
+	if err != nil {
+		t.Fatalf("vol-1 resolvePath failed: %v", err)
+	}
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: "vol-1", Inode: dir1Ino, Blocking: true}); err != nil {
+		t.Fatalf("vol-1 fsync failed: %v", err)
+	}
+
 	_, err = testMkdir(ctx, server, "vol-2", "/dir2", 0755, 0, 0)
 	if err != nil {
 		t.Fatalf("vol-2 mkdir failed: %v", err)
+	}
+	dir2Ino, err := resolvePath(ctx, server, "vol-2", "/dir2")
+	if err != nil {
+		t.Fatalf("vol-2 resolvePath failed: %v", err)
+	}
+	if _, err := server.Fsync(ctx, &pb.FsyncRequest{VolumeId: "vol-2", Inode: dir2Ino, Blocking: true}); err != nil {
+		t.Fatalf("vol-2 fsync failed: %v", err)
 	}
 
 	vol1 := mustGetVolume(t, server, "vol-1")
@@ -7280,6 +7306,7 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 
 	// 2. Server 1 writes local records in local mode (not replicated to buffer), producing divergent records ahead of buffer
 	server1 := NewTestServer(t, storage, WithServerWAL(walDir, "", walclient.Local))
+	var lastIno uint64
 	for i := 1; i <= 3; i++ {
 		initResp, err := server1.CreateFile(ctx, &pb.CreateFileRequest{
 			VolumeId:       volumeID,
@@ -7290,6 +7317,10 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 		if err != nil || initResp.GetError() != 0 {
 			t.Fatalf("CreateFile on server1 %d failed: %v, resp: %v", i, err, initResp)
 		}
+		lastIno = initResp.GetAttr().GetInode().GetIno()
+	}
+	if _, err := server1.Fsync(ctx, &pb.FsyncRequest{VolumeId: volumeID, Inode: lastIno, Blocking: true}); err != nil {
+		t.Fatalf("Fsync on server1 failed: %v", err)
 	}
 	if err := server1.Close(); err != nil {
 		t.Fatalf("Close server1 failed: %v", err)
@@ -7365,8 +7396,10 @@ func TestControllerRestartDivergenceRecovery(t *testing.T) {
 		t.Fatalf("expected Fsync to fail with EIO on degraded volume, got err=%v, resp=%v", err, fsyncResp2)
 	}
 
-	if err := server2.Close(); err != nil {
-		t.Fatalf("Close server2 failed: %v", err)
+	closeErr := server2.Close()
+	var degErr *walclient.DegradedError
+	if !errors.As(closeErr, &degErr) {
+		t.Fatalf("Close server2 error = %v, want DegradedError", closeErr)
 	}
 
 	// 4. Controller restart with fault CLEARED:

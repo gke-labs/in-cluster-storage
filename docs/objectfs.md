@@ -499,6 +499,13 @@ ObjectFS supports three distinct write synchronization modes:
 2. `LAZY`: Writes are buffered asynchronously and flushed in background batches, maximizing write throughput for scratch and temporary workloads.
 3. `EAGER`: Writes are streamed immediately to the central controller memory and change-log, providing cross-node visibility and crash resilience without waiting for object store commits.
 
+### 6. Configurable Metadata Durability Modes
+ObjectFS supports two metadata durability modes, configured cluster-wide via the controller flag `--metadata-durability=barrier|operation` (default `barrier`) or per-volume via the StorageClass parameter `metadata-durability`:
+
+1. `barrier` (Default): Metadata operations (such as creating files and directories, renaming, unlinking, linking, setting attributes, truncating, extended attributes, and releasing orphan files) return once sequenced into the client stream without waiting for the WAL durability level. Durability is collected at barriers: `fsync`, file close in the close-to-open and write-through modes, volume shutdown, snapshot creation, and snapshot restore. Because durability waits track stream watermarks, a single wait on the newest commit sequence at a barrier covers all preceding metadata operations. Buffer-side commit failures on the Append stream are retried by reconnect-and-replay, so an unwaited record whose commit continues to fail shows up at the barrier as a wait until the sync timeout. A fatal stream error (such as a local segment-store truncation failure) marks the stream degraded, surfacing at the next barrier and causing mutating operations to return `EIO`.
+   - **Loss Window:** After a controller crash, metadata operations that returned but were not followed by a barrier may be lost, as on a local filesystem without fsync.
+2. `operation`: Legacy per-operation durability. Every metadata mutation blocks and waits for acknowledgement at the volume's configured WAL durability level (`witness`, `permanent`, or `local`) before returning to the caller.
+
 ---
 
 ## Protocol Specification

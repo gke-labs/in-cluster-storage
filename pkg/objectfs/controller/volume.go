@@ -157,6 +157,7 @@ type Volume struct {
 	syncTimeout        time.Duration
 	openBarrierTimeout time.Duration
 	consistencyMode    pb.ConsistencyMode
+	metadataDurability pb.MetadataDurability
 	syncInProgress     bool
 	syncCond           *sync.Cond
 
@@ -254,6 +255,15 @@ func WithOpenBarrierTimeout(d time.Duration) VolumeOption {
 func WithConsistencyMode(mode pb.ConsistencyMode) VolumeOption {
 	return func(v *Volume) {
 		v.consistencyMode = mode
+	}
+}
+
+// WithMetadataDurability sets the metadata durability mode for the volume.
+func WithMetadataDurability(mode pb.MetadataDurability) VolumeOption {
+	return func(v *Volume) {
+		if mode != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+			v.metadataDurability = mode
+		}
 	}
 }
 
@@ -507,6 +517,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		maxInlineLen:       4096,      // 4KB default inline threshold for tiny files
 		chunkSize:          64 * 1024, // 64KB default chunk size
 		durability:         walclient.Local,
+		metadataDurability: pb.MetadataDurability_BARRIER,
 		indexFactory:       f,
 		streamID:           StreamIDForVolume(volumeID),
 		closedCh:           make(chan struct{}),
@@ -808,6 +819,14 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 			snapSeq := v.stagingSeq
 			pos := v.Position()
 			v.stagingMu.Unlock()
+			if pos > 0 {
+				waitFn := v.makeWaitFn(pos, nil)
+				if waitFn != nil {
+					if err := waitFn(ctx); err != nil {
+						return epoch, 0, err
+					}
+				}
+			}
 			if requirePermanent {
 				if err := v.stream.Flush(ctx); err != nil {
 					return epoch, 0, err
@@ -825,6 +844,14 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 		if len(v.stagedChunks[inodeID]) == 0 {
 			pos := v.Position()
 			v.stagingMu.Unlock()
+			if pos > 0 {
+				waitFn := v.makeWaitFn(pos, nil)
+				if waitFn != nil {
+					if err := waitFn(ctx); err != nil {
+						return epoch, 0, err
+					}
+				}
+			}
 			return epoch, pos, nil
 		}
 
@@ -893,6 +920,14 @@ func (v *Volume) executeSyncLocked(ctx context.Context, requirePermanent bool, i
 		snapSeq := v.stagingSeq
 		pos := v.Position()
 		v.stagingMu.Unlock()
+		if pos > 0 {
+			waitFn := v.makeWaitFn(pos, nil)
+			if waitFn != nil {
+				if err := waitFn(ctx); err != nil {
+					return 0, v.finishSync(snapSeq, err, nil, 0, inodeFilter)
+				}
+			}
+		}
 		if v.stream.ReplicationLevel() == walclient.Permanent {
 			if err := v.stream.Flush(ctx); err != nil {
 				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
@@ -1482,21 +1517,31 @@ func (v *Volume) SetConsistencyMode(mode pb.ConsistencyMode) {
 	v.consistencyMode = mode
 }
 
-// PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store.
-func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
+// MetadataDurability returns the configured metadata durability mode for this volume.
+func (v *Volume) MetadataDurability() pb.MetadataDurability {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.metadataDurability
+}
+
+// SetMetadataDurability updates the metadata durability mode for this volume.
+func (v *Volume) SetMetadataDurability(mode pb.MetadataDurability) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.metadataDurability = mode
+}
 
-	v.consistencyMode = mode
-
+func (v *Volume) persistVolumeInfoLocked(ctx context.Context, opName string, apply func(*pb.VolumeInfo)) (func(context.Context) error, error) {
 	volInfo := &pb.VolumeInfo{
-		VolumeId:        v.volumeID,
-		ConsistencyMode: mode,
+		VolumeId:           v.volumeID,
+		ConsistencyMode:    v.consistencyMode,
+		MetadataDurability: v.metadataDurability,
 	}
+	apply(volInfo)
 
 	volInfoKey, err := pkVolumeInfo.Extract(volInfo)
 	if err != nil {
-		return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
+		return nil, fmt.Errorf("failed to extract VolumeInfo key: %w", err)
 	}
 
 	var beforeMsg proto.Message
@@ -1504,7 +1549,7 @@ func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.Consistency
 	if v.metadataView != nil {
 		msg, ok, err := v.metadataView.Get(ctx, VolumeInfoTypeName, volInfoKey)
 		if err != nil {
-			return fmt.Errorf("failed to get VolumeInfo: %w", err)
+			return nil, fmt.Errorf("failed to get VolumeInfo: %w", err)
 		}
 		if ok && msg != nil {
 			beforeMsg = msg
@@ -1512,23 +1557,70 @@ func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.Consistency
 		}
 	}
 
-	tx := v.beginTxLocked("PersistConsistencyMode")
+	var waitFn func(context.Context) error
+	tx := v.beginTxLocked(opName)
 	if tx != nil {
 		v.recordReadLocked(tx, VolumeInfoTypeName, volInfoKey, beforeMsg)
 		if exists {
 			if _, err := tx.Update(ctx, volInfo); err != nil {
-				return fmt.Errorf("failed to update VolumeInfo: %w", err)
+				return nil, fmt.Errorf("failed to update VolumeInfo: %w", err)
 			}
 		} else {
 			if _, err := tx.Insert(ctx, volInfo); err != nil {
-				return fmt.Errorf("failed to insert VolumeInfo: %w", err)
+				return nil, fmt.Errorf("failed to insert VolumeInfo: %w", err)
 			}
 		}
-		if _, err := v.commitTxLocked(ctx, tx); err != nil {
-			return fmt.Errorf("failed to commit VolumeInfo transaction: %w", err)
+		commitSeq, err := v.commitTxLocked(ctx, tx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to commit VolumeInfo transaction: %w", err)
 		}
 		if err := v.flushOverlayLocked(ctx); err != nil {
-			return fmt.Errorf("failed to flush overlay for VolumeInfo: %w", err)
+			return nil, fmt.Errorf("failed to flush overlay for VolumeInfo: %w", err)
+		}
+		if commitSeq > 0 {
+			waitFn = v.makeWaitFn(commitSeq, nil)
+		}
+	}
+	return waitFn, nil
+}
+
+// PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store.
+func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
+	waitFn, err := func() (func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		v.consistencyMode = mode
+		return v.persistVolumeInfoLocked(ctx, "PersistConsistencyMode", func(volumeInfo *pb.VolumeInfo) {
+			volumeInfo.ConsistencyMode = mode
+		})
+	}()
+	if err != nil {
+		return err
+	}
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return fmt.Errorf("failed to wait for consistency mode durability: %w", err)
+		}
+	}
+	return nil
+}
+
+// PersistMetadataDurability updates the volume's metadata durability mode and persists it to the metadata store.
+func (v *Volume) PersistMetadataDurability(ctx context.Context, mode pb.MetadataDurability) error {
+	waitFn, err := func() (func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		v.metadataDurability = mode
+		return v.persistVolumeInfoLocked(ctx, "PersistMetadataDurability", func(volumeInfo *pb.VolumeInfo) {
+			volumeInfo.MetadataDurability = mode
+		})
+	}()
+	if err != nil {
+		return err
+	}
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return fmt.Errorf("failed to wait for metadata durability mode durability: %w", err)
 		}
 	}
 	return nil
@@ -1540,6 +1632,9 @@ func (v *Volume) commitTxLocked(ctx context.Context, tx *sds.Tx) (uint64, error)
 		return 0, err
 	}
 	v.applyTxChangesLocked(ctx, tx)
+	if commitSeq > v.lastCommitSeq {
+		v.lastCommitSeq = commitSeq
+	}
 	return commitSeq, nil
 }
 
@@ -1584,10 +1679,19 @@ func (v *Volume) Close() error {
 			close(v.closedCh)
 		}
 	}
+	waitFn := v.makeWaitFn(v.lastCommitSeq, nil)
 	mView := v.metadataView
 	v.mu.Unlock()
 
 	var firstErr error
+	if waitFn != nil {
+		if err := waitFn(context.Background()); err != nil && firstErr == nil {
+			if err.Error() != "stream closed" {
+				firstErr = err
+			}
+		}
+	}
+
 	if mView != nil {
 		if err := mView.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -1616,9 +1720,6 @@ func (v *Volume) Close() error {
 // has already been applied to in-memory state and appended locally, so no rollback is
 // attempted; the error is returned to inform the caller that durability was not achieved.
 func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(context.Context) error {
-	if commitSeq > v.lastCommitSeq {
-		v.lastCommitSeq = commitSeq
-	}
 	if commitSeq == 0 {
 		return nil
 	}
@@ -1638,6 +1739,13 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 		}
 		return nil
 	}
+}
+
+func (v *Volume) makeOperationWaitFn(commitSeq uint64) func(context.Context) error {
+	if v.metadataDurability != pb.MetadataDurability_OPERATION {
+		return nil
+	}
+	return v.makeWaitFn(commitSeq, nil)
 }
 
 // Position returns the latest committed stream sequence number for this volume.
@@ -2049,6 +2157,7 @@ func (v *Volume) cleanOrphanInodesLocked(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
 	}
+	// Waits unconditionally because orphan cleanup runs at volume open time before servicing requests.
 	waitFn := v.makeWaitFn(commitSeq, nil)
 	if waitFn != nil {
 		if err := waitFn(ctx); err != nil {
@@ -2292,7 +2401,7 @@ func (v *Volume) SetAttr(ctx context.Context, inodeID uint64, mode *uint32, uid 
 			return nil, nil, fmt.Errorf("failed to commit setattr transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return attr, waitFn, nil
@@ -2433,7 +2542,7 @@ func (v *Volume) SetXAttr(ctx context.Context, inodeID uint64, name string, valu
 			return nil, nil, fmt.Errorf("failed to commit setxattr transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return waitFn, attr, nil
 	}()
@@ -2547,7 +2656,7 @@ func (v *Volume) RemoveXAttr(ctx context.Context, inodeID uint64, name string) e
 			return nil, nil, fmt.Errorf("failed to commit removexattr transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		return waitFn, attr, nil
 	}()
@@ -2803,7 +2912,7 @@ func (v *Volume) Mkdir(ctx context.Context, parentInodeID uint64, name string, m
 			return nil, nil, fmt.Errorf("failed to commit mkdir transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInodeMsg, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3022,7 +3131,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 				return nil, nil, fmt.Errorf("failed to commit overwrite file transaction: %w", err)
 			}
 
-			waitFn := v.makeWaitFn(commitSeq, nil)
+			waitFn := v.makeOperationWaitFn(commitSeq)
 
 			attr := v.toEntryAttr(childInode.Row, name, childInode.RedirectURL)
 			v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3132,7 +3241,7 @@ func (v *Volume) CreateFile(ctx context.Context, parentInodeID uint64, name stri
 			return nil, nil, fmt.Errorf("failed to commit create file transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInode.Row, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3246,7 +3355,7 @@ func (v *Volume) Symlink(ctx context.Context, parentInodeID uint64, name string,
 			return nil, nil, fmt.Errorf("failed to commit symlink transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInode.Row, name, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -3369,7 +3478,7 @@ func (v *Volume) Link(ctx context.Context, oldInodeID uint64, newParentInodeID u
 			return nil, nil, fmt.Errorf("failed to commit link transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(oldNode.Row, newName, "")
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -4393,7 +4502,7 @@ func (v *Volume) TruncateFile(ctx context.Context, inodeID uint64, size int64) (
 			return nil, nil, fmt.Errorf("failed to commit truncate file transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -4665,7 +4774,7 @@ func (v *Volume) PunchHole(ctx context.Context, inodeID uint64, offset, length i
 			return nil, nil, fmt.Errorf("failed to commit punch hole transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -4795,7 +4904,7 @@ func (v *Volume) Unlink(ctx context.Context, parentInodeID uint64, name string) 
 			return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:      pb.WatchEventType_EVENT_DELETED,
@@ -4897,7 +5006,7 @@ func (v *Volume) Rmdir(ctx context.Context, parentInodeID uint64, name string) (
 			return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
 			EventType:      pb.WatchEventType_EVENT_DELETED,
@@ -5176,7 +5285,7 @@ func (v *Volume) Rename(ctx context.Context, oldParentInodeID uint64, oldName st
 			return nil, nil, fmt.Errorf("failed to commit rename transaction: %w", err)
 		}
 
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 
 		attr := v.toEntryAttr(childInode.Row, newName, childInode.RedirectURL)
 		v.broadcaster.Broadcast(v.volumeID, &pb.WatchVolumeResponse{
@@ -5381,7 +5490,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 		if err != nil {
 			return fmt.Errorf("failed to commit orphan deletion transaction: %w", err)
 		}
-		waitFn := v.makeWaitFn(commitSeq, nil)
+		waitFn := v.makeOperationWaitFn(commitSeq)
 		if waitFn != nil {
 			if err := waitFn(ctx); err != nil {
 				return fmt.Errorf("failed to wait for orphan deletion sync: %w", err)
@@ -6137,8 +6246,13 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 				}
 			}
 			if ch.TypeName == VolumeInfoTypeName {
-				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-					v.consistencyMode = vi.GetConsistencyMode()
+				if vi, ok := ch.Row.(*pb.VolumeInfo); ok && vi != nil {
+					if vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+						v.consistencyMode = vi.GetConsistencyMode()
+					}
+					if vi.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+						v.metadataDurability = vi.GetMetadataDurability()
+					}
 				}
 			}
 		}
@@ -6324,8 +6438,13 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			return fmt.Errorf("failed to get VolumeInfo: %w", err)
 		}
 		if ok && msg != nil {
-			if vi, ok := msg.(*pb.VolumeInfo); ok && vi != nil && vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
-				v.consistencyMode = vi.GetConsistencyMode()
+			if vi, ok := msg.(*pb.VolumeInfo); ok && vi != nil {
+				if vi.GetConsistencyMode() != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
+					v.consistencyMode = vi.GetConsistencyMode()
+				}
+				if vi.GetMetadataDurability() != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+					v.metadataDurability = vi.GetMetadataDurability()
+				}
 			}
 		}
 	}
@@ -6353,51 +6472,66 @@ func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error
 	v.snapshotMu.Lock()
 	defer v.snapshotMu.Unlock()
 
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	snapName, waitFn, err := func() (string, func(context.Context) error, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
 
-	if v.backend == nil {
-		return "", fmt.Errorf("no backend configured")
-	}
+		if v.backend == nil {
+			return "", nil, fmt.Errorf("no backend configured")
+		}
 
-	snap, ok := v.metadataView.Index().(sds.Snapshotter)
-	if !ok {
-		return "", fmt.Errorf("volume metadata index does not support snapshots")
-	}
+		snap, ok := v.metadataView.Index().(sds.Snapshotter)
+		if !ok {
+			return "", nil, fmt.Errorf("volume metadata index does not support snapshots")
+		}
 
-	if err := v.flushOverlayLocked(ctx); err != nil {
-		return "", fmt.Errorf("failed to flush overlay before snapshot: %w", err)
-	}
+		if err := v.flushOverlayLocked(ctx); err != nil {
+			return "", nil, fmt.Errorf("failed to flush overlay before snapshot: %w", err)
+		}
 
-	snapKey, actualPos, err := snap.PublishSnapshot(ctx, v.backend)
+		snapKey, actualPos, err := snap.PublishSnapshot(ctx, v.backend)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to publish index snapshot: %w", err)
+		}
+
+		format := ""
+		if v.indexFactory != nil {
+			format = v.indexFactory.Format()
+		}
+
+		resolvedName := name
+		if resolvedName == "" {
+			resolvedName = path.Base(snapKey)
+		}
+
+		ptr := &sdsv1.SnapshotPointer{
+			Position:  actualPos,
+			Format:    format,
+			Location:  snapKey,
+			Name:      resolvedName,
+			CreatedAt: timestamppb.Now(),
+		}
+
+		var waitFn func(context.Context) error
+		if v.metadataStream != nil && snapKey != "" {
+			seq, err := v.metadataStream.AppendSnapshotPointer(ctx, ptr)
+			if err != nil {
+				return "", nil, fmt.Errorf("failed to append snapshot pointer: %w", err)
+			}
+			waitFn = v.makeWaitFn(seq, nil)
+		}
+		v.snapshotPointers = append(v.snapshotPointers, ptr)
+
+		return resolvedName, waitFn, nil
+	}()
 	if err != nil {
-		return "", fmt.Errorf("failed to publish index snapshot: %w", err)
+		return "", err
 	}
-
-	format := ""
-	if v.indexFactory != nil {
-		format = v.indexFactory.Format()
-	}
-
-	snapName := name
-	if snapName == "" {
-		snapName = path.Base(snapKey)
-	}
-
-	ptr := &sdsv1.SnapshotPointer{
-		Position:  actualPos,
-		Format:    format,
-		Location:  snapKey,
-		Name:      snapName,
-		CreatedAt: timestamppb.Now(),
-	}
-
-	if v.metadataStream != nil && snapKey != "" {
-		if _, err := v.metadataStream.AppendSnapshotPointer(ctx, ptr); err != nil {
-			return "", fmt.Errorf("failed to append snapshot pointer: %w", err)
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return "", fmt.Errorf("failed to wait for snapshot pointer durability: %w", err)
 		}
 	}
-	v.snapshotPointers = append(v.snapshotPointers, ptr)
 
 	return snapName, nil
 }
@@ -6602,8 +6736,13 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 	v.snapshotMu.Lock()
 	defer v.snapshotMu.Unlock()
 
+	var unlocked bool
 	v.mu.Lock()
-	defer v.mu.Unlock()
+	defer func() {
+		if !unlocked {
+			v.mu.Unlock()
+		}
+	}()
 
 	if v.backend == nil {
 		return nil, fmt.Errorf("no backend configured")
@@ -6722,6 +6861,19 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 	v.replayStartPos = freshPos
 	v.replaySnapshotLocation = freshKey
 	v.snapshotPointers = append(v.snapshotPointers, restorePtr, freshPtr)
+
+	var waitFn func(context.Context) error
+	if restoreSeq > 0 {
+		waitFn = v.makeWaitFn(restoreSeq, nil)
+	}
+	unlocked = true
+	v.mu.Unlock()
+
+	if waitFn != nil {
+		if err := waitFn(ctx); err != nil {
+			return nil, fmt.Errorf("failed to wait for restore record durability: %w", err)
+		}
+	}
 
 	return snapshotInfoFromPointer(freshPtr), nil
 }

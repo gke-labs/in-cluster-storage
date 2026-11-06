@@ -97,6 +97,12 @@ enum VolumeMode {
   EXCLUSIVE_LOCAL = 2;
 }
 
+enum MetadataDurability {
+  METADATA_DURABILITY_UNSPECIFIED = 0;
+  BARRIER = 1;
+  OPERATION = 2;
+}
+
 message EntryAttr {
   Inode inode = 1;
   string name = 2;
@@ -503,6 +509,7 @@ message VolumeInfo {
   ConsistencyMode consistency_mode = 4;
   bool deleted = 5;
   optional int32 retention = 6;
+  MetadataDurability metadata_durability = 7;
 }
 
 message ListVolumesResponse {

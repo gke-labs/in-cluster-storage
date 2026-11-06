@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/projection/table"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -124,6 +125,34 @@ func TestWalDurabilityFlag(t *testing.T) {
 	}
 }
 
+func TestMetadataDurabilityFlag(t *testing.T) {
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	options.AddFlags(flagSet)
+	f := flagSet.Lookup("metadata-durability")
+	if f == nil {
+		t.Fatal("flag --metadata-durability not registered")
+	}
+	if f.DefValue != "barrier" {
+		t.Errorf("default value = %q, want barrier", f.DefValue)
+	}
+	if err := f.Value.Set("operation"); err != nil {
+		t.Fatalf("Set operation failed: %v", err)
+	}
+	if options.MetadataDurability != pb.MetadataDurability_OPERATION {
+		t.Errorf("options.MetadataDurability = %v, want %v", options.MetadataDurability, pb.MetadataDurability_OPERATION)
+	}
+	if err := f.Value.Set("barrier"); err != nil {
+		t.Fatalf("Set barrier failed: %v", err)
+	}
+	if options.MetadataDurability != pb.MetadataDurability_BARRIER {
+		t.Errorf("options.MetadataDurability = %v, want %v", options.MetadataDurability, pb.MetadataDurability_BARRIER)
+	}
+	if err := f.Value.Set("invalid"); err == nil {
+		t.Fatal("expected error for invalid metadata durability")
+	}
+}
+
 func TestOpenBarrierTimeoutFlag(t *testing.T) {
 	options := NewOptions()
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -152,6 +181,7 @@ func TestOptionsParseAndValidate(t *testing.T) {
 		"--wal-target=127.0.0.1:50051",
 		"--port=8080",
 		"--wal-durability=permanent",
+		"--metadata-durability=operation",
 		"--csi-endpoint=unix:///tmp/csi.sock",
 	}
 	if err := flagSet.Parse(arguments); err != nil {
@@ -161,6 +191,7 @@ func TestOptionsParseAndValidate(t *testing.T) {
 	if options.Backend != "memory://" || options.MetadataDir != "/tmp/metadata" ||
 		options.WALDir != "/tmp/wal" || options.WALTarget != "127.0.0.1:50051" ||
 		options.Port != 8080 || options.WALDurability != walclient.Permanent ||
+		options.MetadataDurability != pb.MetadataDurability_OPERATION ||
 		options.CSIEndpoint != "unix:///tmp/csi.sock" {
 		t.Fatalf("parsed options mismatch: %+v", options)
 	}

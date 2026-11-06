@@ -22,6 +22,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/consistency"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/metadatadurability"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -104,6 +105,16 @@ func (c *CSIController) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 	if consistencyMode != pb.ConsistencyMode_CONSISTENCY_MODE_UNSPECIFIED {
 		if err := vol.PersistConsistencyMode(ctx, consistencyMode); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to persist consistency mode: %v", err)
+		}
+	}
+
+	metadataDurability, err := metadatadurability.Parse(req.GetParameters()["metadata-durability"])
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if metadataDurability != pb.MetadataDurability_METADATA_DURABILITY_UNSPECIFIED {
+		if err := vol.PersistMetadataDurability(ctx, metadataDurability); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to persist metadata durability: %v", err)
 		}
 	}
 
