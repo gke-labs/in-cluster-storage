@@ -158,9 +158,16 @@ type Server struct {
 	streamFactory            func(volumeID string) (walclient.Stream, error)
 	syncCoalesceWindow       time.Duration
 	maxStagingBytes          int64
+	maxLocalPackCacheBytes   int64
+	maxLocalStagingBytes     int64
 	syncTimeout              time.Duration
 	openBarrierTimeout       time.Duration
 	acceptUnversioned        bool
+
+	diskLimitsMu        sync.Mutex
+	localPackCacheBytes int64
+	localStagingBytes   int64
+	stagingCapWarnings  map[string]time.Time
 
 	flushTicker *time.Ticker
 	stopFlush   chan struct{}
@@ -342,6 +349,20 @@ func WithServerMaxStagingBytes(b int64) ServerOption {
 	}
 }
 
+// WithServerMaxLocalPackCacheBytes sets the controller-wide uploaded pack cache byte limit across all volumes before evicting.
+func WithServerMaxLocalPackCacheBytes(bytes int64) ServerOption {
+	return func(s *Server) {
+		s.maxLocalPackCacheBytes = bytes
+	}
+}
+
+// WithServerMaxLocalStagingBytes sets the controller-wide unuploaded write staging byte limit across all volumes before failing fast with ENOSPC.
+func WithServerMaxLocalStagingBytes(bytes int64) ServerOption {
+	return func(s *Server) {
+		s.maxLocalStagingBytes = bytes
+	}
+}
+
 // WithServerSyncTimeout sets the timeout duration for coalesced background sync operations.
 func WithServerSyncTimeout(d time.Duration) ServerOption {
 	return func(s *Server) {
@@ -402,16 +423,19 @@ func NewServer(backend ObjectStorageBackend, opts ...ServerOption) *Server {
 		backend = NewMemoryBackend()
 	}
 	s := &Server{
-		volumes:           make(map[string]*Volume),
-		backend:           backend,
-		blobStore:         blob.NewStore(backend, 0),
-		broadcaster:       NewEventBroadcaster(),
-		checkpointWaiters: make(map[string]chan uint64),
-		exclusiveHolds:    make(map[string]*ExclusiveHold),
-		exclusiveLeaseTTL: 30 * time.Second,
-		syncTimeout:       10 * time.Minute,
-		defaultDurability: walclient.Local,
-		restoring:         make(map[string]bool),
+		volumes:                make(map[string]*Volume),
+		backend:                backend,
+		blobStore:              blob.NewStore(backend, 0),
+		broadcaster:            NewEventBroadcaster(),
+		checkpointWaiters:      make(map[string]chan uint64),
+		exclusiveHolds:         make(map[string]*ExclusiveHold),
+		exclusiveLeaseTTL:      30 * time.Second,
+		syncTimeout:            10 * time.Minute,
+		defaultDurability:      walclient.Local,
+		restoring:              make(map[string]bool),
+		maxLocalPackCacheBytes: 8 * 1024 * 1024 * 1024,
+		maxLocalStagingBytes:   16 * 1024 * 1024 * 1024,
+		stagingCapWarnings:     make(map[string]time.Time),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -526,6 +550,7 @@ func (s *Server) createVolumeInstanceLocked(volumeID string) (*Volume, error) {
 	if s.blobStore != nil {
 		volumeOptions = append(volumeOptions, WithBlobStore(s.blobStore))
 	}
+	volumeOptions = append(volumeOptions, WithServer(s))
 
 	return NewVolume(volumeID, s.backend, s.broadcaster, volumeOptions...)
 }
@@ -1871,4 +1896,130 @@ func (s *Server) RepairVolume(ctx context.Context, req *pb.RepairVolumeRequest) 
 		OldPath:      oldPath,
 		NewWatermark: witnessWatermark,
 	}, nil
+}
+
+// ServerStats contains aggregated operational and capacity metrics for the controller server.
+type ServerStats struct {
+	LocalStagingBytes      int64
+	MaxLocalStagingBytes   int64
+	LocalPackCacheBytes    int64
+	MaxLocalPackCacheBytes int64
+}
+
+// Stats returns a snapshot of controller operational and capacity metrics.
+func (s *Server) Stats() ServerStats {
+	s.diskLimitsMu.Lock()
+	defer s.diskLimitsMu.Unlock()
+
+	return ServerStats{
+		LocalStagingBytes:      s.localStagingBytes,
+		MaxLocalStagingBytes:   s.maxLocalStagingBytes,
+		LocalPackCacheBytes:    s.localPackCacheBytes,
+		MaxLocalPackCacheBytes: s.maxLocalPackCacheBytes,
+	}
+}
+
+func (s *Server) checkStagingCapacity(volumeID string, dataLength int64) error {
+	s.diskLimitsMu.Lock()
+	defer s.diskLimitsMu.Unlock()
+
+	if s.maxLocalStagingBytes > 0 && s.localStagingBytes+dataLength > s.maxLocalStagingBytes {
+		now := time.Now()
+		if last, ok := s.stagingCapWarnings[volumeID]; !ok || now.Sub(last) >= time.Second {
+			s.stagingCapWarnings[volumeID] = now
+			klog.Warningf("ObjectFS volume %s: local staging cap exceeded (total staged: %d bytes, cap: %d bytes)", volumeID, s.localStagingBytes, s.maxLocalStagingBytes)
+		}
+		return syscall.ENOSPC
+	}
+	return nil
+}
+
+func (s *Server) addLocalStagingBytes(delta int64) {
+	s.diskLimitsMu.Lock()
+	s.localStagingBytes += delta
+	s.diskLimitsMu.Unlock()
+}
+
+func (s *Server) subLocalStagingBytes(delta int64) {
+	s.diskLimitsMu.Lock()
+	s.localStagingBytes -= delta
+	if s.localStagingBytes < 0 {
+		klog.Errorf("negative local staging bytes: %d", s.localStagingBytes)
+	}
+	s.diskLimitsMu.Unlock()
+}
+
+func (s *Server) subLocalPackCacheBytes(delta int64) {
+	s.diskLimitsMu.Lock()
+	s.localPackCacheBytes -= delta
+	if s.localPackCacheBytes < 0 {
+		klog.Errorf("negative local pack cache bytes: %d", s.localPackCacheBytes)
+	}
+	s.diskLimitsMu.Unlock()
+}
+
+func (s *Server) addLocalPackCacheBytes(delta int64) int64 {
+	s.diskLimitsMu.Lock()
+	defer s.diskLimitsMu.Unlock()
+
+	s.localPackCacheBytes += delta
+	if s.maxLocalPackCacheBytes > 0 && s.localPackCacheBytes > s.maxLocalPackCacheBytes {
+		return s.localPackCacheBytes - s.maxLocalPackCacheBytes
+	}
+	return 0
+}
+
+func (s *Server) evictLocalPackCache(bytesToEvict int64) {
+	type candidatePack struct {
+		volume   *Volume
+		packID   uint64
+		lastRead time.Time
+	}
+
+	s.mu.RLock()
+	volumes := make([]*Volume, 0, len(s.volumes))
+	for _, volume := range s.volumes {
+		volumes = append(volumes, volume)
+	}
+	s.mu.RUnlock()
+
+	var candidates []candidatePack
+	for _, volume := range volumes {
+		volume.stagingMu.Lock()
+		for packID, info := range volume.packs {
+			if info.state == packUploaded && info.liveReferences <= 0 && info.pack != nil {
+				candidates = append(candidates, candidatePack{
+					volume:   volume,
+					packID:   packID,
+					lastRead: info.lastRead,
+				})
+			}
+		}
+		volume.stagingMu.Unlock()
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].lastRead.Equal(candidates[j].lastRead) {
+			return candidates[i].packID < candidates[j].packID
+		}
+		return candidates[i].lastRead.Before(candidates[j].lastRead)
+	})
+
+	var evictedBytes int64
+	for _, candidate := range candidates {
+		if evictedBytes >= bytesToEvict {
+			break
+		}
+		candidate.volume.stagingMu.Lock()
+		info, ok := candidate.volume.packs[candidate.packID]
+		if ok && info.state == packUploaded && info.liveReferences <= 0 {
+			var packSize int64
+			if info.pack != nil {
+				packSize = info.pack.ByteSize()
+			}
+			candidate.volume.deletePackLocked(candidate.packID)
+			evictedBytes += packSize
+		}
+		candidate.volume.stagingMu.Unlock()
+	}
 }

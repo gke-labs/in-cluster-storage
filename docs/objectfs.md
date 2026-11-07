@@ -473,6 +473,10 @@ To achieve both high write throughput and optimal packing in cloud object storag
    - A blocking `fsync` arriving during an active coalesce window preempts the window and flushes immediately, including all writes in the window.
    - Non-blocking sync failures are retained by the controller and surfaced on the next blocking `fsync` for any affected inode.
    - Controller staged bytes are bounded via `--max-staging-bytes=64MB` per volume; writes that exceed this limit are rejected until an `Fsync` commits staged data.
+   - **Controller Local Disk Caps:**
+     - **Staging Cap (Fail Fast):** `--max-local-staging-bytes=16GB` (default 16 GiB) bounds total unuploaded staged bytes across all volumes. A write that would exceed this cap immediately fails fast with `ENOSPC` and emits a rate-limited Warning log with the volume, total, and cap. There is no waiting or background relief: the store is the bottleneck and the honest answer to the writer is no space now.
+     - **Pack Cache Cap (Eviction Only):** `--max-local-pack-cache-bytes=8GB` (default 8 GiB) bounds total bytes of uploaded packs retained across all volumes for fast local reads. When adding an uploaded pack exceeds the cap, least recently read uploaded packs without live references are evicted across volumes until it fits. Reads of evicted packs fall back to object storage; writers are never blocked.
+     - **Startup Disk Space Check:** On controller startup, the staging directory's filesystem free space (`statfs`) is verified against the sum of `--max-local-staging-bytes`, `--max-local-pack-cache-bytes`, and a 1 GiB margin. If available disk space is insufficient, the controller refuses to start with an error indicating which flag to lower.
 
 6. **Crash Recovery & Client Re-Push:**
    - The open packfile is scratch: if the controller restarts before an `Fsync` completes, open packs are deleted on startup and the staging epoch is bumped as today.

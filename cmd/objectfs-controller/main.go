@@ -68,6 +68,8 @@ type Options struct {
 	DebugStatsCheck           bool
 	SyncCoalesceWindow        time.Duration
 	MaxStagingBytes           int64
+	MaxLocalPackCacheBytes    int64
+	MaxLocalStagingBytes      int64
 	ControllerSyncTimeout     time.Duration
 	OpenBarrierTimeout        time.Duration
 	AcceptUnversionedSegments bool
@@ -87,6 +89,8 @@ func NewOptions() *Options {
 		MetadataApplierBatchSize: 100,
 		SyncCoalesceWindow:       1 * time.Second,
 		MaxStagingBytes:          64 * 1024 * 1024,
+		MaxLocalPackCacheBytes:   8 * 1024 * 1024 * 1024,
+		MaxLocalStagingBytes:     16 * 1024 * 1024 * 1024,
 		ControllerSyncTimeout:    10 * time.Minute,
 		OpenBarrierTimeout:       30 * time.Second,
 	}
@@ -141,6 +145,8 @@ func (o *Options) AddFlags(flagSet *flag.FlagSet) {
 	flagSet.BoolVar(&o.DebugStatsCheck, "debug-stats-check", o.DebugStatsCheck, "Enable debug volume stats checking (for test/CI gates)")
 	flagSet.DurationVar(&o.SyncCoalesceWindow, "sync-coalesce-window", o.SyncCoalesceWindow, "Coalescing window for non-blocking sync requests")
 	flagSet.Int64Var(&o.MaxStagingBytes, "max-staging-bytes", o.MaxStagingBytes, "Maximum byte size of in-memory write staging per volume before backpressure or rejection")
+	flagSet.Int64Var(&o.MaxLocalPackCacheBytes, "max-local-pack-cache-bytes", o.MaxLocalPackCacheBytes, "Maximum controller-wide uploaded pack cache bytes on local disk across all volumes before evicting")
+	flagSet.Int64Var(&o.MaxLocalStagingBytes, "max-local-staging-bytes", o.MaxLocalStagingBytes, "Maximum controller-wide write staging bytes on local disk across all volumes before failing fast with ENOSPC")
 	flagSet.DurationVar(&o.ControllerSyncTimeout, "controller-sync-timeout", o.ControllerSyncTimeout, "Timeout for controller coalesced background sync operations")
 	flagSet.DurationVar(&o.OpenBarrierTimeout, "open-barrier-timeout", o.OpenBarrierTimeout, "Timeout for open-side barrier waiting on in-flight or staged syncs on close-to-open volumes")
 	flagSet.BoolVar(&o.AcceptUnversionedSegments, "accept-unversioned-segments", o.AcceptUnversionedSegments, "Accept unversioned WAL segments, streams and snapshots for one-time upgrade")
@@ -230,7 +236,33 @@ func main() {
 	}
 }
 
+const defaultDiskMarginBytes = 1 * 1024 * 1024 * 1024
+
+func checkStagingDiskSpace(directory string, maxLocalPackCacheBytes int64, maxLocalStagingBytes int64, marginBytes int64) error {
+	if directory == "" {
+		return fmt.Errorf("staging directory is not specified")
+	}
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		return fmt.Errorf("failed to create staging directory %s: %w", directory, err)
+	}
+	var statfs syscall.Statfs_t
+	if err := syscall.Statfs(directory, &statfs); err != nil {
+		return fmt.Errorf("failed to statfs staging directory %s: %w", directory, err)
+	}
+	availableBytes := int64(statfs.Bavail) * int64(statfs.Bsize)
+	requiredBytes := maxLocalPackCacheBytes + maxLocalStagingBytes + marginBytes
+	if availableBytes < requiredBytes {
+		return fmt.Errorf("insufficient disk space on %s: required %d bytes (cache %d, staging %d, margin %d), available %d bytes; lower --max-local-staging-bytes or --max-local-pack-cache-bytes",
+			directory, requiredBytes, maxLocalPackCacheBytes, maxLocalStagingBytes, marginBytes, availableBytes)
+	}
+	return nil
+}
+
 func run(options Options) error {
+	if err := checkStagingDiskSpace(options.MetadataDir, options.MaxLocalPackCacheBytes, options.MaxLocalStagingBytes, defaultDiskMarginBytes); err != nil {
+		return fmt.Errorf("staging disk space check failed: %w", err)
+	}
+
 	// Controller registration uses explicit options: WithDisableWAL(true)
 	// (stream is the source of truth, position and rows move in one batch),
 	// and one process-wide pebble.Cache shared by all volumes. Memtable size
@@ -286,6 +318,12 @@ func run(options Options) error {
 	}
 	if options.MaxStagingBytes > 0 {
 		serverOptions = append(serverOptions, controller.WithServerMaxStagingBytes(options.MaxStagingBytes))
+	}
+	if options.MaxLocalPackCacheBytes > 0 {
+		serverOptions = append(serverOptions, controller.WithServerMaxLocalPackCacheBytes(options.MaxLocalPackCacheBytes))
+	}
+	if options.MaxLocalStagingBytes > 0 {
+		serverOptions = append(serverOptions, controller.WithServerMaxLocalStagingBytes(options.MaxLocalStagingBytes))
 	}
 	if options.ControllerSyncTimeout > 0 {
 		serverOptions = append(serverOptions, controller.WithServerSyncTimeout(options.ControllerSyncTimeout))

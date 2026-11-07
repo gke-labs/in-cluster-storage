@@ -248,3 +248,53 @@ func TestCheckLeafExpiry(t *testing.T) {
 		evaluateLeafExpiry(cert, now)
 	})
 }
+
+func TestLocalDiskCapsFlags(t *testing.T) {
+	options := NewOptions()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	options.AddFlags(flagSet)
+
+	cacheFlag := flagSet.Lookup("max-local-pack-cache-bytes")
+	if cacheFlag == nil {
+		t.Fatal("flag --max-local-pack-cache-bytes not registered")
+	}
+	expectedCacheDefault := "8589934592"
+	if cacheFlag.DefValue != expectedCacheDefault {
+		t.Errorf("default value for --max-local-pack-cache-bytes = %q, want %q", cacheFlag.DefValue, expectedCacheDefault)
+	}
+
+	stagingFlag := flagSet.Lookup("max-local-staging-bytes")
+	if stagingFlag == nil {
+		t.Fatal("flag --max-local-staging-bytes not registered")
+	}
+	expectedStagingDefault := "17179869184"
+	if stagingFlag.DefValue != expectedStagingDefault {
+		t.Errorf("default value for --max-local-staging-bytes = %q, want %q", stagingFlag.DefValue, expectedStagingDefault)
+	}
+}
+
+func TestCheckStagingDiskSpace_StartupRefusal(t *testing.T) {
+	tempDirectory := t.TempDir()
+
+	t.Run("succeeds when disk space is sufficient", func(t *testing.T) {
+		err := checkStagingDiskSpace(tempDirectory, 1024, 1024, 1024)
+		if err != nil {
+			t.Fatalf("checkStagingDiskSpace failed unexpectedly: %v", err)
+		}
+	})
+
+	t.Run("refuses to start when caps exceed free space", func(t *testing.T) {
+		hugeBytes := int64(1) << 60
+		err := checkStagingDiskSpace(tempDirectory, hugeBytes, hugeBytes, defaultDiskMarginBytes)
+		if err == nil {
+			t.Fatal("expected startup refusal when caps exceed free space, but got nil")
+		}
+		errorMessage := err.Error()
+		if !strings.Contains(errorMessage, "insufficient disk space") {
+			t.Errorf("expected error to mention 'insufficient disk space', got: %s", errorMessage)
+		}
+		if !strings.Contains(errorMessage, "--max-local-staging-bytes") || !strings.Contains(errorMessage, "--max-local-pack-cache-bytes") {
+			t.Errorf("expected error to name which flags to lower, got: %s", errorMessage)
+		}
+	})
+}
