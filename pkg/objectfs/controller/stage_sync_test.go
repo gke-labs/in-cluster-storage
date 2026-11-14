@@ -3155,3 +3155,50 @@ func TestServer_Shutdown_FlushesStagedData(t *testing.T) {
 		t.Fatalf("ReadFile content mismatch: got %q, want %q", string(readResp.GetData()), string(data))
 	}
 }
+
+func TestStageAndSync_SingleInFlightSyncRuleFailsLoudly(t *testing.T) {
+	ctx := t.Context()
+	server := NewTestServer(t, NewMemoryBackend())
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close failed: %v", err)
+		}
+	}()
+
+	volumeID := "test-single-sync-rule"
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+
+	volume.stagingMu.Lock()
+	existingOperation := &syncOperation{
+		trigger:   pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
+		startTime: time.Now(),
+	}
+	volume.currentSync = existingOperation
+
+	// executeSyncLocked must be called with stagingMu held and always returns with stagingMu unlocked.
+	_, syncErr := volume.executeSyncLocked(ctx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC, false, nil)
+	if syncErr == nil {
+		t.Fatal("expected executeSyncLocked to fail when a sync is already in flight, got nil error")
+	}
+
+	expectedTriggers := []string{
+		pb.FsyncRequest_SYNC_TRIGGER_PERIODIC.String(),
+		pb.FsyncRequest_SYNC_TRIGGER_CLOSE.String(),
+	}
+	for _, expected := range expectedTriggers {
+		if !strings.Contains(syncErr.Error(), expected) {
+			t.Fatalf("expected error to name trigger %q, got: %v", expected, syncErr)
+		}
+	}
+
+	volume.stagingMu.Lock()
+	if volume.currentSync != existingOperation {
+		t.Fatalf("expected currentSync to not be overwritten, got %+v, want %+v", volume.currentSync, existingOperation)
+	}
+	// Clean up mock operation so volume can close cleanly.
+	volume.currentSync = nil
+	volume.stagingMu.Unlock()
+}

@@ -176,11 +176,17 @@ type Volume struct {
 	maxStagingBytes int64
 	lastSyncError   map[uint64]error
 
-	coalesceTimer      *time.Timer
-	coalesceWaiters    []*syncWaiter
-	coalesceWindow     time.Duration
-	closeTimer         *time.Timer
-	closeInodes        map[uint64]struct{}
+	coalesceTimer   *time.Timer
+	coalesceWaiters []*syncWaiter
+	coalesceWindow  time.Duration
+	closeTimer      *time.Timer
+	closeInodes     map[uint64]struct{}
+	// currentSync tracks the single real sync operation currently in flight, or nil if idle.
+	// At most one real sync is in flight at a time. Every path that starts one waits for
+	// idle (waitForSyncIdleLocked) or skips if a sync is already running, all under stagingMu.
+	// Empty syncs (which find no staged chunks) never install themselves and may run alongside
+	// a real sync harmlessly; they only wait for durability and answer waiters. This is why
+	// there is one pointer and not a list of operations.
 	currentSync        *syncOperation
 	syncTimeout        time.Duration
 	openBarrierTimeout time.Duration
@@ -643,11 +649,12 @@ func (v *Volume) dropPackReferenceLocked(packID uint64) {
 	}
 }
 
-func (v *Volume) finishSync(operation *syncOperation, snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int]stagedChunkReference, pos uint64, inodeFilter map[uint64]struct{}) error {
+func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int]stagedChunkReference, pos uint64, inodeFilter map[uint64]struct{}) error {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
 
-	if operation != nil && v.currentSync == operation {
+	// Clear only the operation this sync installed; see Volume.currentSync for the single-operation rule.
+	if v.currentSync == operation {
 		v.currentSync = nil
 	}
 
@@ -668,24 +675,41 @@ func (v *Volume) finishSync(operation *syncOperation, snapshotSeq uint64, err er
 		}
 	}
 
+	v.completeWaitersAndRearmLocked(snapshotSeq, err, pos, inodeFilter)
+	return err
+}
+
+func (v *Volume) finishEmptySync(snapshotSeq uint64, err error, pos uint64, inodeFilter map[uint64]struct{}) error {
+	v.stagingMu.Lock()
+	defer v.stagingMu.Unlock()
+
+	if err == nil {
+		v.evictUploadedPacksLocked(0)
+	}
+
+	v.completeWaitersAndRearmLocked(snapshotSeq, err, pos, inodeFilter)
+	return err
+}
+
+func (v *Volume) completeWaitersAndRearmLocked(snapshotSeq uint64, err error, pos uint64, inodeFilter map[uint64]struct{}) {
 	var remainingWaiters []*syncWaiter
-	for _, w := range v.coalesceWaiters {
+	for _, waiter := range v.coalesceWaiters {
 		shouldComplete := false
-		if w.seq <= snapshotSeq {
+		if waiter.seq <= snapshotSeq {
 			if inodeFilter == nil {
 				shouldComplete = true
 			} else {
-				if _, ok := inodeFilter[w.inodeID]; ok {
+				if _, ok := inodeFilter[waiter.inodeID]; ok {
 					shouldComplete = true
 				}
 			}
 		}
 
 		if shouldComplete {
-			w.ch <- syncResult{pos: pos, err: err}
-			close(w.ch)
+			waiter.ch <- syncResult{pos: pos, err: err}
+			close(waiter.ch)
 		} else {
-			remainingWaiters = append(remainingWaiters, w)
+			remainingWaiters = append(remainingWaiters, waiter)
 		}
 	}
 	v.coalesceWaiters = remainingWaiters
@@ -700,7 +724,6 @@ func (v *Volume) finishSync(operation *syncOperation, snapshotSeq uint64, err er
 	}
 
 	v.syncCond.Broadcast()
-	return err
 }
 
 func (v *Volume) triggerCoalesceSync() {
@@ -748,8 +771,8 @@ func (v *Volume) syncInodesLocked(ctx context.Context, targetInodes map[uint64]s
 		snapSeq := v.stagingSeq
 		pos := v.Position()
 		v.stagingMu.Unlock()
-		if err := v.finishSync(nil, snapSeq, nil, nil, pos, targetInodes); err != nil {
-			klog.Warningf("ObjectFS volume %s close finishSync failed: %v", v.volumeID, err)
+		if err := v.finishEmptySync(snapSeq, nil, pos, targetInodes); err != nil {
+			klog.Warningf("ObjectFS volume %s close finishEmptySync failed: %v", v.volumeID, err)
 			return pos, err
 		}
 		return pos, nil
@@ -852,7 +875,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 					return epoch, 0, err
 				}
 			}
-			return epoch, pos, v.finishSync(nil, snapSeq, nil, nil, pos, nil)
+			return epoch, pos, v.finishEmptySync(snapSeq, nil, pos, nil)
 		}
 
 		pos, err := v.executeSyncLocked(ctx, trigger, requirePermanent, nil)
@@ -1188,12 +1211,20 @@ func (v *Volume) waitForCommit(ctx context.Context, waitFn func(context.Context)
 	return nil
 }
 
+// executeSyncLocked executes a sync under stagingMu.
+// Preconditions:
+//   - Must be called with v.stagingMu held.
+//   - Must be called with no sync in flight (v.currentSync == nil).
+//
+// Invariant: ALWAYS returns with v.stagingMu UNLOCKED.
 func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_SyncTrigger, requirePermanent bool, inodeFilter map[uint64]struct{}) (uint64, error) {
-	// Must be called with v.stagingMu held.
-	// Invariant: ALWAYS returns with v.stagingMu UNLOCKED.
 	if v.stagingClosed {
 		v.stagingMu.Unlock()
 		return 0, fmt.Errorf("volume closed")
+	}
+	if v.currentSync != nil {
+		v.stagingMu.Unlock()
+		return 0, fmt.Errorf("volume %s cannot start sync with trigger %v: sync with trigger %v is already in flight", v.volumeID, trigger, v.currentSync.trigger)
 	}
 	syncStartTime := time.Now()
 	syncCtx, syncSpan := scoped.StartSpan(ctx, spanVolumeSync)
@@ -1207,7 +1238,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	if err := v.sealActivePackLocked(syncCtx); err != nil {
 		snapSeq := v.stagingSeq
 		v.stagingMu.Unlock()
-		return 0, v.finishSync(nil, snapSeq, err, nil, 0, inodeFilter)
+		return 0, v.finishEmptySync(snapSeq, err, 0, inodeFilter)
 	}
 
 	if len(v.stagedChunks) == 0 {
@@ -1219,7 +1250,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
 			}
 		}
-		return pos, v.finishSync(nil, snapSeq, nil, nil, pos, inodeFilter)
+		return pos, v.finishEmptySync(snapSeq, nil, pos, inodeFilter)
 	}
 
 	snapshotSeq := v.stagingSeq
@@ -1245,7 +1276,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
 			}
 		}
-		return pos, v.finishSync(nil, snapSeq, nil, nil, pos, inodeFilter)
+		return pos, v.finishEmptySync(snapSeq, nil, pos, inodeFilter)
 	}
 
 	snapshotSizes := make(map[uint64]int64, len(snapshotChunks))
@@ -1290,14 +1321,14 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 
 	syncBytes, syncPacks, err := v.uploadPacks(syncCtx, packIDsToUpload)
 	if err != nil {
-		return 0, v.finishSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
+		return 0, v.finishRealSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 	}
 
 	v.mu.Lock()
 	commitSeq, recordsAppended, modifiedAttrs, err := v.appendSyncRecordsLocked(syncCtx, snapshotChunks, snapshotSizes, snapshotMtimes)
 	if err != nil {
 		v.mu.Unlock()
-		return 0, v.finishSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
+		return 0, v.finishRealSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 	}
 
 	reqLevel := v.durability
@@ -1309,7 +1340,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 	v.stagingMu.Unlock()
 
 	if err := v.waitForCommit(syncCtx, waitFn, requirePermanent); err != nil {
-		return 0, v.finishSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
+		return 0, v.finishRealSync(operation, snapshotSeq, err, snapshotChunks, 0, inodeFilter)
 	}
 
 	for _, attr := range modifiedAttrs {
@@ -1331,7 +1362,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 		attribute.Int64(attributeSyncPacks, syncPacks),
 	)
 
-	return commitSeq, v.finishSync(operation, snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
+	return commitSeq, v.finishRealSync(operation, snapshotSeq, nil, snapshotChunks, commitSeq, inodeFilter)
 }
 
 type metadataStreamType struct {
