@@ -30,6 +30,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/consistency"
 	objectfuse "github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuse"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/writemode"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/spf13/cobra"
 )
@@ -107,6 +108,8 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 
 	nodeCache := objectfuse.NewNodeCache(opts.cacheSizeMB * 1024 * 1024)
 	rawFS := objectfuse.NewObjectFS(client, opts.volumeID, writeMode, nodeCache)
+	mountLogger := scoped.Log(context.Background()).WithValues("volume", opts.volumeID, "target", mountpoint)
+	rawFS.SetLogger(mountLogger)
 	rawFS.SetEntryTimeout(opts.entryTimeout)
 	rawFS.SetAttrTimeout(opts.attrTimeout)
 	rawFS.SetConsistencyMode(opts.consistencyMode)
@@ -131,7 +134,7 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 		return fmt.Errorf("failed waiting for FUSE mount at %s: %w", mountpoint, err)
 	}
 
-	watchCtx, cancelWatch := context.WithCancel(ctx)
+	watchCtx, cancelWatch := context.WithCancel(scoped.WithLog(ctx, mountLogger))
 	defer cancelWatch()
 	objectfuse.StartWatcher(watchCtx, client, opts.volumeID, nodeID, opts.consistencyMode, nodeCache, rawFS)
 

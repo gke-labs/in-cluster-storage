@@ -88,7 +88,8 @@ func shaString(data []byte) string {
 }
 
 func TestDiskBlobCachePutAndRead(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "disk-cache-test-*")
+	ctx := t.Context()
+	tempDir, err := os.MkdirTemp("", "disk-cache-put-read-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +108,7 @@ func TestDiskBlobCachePutAndRead(t *testing.T) {
 		t.Fatalf("expected HasBlob to return false before put")
 	}
 
-	if err := cache.PutBlob(sha, data); err != nil {
+	if err := cache.PutBlob(ctx, sha, data); err != nil {
 		t.Fatalf("PutBlob failed: %v", err)
 	}
 
@@ -115,7 +116,7 @@ func TestDiskBlobCachePutAndRead(t *testing.T) {
 		t.Fatalf("expected HasBlob to return true after put")
 	}
 
-	readBytes, err := cache.ReadBlob(sha)
+	readBytes, err := cache.ReadBlob(ctx, sha)
 	if err != nil {
 		t.Fatalf("ReadBlob failed: %v", err)
 	}
@@ -125,6 +126,7 @@ func TestDiskBlobCachePutAndRead(t *testing.T) {
 }
 
 func TestDiskBlobCacheVerifyIntegrity(t *testing.T) {
+	ctx := t.Context()
 	tempDir, err := os.MkdirTemp("", "disk-cache-verify-*")
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +142,7 @@ func TestDiskBlobCacheVerifyIntegrity(t *testing.T) {
 	data := []byte("legitimate data")
 	wrongSha := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-	err = cache.PutBlob(wrongSha, data)
+	err = cache.PutBlob(ctx, wrongSha, data)
 	if err == nil {
 		t.Fatalf("expected PutBlob to fail on sha mismatch")
 	}
@@ -157,6 +159,7 @@ func TestDiskBlobCacheVerifyIntegrity(t *testing.T) {
 }
 
 func TestDiskBlobCachePersistenceAcrossRestart(t *testing.T) {
+	ctx := t.Context()
 	tempDir, err := os.MkdirTemp("", "disk-cache-restart-*")
 	if err != nil {
 		t.Fatal(err)
@@ -173,10 +176,10 @@ func TestDiskBlobCachePersistenceAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cache1.PutBlob(sha1, data1); err != nil {
+	if err := cache1.PutBlob(ctx, sha1, data1); err != nil {
 		t.Fatal(err)
 	}
-	if err := cache1.PutBlob(sha2, data2); err != nil {
+	if err := cache1.PutBlob(ctx, sha2, data2); err != nil {
 		t.Fatal(err)
 	}
 	if err := cache1.Close(); err != nil {
@@ -194,11 +197,11 @@ func TestDiskBlobCachePersistenceAcrossRestart(t *testing.T) {
 		t.Fatalf("expected reopened cache to have both blobs")
 	}
 
-	r1, err := cache2.ReadBlob(sha1)
+	r1, err := cache2.ReadBlob(ctx, sha1)
 	if err != nil || !bytes.Equal(r1, data1) {
 		t.Fatalf("failed reading blob 1 after restart: %v", err)
 	}
-	r2, err := cache2.ReadBlob(sha2)
+	r2, err := cache2.ReadBlob(ctx, sha2)
 	if err != nil || !bytes.Equal(r2, data2) {
 		t.Fatalf("failed reading blob 2 after restart: %v", err)
 	}
@@ -209,6 +212,7 @@ func TestDiskBlobCachePersistenceAcrossRestart(t *testing.T) {
 }
 
 func TestDiskBlobCacheLRUEviction(t *testing.T) {
+	ctx := t.Context()
 	tempDir, err := os.MkdirTemp("", "disk-cache-evict-*")
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +229,7 @@ func TestDiskBlobCacheLRUEviction(t *testing.T) {
 	// Add blob 1 (100 bytes)
 	data1 := bytes.Repeat([]byte("1"), 100)
 	sha1 := shaString(data1)
-	if err := cache.PutBlob(sha1, data1); err != nil {
+	if err := cache.PutBlob(ctx, sha1, data1); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(10 * time.Millisecond)
@@ -233,7 +237,7 @@ func TestDiskBlobCacheLRUEviction(t *testing.T) {
 	// Add blob 2 (100 bytes)
 	data2 := bytes.Repeat([]byte("2"), 100)
 	sha2 := shaString(data2)
-	if err := cache.PutBlob(sha2, data2); err != nil {
+	if err := cache.PutBlob(ctx, sha2, data2); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(10 * time.Millisecond)
@@ -241,13 +245,13 @@ func TestDiskBlobCacheLRUEviction(t *testing.T) {
 	// Add blob 3 (100 bytes) -> total 300 bytes, at capacity
 	data3 := bytes.Repeat([]byte("3"), 100)
 	sha3 := shaString(data3)
-	if err := cache.PutBlob(sha3, data3); err != nil {
+	if err := cache.PutBlob(ctx, sha3, data3); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(10 * time.Millisecond)
 
 	// Access blob 1 so it becomes more recently accessed than blob 2
-	if _, err := cache.ReadBlob(sha1); err != nil {
+	if _, err := cache.ReadBlob(ctx, sha1); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -255,7 +259,7 @@ func TestDiskBlobCacheLRUEviction(t *testing.T) {
 	// Add blob 4 (100 bytes) -> triggers eviction
 	data4 := bytes.Repeat([]byte("4"), 100)
 	sha4 := shaString(data4)
-	if err := cache.PutBlob(sha4, data4); err != nil {
+	if err := cache.PutBlob(ctx, sha4, data4); err != nil {
 		t.Fatal(err)
 	}
 
@@ -274,6 +278,7 @@ func TestDiskBlobCacheLRUEviction(t *testing.T) {
 }
 
 func TestDiskBlobCacheFetchAndSingleflight(t *testing.T) {
+	ctx := t.Context()
 	tempDir, err := os.MkdirTemp("", "disk-cache-fetch-*")
 	if err != nil {
 		t.Fatal(err)
@@ -301,7 +306,7 @@ func TestDiskBlobCacheFetchAndSingleflight(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			fetched, err := cache.FetchBlob(t.Context(), mockClient, sha)
+			fetched, err := cache.FetchBlob(ctx, mockClient, sha)
 			if err != nil {
 				t.Errorf("FetchBlob failed: %v", err)
 			}
@@ -334,6 +339,7 @@ func (w *failCloseWriter) Close() error {
 }
 
 func TestDiskBlobCacheFetchCloseError(t *testing.T) {
+	ctx := t.Context()
 	tempDir, err := os.MkdirTemp("", "disk-cache-close-err-*")
 	if err != nil {
 		t.Fatal(err)
@@ -360,7 +366,7 @@ func TestDiskBlobCacheFetchCloseError(t *testing.T) {
 		return &failCloseWriter{WriteCloser: wc, closeErr: injectedErr}
 	}
 
-	_, err = cache.FetchBlob(t.Context(), mockClient, sha)
+	_, err = cache.FetchBlob(ctx, mockClient, sha)
 	if err == nil {
 		t.Fatal("expected FetchBlob to return error on failing Close(), got nil")
 	}
@@ -389,7 +395,7 @@ func TestDiskBlobCacheFetchCloseError(t *testing.T) {
 
 	// Verify subsequent fetch without failing Close succeeds and retries
 	cache.wrapWriter = nil
-	fetched, err := cache.FetchBlob(t.Context(), mockClient, sha)
+	fetched, err := cache.FetchBlob(ctx, mockClient, sha)
 	if err != nil {
 		t.Fatalf("expected subsequent FetchBlob to succeed, got: %v", err)
 	}

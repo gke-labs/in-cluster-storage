@@ -366,6 +366,9 @@ func (d *objectFSDriver) serveFUSE(targetPath, volumeID string, descriptor int, 
 		Debug:      d.debug,
 	}
 
+	mountLogger := scoped.Log(context.Background()).WithValues("volume", volumeID, "target", targetPath)
+	rawFS.SetLogger(mountLogger)
+
 	mountPoint := fmt.Sprintf("/dev/fd/%d", descriptor)
 	server, err := gofuse.NewServer(rawFS, mountPoint, mountOptions)
 	if err != nil {
@@ -382,7 +385,6 @@ func (d *objectFSDriver) serveFUSE(targetPath, volumeID string, descriptor int, 
 		return fmt.Errorf("failed waiting for FUSE mount at %s: %w", targetPath, err)
 	}
 
-	mountLogger := scoped.Log(context.Background()).WithValues("volume", volumeID, "target", targetPath)
 	watchCtx, cancel := context.WithCancel(scoped.WithLog(context.Background(), mountLogger))
 	objectfuse.StartWatcher(watchCtx, client, volumeID, d.nodeID, consistencyMode, nodeCache, rawFS)
 	scoped.Log(watchCtx).Info("started volume watcher")

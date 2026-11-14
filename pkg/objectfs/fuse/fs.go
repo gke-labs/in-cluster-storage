@@ -28,6 +28,8 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
+	"github.com/go-logr/logr"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
@@ -135,6 +137,8 @@ type ObjectFS struct {
 	inodeAttrsMu sync.RWMutex
 	inodeAttrs   map[uint64]*pb.Inode
 
+	logger logr.Logger
+
 	notifyHook func(notifyEvent)
 }
 
@@ -212,7 +216,18 @@ func NewObjectFSWithTimeouts(client pb.ObjectFSControllerClient, volumeID string
 		inodeAttrs:             make(map[uint64]*pb.Inode),
 	}
 	fs.lookups[fuse.FUSE_ROOT_ID] = 1
+	fs.logger = scoped.Log(context.Background()).WithValues("volume", volumeID)
 	return fs
+}
+
+// SetLogger sets the logger used for operation contexts and filesystem logging.
+func (fs *ObjectFS) SetLogger(logger logr.Logger) {
+	fs.logger = logger
+}
+
+// Logger returns the logger configured on this filesystem mount.
+func (fs *ObjectFS) Logger() logr.Logger {
+	return fs.logger
 }
 
 func (fs *ObjectFS) SetDiskBlobCache(dc *DiskBlobCache) {
@@ -278,19 +293,21 @@ func (fs *ObjectFS) getOrLoadManifest(ctx context.Context, inode uint64) (*fileM
 	return m, nil
 }
 
-func (fs *ObjectFS) startPrefetchOnOpen(inode, fh uint64) {
+func (fs *ObjectFS) startPrefetchOnOpen(ctx context.Context, inode, fh uint64) {
 	if fs.diskCache == nil {
 		return
 	}
 
-	manifest, err := fs.getOrLoadManifest(context.Background(), inode)
+	prefetchCtx, cancel := context.WithCancel(scoped.WithLog(context.Background(), scoped.Log(ctx)))
+
+	manifest, err := fs.getOrLoadManifest(prefetchCtx, inode)
 	if err != nil || manifest == nil || len(manifest.chunkSHAs) == 0 {
+		cancel()
 		return
 	}
 
-	fs.diskCache.RecordKnownBlobs(manifest.chunkSHAs)
+	fs.diskCache.RecordKnownBlobs(prefetchCtx, manifest.chunkSHAs)
 
-	ctx, cancel := context.WithCancel(context.Background())
 	fs.prefetchMu.Lock()
 	if fs.activePrefetches == nil {
 		fs.activePrefetches = make(map[uint64]*prefetchHandle)
@@ -314,7 +331,7 @@ func (fs *ObjectFS) startPrefetchOnOpen(inode, fh uint64) {
 	fs.furthestPrefetched[fh] = limit
 	fs.prefetchMu.Unlock()
 
-	go fs.prefetchChunks(ctx, manifest, 0, limit)
+	go fs.prefetchChunks(prefetchCtx, manifest, 0, limit)
 }
 
 func (fs *ObjectFS) prefetchChunks(ctx context.Context, manifest *fileManifest, start, end int) {
@@ -584,17 +601,17 @@ func (fs *ObjectFS) HeldInodes() []uint64 {
 // SweepRevalidateInodes sends EntryNotify(parent, name) for every tracked dentry
 // and InodeNotify(ino, -1, 0) for every held inode, invalidating kernel caches
 // after a watcher reconnection.
-func (fs *ObjectFS) SweepRevalidateInodes() {
+func (fs *ObjectFS) SweepRevalidateInodes(ctx context.Context) {
 	dentries := fs.TrackedDentries()
 	inodes := fs.HeldInodes()
 
 	klog.V(2).Infof("ObjectFS(%s): sweeping %d dentries and %d inodes on reconnect", fs.volumeID, len(dentries), len(inodes))
 
 	for _, d := range dentries {
-		fs.notifyEntry(d.Parent, d.Name)
+		fs.notifyEntry(ctx, d.Parent, d.Name)
 	}
 	for _, ino := range inodes {
-		fs.notifyInode(ino, -1, 0)
+		fs.notifyInode(ctx, ino, -1, 0)
 	}
 }
 
@@ -610,7 +627,7 @@ func (fs *ObjectFS) makeContextWithTimeout(cancel <-chan struct{}, timeout, defa
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
+	ctx, cancelFunc := context.WithTimeout(scoped.WithLog(context.Background(), fs.Logger()), timeout)
 	if cancel != nil {
 		go func() {
 			select {
@@ -623,7 +640,7 @@ func (fs *ObjectFS) makeContextWithTimeout(cancel <-chan struct{}, timeout, defa
 	return ctx, cancelFunc
 }
 
-func (fs *ObjectFS) logRPCError(op string, err error) {
+func (fs *ObjectFS) logRPCError(ctx context.Context, op string, err error) {
 	if err == nil {
 		return
 	}
@@ -676,8 +693,8 @@ func grpcErrorToStatus(err error) fuse.Status {
 	}
 }
 
-func (fs *ObjectFS) grpcErrorToStatus(op string, err error) fuse.Status {
-	fs.logRPCError(op, err)
+func (fs *ObjectFS) grpcErrorToStatus(ctx context.Context, op string, err error) fuse.Status {
+	fs.logRPCError(ctx, op, err)
 	return grpcErrorToStatus(err)
 }
 
@@ -817,7 +834,7 @@ func (fs *ObjectFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 		Name:        name,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("Lookup", err)
+		return fs.grpcErrorToStatus(ctx, "Lookup", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -839,7 +856,7 @@ func (fs *ObjectFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 		Inode:    input.NodeId,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("GetAttr", err)
+		return fs.grpcErrorToStatus(ctx, "GetAttr", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -867,7 +884,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 			syncCtx, syncCancel := fs.makeSyncContext(cancel)
 			if err := fs.syncAndFsyncLocked(syncCtx, input.NodeId, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
 				syncCancel()
-				return fs.grpcErrorToStatus("Truncate:Sync", err)
+				return fs.grpcErrorToStatus(syncCtx, "Truncate:Sync", err)
 			}
 			syncCancel()
 			truncGen := fs.cache.Truncate(input.NodeId, int64(input.Size), time.Now())
@@ -877,7 +894,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 				Size:     int64(input.Size),
 			})
 			if err != nil {
-				return fs.grpcErrorToStatus("TruncateFile", err)
+				return fs.grpcErrorToStatus(ctx, "TruncateFile", err)
 			}
 			if resp.GetError() != 0 {
 				return fuse.Status(resp.GetError())
@@ -927,7 +944,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 
 		resp, err := fs.client.SetAttr(ctx, req)
 		if err != nil {
-			return fs.grpcErrorToStatus("SetAttr", err)
+			return fs.grpcErrorToStatus(ctx, "SetAttr", err)
 		}
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
@@ -941,7 +958,7 @@ func (fs *ObjectFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *
 			Inode:    input.NodeId,
 		})
 		if err != nil {
-			return fs.grpcErrorToStatus("GetAttr", err)
+			return fs.grpcErrorToStatus(ctx, "GetAttr", err)
 		}
 		if resp.GetError() != 0 {
 			return fuse.Status(resp.GetError())
@@ -1009,7 +1026,7 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 			syncCtx, syncCancel := fs.makeSyncContext(cancel)
 			if err := fs.syncAndFsyncLocked(syncCtx, input.NodeId, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
 				syncCancel()
-				return fs.grpcErrorToStatus("PunchHole:Sync", err)
+				return fs.grpcErrorToStatus(syncCtx, "PunchHole:Sync", err)
 			}
 			syncCancel()
 
@@ -1024,7 +1041,7 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 				KeepSize: punchKeepSize,
 			})
 			if err != nil {
-				return fs.grpcErrorToStatus("PunchHole", err)
+				return fs.grpcErrorToStatus(ctx, "PunchHole", err)
 			}
 			if resp.GetError() != 0 {
 				return fuse.Status(resp.GetError())
@@ -1055,7 +1072,7 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 			syncCtx, syncCancel := fs.makeSyncContext(cancel)
 			if err := fs.syncAndFsyncLocked(syncCtx, input.NodeId, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
 				syncCancel()
-				return fs.grpcErrorToStatus("Fallocate:Sync", err)
+				return fs.grpcErrorToStatus(syncCtx, "Fallocate:Sync", err)
 			}
 			syncCancel()
 
@@ -1071,7 +1088,7 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 					Inode:    input.NodeId,
 				})
 				if err != nil {
-					return fs.grpcErrorToStatus("Fallocate:GetAttr", err)
+					return fs.grpcErrorToStatus(ctx, "Fallocate:GetAttr", err)
 				}
 				if attrResp.GetError() != 0 {
 					return fuse.Status(attrResp.GetError())
@@ -1088,7 +1105,7 @@ func (fs *ObjectFS) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 					Size:     targetSize,
 				})
 				if err != nil {
-					return fs.grpcErrorToStatus("Fallocate:TruncateFile", err)
+					return fs.grpcErrorToStatus(ctx, "Fallocate:TruncateFile", err)
 				}
 				if resp.GetError() != 0 {
 					return fuse.Status(resp.GetError())
@@ -1123,7 +1140,7 @@ func (fs *ObjectFS) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name stri
 		Gid:         input.Gid,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("Mkdir", err)
+		return fs.grpcErrorToStatus(ctx, "Mkdir", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1155,7 +1172,7 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 		Gid:         input.Gid,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("CreateFile", err)
+		return fs.grpcErrorToStatus(ctx, "CreateFile", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1192,7 +1209,7 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 		Gid:         input.Gid,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("CreateFile", err)
+		return fs.grpcErrorToStatus(ctx, "CreateFile", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1221,7 +1238,7 @@ func (fs *ObjectFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name s
 		Name:        name,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("Unlink", err)
+		return fs.grpcErrorToStatus(ctx, "Unlink", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1245,7 +1262,7 @@ func (fs *ObjectFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name st
 		Name:        name,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("Rmdir", err)
+		return fs.grpcErrorToStatus(ctx, "Rmdir", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1271,7 +1288,7 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 		NewName:        newName,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("Rename", err)
+		return fs.grpcErrorToStatus(ctx, "Rename", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1297,7 +1314,7 @@ func (fs *ObjectFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.O
 		Flags:    input.Flags,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("Open", err)
+		return fs.grpcErrorToStatus(ctx, "Open", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1327,8 +1344,8 @@ func (fs *ObjectFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.O
 			// notifyInode is called synchronously inside the OPEN handler for the same inode.
 			// This cannot deadlock because the Linux kernel does not hold inode or page locks
 			// across FUSE_OPEN operations while dispatching to user space.
-			fs.notifyInode(input.NodeId, 0, -1)
-			fs.notifyInode(input.NodeId, -1, 0)
+			fs.notifyInode(ctx, input.NodeId, 0, -1)
+			fs.notifyInode(ctx, input.NodeId, -1, 0)
 		} else {
 			out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 		}
@@ -1337,7 +1354,7 @@ func (fs *ObjectFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.O
 	}
 
 	if fs.diskCache != nil {
-		fs.startPrefetchOnOpen(input.NodeId, out.Fh)
+		fs.startPrefetchOnOpen(ctx, input.NodeId, out.Fh)
 	}
 
 	return fuse.OK
@@ -1357,7 +1374,7 @@ func (fs *ObjectFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 		Inode:    input.NodeId,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("ReadDir", err)
+		return fs.grpcErrorToStatus(ctx, "ReadDir", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1394,7 +1411,7 @@ func (fs *ObjectFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 		Inode:    input.NodeId,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("ReadDir", err)
+		return fs.grpcErrorToStatus(ctx, "ReadDir", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1440,7 +1457,7 @@ func (fs *ObjectFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, point
 		Gid:         header.Gid,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("Symlink", err)
+		return fs.grpcErrorToStatus(ctx, "Symlink", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1465,7 +1482,7 @@ func (fs *ObjectFS) Readlink(cancel <-chan struct{}, header *fuse.InHeader) ([]b
 		Inode:    header.NodeId,
 	})
 	if err != nil {
-		return nil, fs.grpcErrorToStatus("Readlink", err)
+		return nil, fs.grpcErrorToStatus(ctx, "Readlink", err)
 	}
 	if resp.GetError() != 0 {
 		return nil, fuse.Status(resp.GetError())
@@ -1487,7 +1504,7 @@ func (fs *ObjectFS) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename st
 		NewName:        filename,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("Link", err)
+		return fs.grpcErrorToStatus(ctx, "Link", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1519,7 +1536,7 @@ func (fs *ObjectFS) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr
 		Name:     attr,
 	})
 	if err != nil {
-		return 0, fs.grpcErrorToStatus("GetXAttr", err)
+		return 0, fs.grpcErrorToStatus(ctx, "GetXAttr", err)
 	}
 	if resp.GetError() != 0 {
 		return 0, fuse.Status(resp.GetError())
@@ -1550,7 +1567,7 @@ func (fs *ObjectFS) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, des
 		Inode:    header.NodeId,
 	})
 	if err != nil {
-		return 0, fs.grpcErrorToStatus("ListXAttr", err)
+		return 0, fs.grpcErrorToStatus(ctx, "ListXAttr", err)
 	}
 	if resp.GetError() != 0 {
 		return 0, fuse.Status(resp.GetError())
@@ -1597,7 +1614,7 @@ func (fs *ObjectFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, att
 		Flags:    flags,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("SetXAttr", err)
+		return fs.grpcErrorToStatus(ctx, "SetXAttr", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1616,7 +1633,7 @@ func (fs *ObjectFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, a
 		Name:     attr,
 	})
 	if err != nil {
-		return fs.grpcErrorToStatus("RemoveXAttr", err)
+		return fs.grpcErrorToStatus(ctx, "RemoveXAttr", err)
 	}
 	if resp.GetError() != 0 {
 		return fuse.Status(resp.GetError())
@@ -1728,7 +1745,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 			chunkSHA = manifest.chunkSHAs[i]
 		}
 		if fs.diskCache != nil && chunkSHA != "" && fs.diskCache.HasBlob(chunkSHA) {
-			data, err := fs.diskCache.ReadBlob(chunkSHA)
+			data, err := fs.diskCache.ReadBlob(ctx, chunkSHA)
 			if err == nil {
 				slots[pIdx].data = data
 				continue
@@ -1763,7 +1780,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 			Size:     cs,
 		})
 		if err != nil {
-			return nil, 0, fs.grpcErrorToStatus("ReadFile", err), err
+			return nil, 0, fs.grpcErrorToStatus(fCtx, "ReadFile", err), err
 		}
 		if resp.GetError() != 0 {
 			return nil, 0, fuse.Status(resp.GetError()), nil
@@ -1775,7 +1792,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 			if fs.diskCache != nil {
 				sum := sha256.Sum256(fetchedData)
 				sha := hex.EncodeToString(sum[:])
-				if pErr := fs.diskCache.PutBlob(sha, fetchedData); pErr != nil {
+				if pErr := fs.diskCache.PutBlob(fCtx, sha, fetchedData); pErr != nil {
 					klog.V(4).Infof("cache PutBlob failed: %v", pErr)
 				}
 			} else {
@@ -1792,7 +1809,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 			return nil, st
 		}
 		if err != nil {
-			return nil, fs.grpcErrorToStatus("ReadFile", err)
+			return nil, fs.grpcErrorToStatus(ctx, "ReadFile", err)
 		}
 		if tSize > totalSize {
 			totalSize = tSize
@@ -1843,10 +1860,10 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 			return nil, firstStatus
 		}
 		if firstErr != nil {
-			return nil, fs.grpcErrorToStatus("ReadFile", firstErr)
+			return nil, fs.grpcErrorToStatus(ctx, "ReadFile", firstErr)
 		}
 		if err := ctx.Err(); err != nil {
-			return nil, fs.grpcErrorToStatus("ReadFile", err)
+			return nil, fs.grpcErrorToStatus(ctx, "ReadFile", err)
 		}
 	}
 
@@ -1905,7 +1922,7 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 			})
 			cancelFunc()
 			if err != nil {
-				return 0, fs.grpcErrorToStatus("Write:GetAttr", err)
+				return 0, fs.grpcErrorToStatus(ctx, "Write:GetAttr", err)
 			}
 			if resp.GetError() != 0 {
 				return 0, fuse.Status(resp.GetError())
@@ -1963,7 +1980,7 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 				})
 				cancelFunc()
 				if err != nil {
-					return 0, fs.grpcErrorToStatus("Write:ReadFile", err)
+					return 0, fs.grpcErrorToStatus(ctx, "Write:ReadFile", err)
 				}
 				if resp.GetError() != 0 {
 					return 0, fuse.Status(resp.GetError())
@@ -1979,7 +1996,7 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 		syncCtx, cancelFunc := fs.makeSyncContext(cancel)
 		if err := fs.syncVolumeBlocking(syncCtx); err != nil {
 			cancelFunc()
-			return 0, fs.grpcErrorToStatus("Write.Sync", err)
+			return 0, fs.grpcErrorToStatus(syncCtx, "Write.Sync", err)
 		}
 		cancelFunc()
 	}
@@ -2005,7 +2022,7 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 			Size:     dirtySize,
 		})
 		if err != nil {
-			fs.logRPCError("TruncateFile", err)
+			fs.logRPCError(ctx, "TruncateFile", err)
 			return 0, nil, nil, err
 		}
 		if resp.GetError() != 0 {
@@ -2102,7 +2119,7 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 			WriteMode: fs.writeMode,
 		})
 		if err != nil {
-			fs.logRPCError("WriteFile", err)
+			fs.logRPCError(ctx, "WriteFile", err)
 			return 0, nil, nil, err
 		}
 		if resp.GetError() == int32(syscall.ENOSPC) {
@@ -2118,7 +2135,7 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 					StagingEpoch: lastEpoch,
 				})
 				if fErr != nil {
-					fs.logRPCError("Fsync(ENOSPC)", fErr)
+					fs.logRPCError(ctx, "Fsync(ENOSPC)", fErr)
 					return 0, nil, nil, fErr
 				}
 				if fResp.GetError() != 0 {
@@ -2152,7 +2169,7 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 				cData := dirtyChunks[idx]
 				sum := sha256.Sum256(cData)
 				sha := hex.EncodeToString(sum[:])
-				if pErr := fs.diskCache.PutBlob(sha, cData); pErr != nil {
+				if pErr := fs.diskCache.PutBlob(ctx, sha, cData); pErr != nil {
 					klog.V(4).Infof("stage PutBlob failed: %v", pErr)
 				}
 			}
@@ -2222,7 +2239,7 @@ func (fs *ObjectFS) syncVolumeBlocking(ctx context.Context) error {
 		StagingEpoch: lastEpoch,
 	})
 	if err != nil {
-		fs.logRPCError("Fsync(volume)", err)
+		fs.logRPCError(ctx, "Fsync(volume)", err)
 		return err
 	}
 	if resp.GetError() == int32(syscall.ESTALE) || (resp.GetStagingEpoch() != 0 && lastEpoch != 0 && resp.GetStagingEpoch() != lastEpoch) {
@@ -2281,7 +2298,7 @@ func (fs *ObjectFS) syncVolumeNonBlocking(ctx context.Context, trigger pb.FsyncR
 		Trigger:      trigger,
 	})
 	if err != nil {
-		fs.logRPCError("Fsync(volume)", err)
+		fs.logRPCError(ctx, "Fsync(volume)", err)
 		return err
 	}
 	if resp.GetError() == int32(syscall.ESTALE) || (resp.GetStagingEpoch() != 0 && lastEpoch != 0 && resp.GetStagingEpoch() != lastEpoch) {
@@ -2355,7 +2372,7 @@ func (fs *ObjectFS) syncClosedInodes(ctx context.Context) error {
 				Trigger:      pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
 			})
 			if err != nil {
-				fs.logRPCError("Fsync", err)
+				fs.logRPCError(gctx, "Fsync", err)
 				return err
 			}
 			if resp.GetError() == int32(syscall.ESTALE) || (resp.GetStagingEpoch() != 0 && item.epoch != 0 && resp.GetStagingEpoch() != item.epoch) {
@@ -2376,7 +2393,7 @@ func (fs *ObjectFS) syncClosedInodes(ctx context.Context) error {
 					Trigger:      pb.FsyncRequest_SYNC_TRIGGER_CLOSE,
 				})
 				if rErr != nil {
-					fs.logRPCError("Fsync(retry)", rErr)
+					fs.logRPCError(gctx, "Fsync(retry)", rErr)
 					return rErr
 				}
 				if retryResp.GetError() != 0 {
@@ -2425,7 +2442,7 @@ func (fs *ObjectFS) syncAndFsyncLocked(ctx context.Context, inode uint64, blocki
 		Trigger:      trigger,
 	})
 	if err != nil {
-		fs.logRPCError("Fsync", err)
+		fs.logRPCError(ctx, "Fsync", err)
 		return err
 	}
 	if resp.GetError() == int32(syscall.ESTALE) || (resp.GetStagingEpoch() != 0 && epoch != 0 && resp.GetStagingEpoch() != epoch) {
@@ -2442,7 +2459,7 @@ func (fs *ObjectFS) syncAndFsyncLocked(ctx context.Context, inode uint64, blocki
 			Trigger:      trigger,
 		})
 		if rErr != nil {
-			fs.logRPCError("Fsync(retry)", rErr)
+			fs.logRPCError(ctx, "Fsync(retry)", rErr)
 			return rErr
 		}
 		if retryResp.GetError() != 0 {
@@ -2474,7 +2491,7 @@ func (fs *ObjectFS) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Stat
 
 	_, _, _, err := fs.pushDirtyChunksToStaging(ctx, input.NodeId)
 	if err != nil {
-		return fs.grpcErrorToStatus("Flush", err)
+		return fs.grpcErrorToStatus(ctx, "Flush", err)
 	}
 	return fuse.OK
 }
@@ -2484,7 +2501,7 @@ func (fs *ObjectFS) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Stat
 	defer cancelFunc()
 
 	if err := fs.syncAndFsync(ctx, input.NodeId, true, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED); err != nil {
-		return fs.grpcErrorToStatus("Fsync", err)
+		return fs.grpcErrorToStatus(ctx, "Fsync", err)
 	}
 	return fuse.OK
 }
@@ -2521,7 +2538,7 @@ func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 		Fh:       input.Fh,
 	})
 	if err != nil {
-		fs.logRPCError("Release", err)
+		fs.logRPCError(ctx, "Release", err)
 		klog.Warningf("Release RPC failed for volume %s, inode %d, fh %d: %v", fs.volumeID, input.NodeId, input.Fh, err)
 		return
 	}
@@ -2548,7 +2565,7 @@ func (fs *ObjectFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fu
 
 	resp, err := fs.client.GetVolumeStats(ctx, &pb.GetVolumeStatsRequest{VolumeId: fs.volumeID})
 	if err != nil {
-		fs.logRPCError("GetVolumeStats", err)
+		fs.logRPCError(ctx, "GetVolumeStats", err)
 		return fuse.EIO
 	}
 	if resp.GetError() != 0 {
@@ -2610,7 +2627,7 @@ type notifyEvent struct {
 	Length int64
 }
 
-func (fs *ObjectFS) notifyInode(ino uint64, off, length int64) {
+func (fs *ObjectFS) notifyInode(ctx context.Context, ino uint64, off, length int64) {
 	if fs.notifyHook != nil {
 		fs.notifyHook(notifyEvent{Op: "inode", Inode: ino, Off: off, Length: length})
 	}
@@ -2625,7 +2642,7 @@ func (fs *ObjectFS) notifyInode(ino uint64, off, length int64) {
 	}
 }
 
-func (fs *ObjectFS) notifyEntry(parent uint64, name string) {
+func (fs *ObjectFS) notifyEntry(ctx context.Context, parent uint64, name string) {
 	if fs.notifyHook != nil {
 		fs.notifyHook(notifyEvent{Op: "entry", Parent: parent, Name: name})
 	}
@@ -2640,7 +2657,7 @@ func (fs *ObjectFS) notifyEntry(parent uint64, name string) {
 	}
 }
 
-func (fs *ObjectFS) notifyDelete(parent, child uint64, name string) {
+func (fs *ObjectFS) notifyDelete(ctx context.Context, parent, child uint64, name string) {
 	if fs.notifyHook != nil {
 		fs.notifyHook(notifyEvent{Op: "delete", Parent: parent, Child: child, Name: name})
 	}
@@ -2655,7 +2672,7 @@ func (fs *ObjectFS) notifyDelete(parent, child uint64, name string) {
 	}
 }
 
-func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*ObjectFS) {
+func handleWatchEvent(ctx context.Context, ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*ObjectFS) {
 	if ev == nil || ev.GetEventType() == pb.WatchEventType_EVENT_CHECKPOINT_REQUEST {
 		return
 	}
@@ -2730,18 +2747,18 @@ func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*Object
 		switch ev.GetEventType() {
 		case pb.WatchEventType_EVENT_MODIFIED:
 			if ino != 0 {
-				f.notifyInode(ino, 0, -1)
+				f.notifyInode(ctx, ino, 0, -1)
 			}
 		case pb.WatchEventType_EVENT_CREATED:
 			if parent := ev.GetParentInode(); parent != 0 && ev.GetName() != "" {
-				f.notifyEntry(parent, ev.GetName())
+				f.notifyEntry(ctx, parent, ev.GetName())
 			}
 		case pb.WatchEventType_EVENT_DELETED:
 			if parent := ev.GetParentInode(); parent != 0 && ev.GetName() != "" {
 				if ino != 0 {
-					f.notifyDelete(parent, ino, ev.GetName())
+					f.notifyDelete(ctx, parent, ino, ev.GetName())
 				} else {
-					f.notifyEntry(parent, ev.GetName())
+					f.notifyEntry(ctx, parent, ev.GetName())
 				}
 			}
 		case pb.WatchEventType_EVENT_RENAMED:
@@ -2751,13 +2768,13 @@ func handleWatchEvent(ev *pb.WatchVolumeResponse, cache *NodeCache, fs []*Object
 			newName := ev.GetName()
 
 			if oldParent != 0 && oldName != "" {
-				f.notifyEntry(oldParent, oldName)
-				f.notifyInode(oldParent, -1, 0)
+				f.notifyEntry(ctx, oldParent, oldName)
+				f.notifyInode(ctx, oldParent, -1, 0)
 			}
 			if newParent != 0 && newName != "" {
-				f.notifyEntry(newParent, newName)
+				f.notifyEntry(ctx, newParent, newName)
 				if newParent != oldParent {
-					f.notifyInode(newParent, -1, 0)
+					f.notifyInode(ctx, newParent, -1, 0)
 				}
 			}
 		}
@@ -2838,7 +2855,7 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				for _, f := range fs {
 					if f != nil {
 						f.invalidateAllManifests()
-						f.SweepRevalidateInodes()
+						f.SweepRevalidateInodes(ctx)
 					}
 				}
 				hasDisconnected = false
@@ -2867,7 +2884,7 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 					klog.V(2).Infof("WatchVolume stream error for volume %s, node %s: %v; backing off %v", volumeID, nodeID, err, backoff)
 					break
 				}
-				handleWatchEvent(ev, cache, fs)
+				handleWatchEvent(ctx, ev, cache, fs)
 			}
 			select {
 			case <-ctx.Done():

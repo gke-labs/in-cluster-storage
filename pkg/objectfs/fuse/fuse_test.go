@@ -37,8 +37,10 @@ import (
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller/controllertest"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer/buffertest"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
+	"github.com/go-logr/logr/funcr"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -2911,6 +2913,7 @@ func TestFUSEHandlerXAttrCountShortcut(t *testing.T) {
 }
 
 func TestFUSEHandlerXAttrCountInvalidationAndPruning(t *testing.T) {
+	ctx := t.Context()
 	realClient, cleanup := createTestClient(t)
 	defer cleanup()
 
@@ -2936,7 +2939,7 @@ func TestFUSEHandlerXAttrCountInvalidationAndPruning(t *testing.T) {
 		EventType: pb.WatchEventType_EVENT_MODIFIED,
 		Inode:     fileIno,
 	}
-	handleWatchEvent(ev, cache, []*ObjectFS{rawFS})
+	handleWatchEvent(ctx, ev, cache, []*ObjectFS{rawFS})
 
 	if rawFS.isXattrCountZero(fileIno) {
 		t.Fatalf("expected isXattrCountZero to be false after EVENT_MODIFIED watch event")
@@ -5403,6 +5406,7 @@ func TestFUSEFallocateMultiClientReadsZeros(t *testing.T) {
 }
 
 func TestWatchEventDecisionLogic(t *testing.T) {
+	ctx := t.Context()
 	cache := NewNodeCache(1024 * 1024)
 	fs := &ObjectFS{
 		manifests: make(map[uint64]*fileManifest),
@@ -5417,7 +5421,7 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 	fs.manifests[100] = &fileManifest{inode: 100}
 	cache.Put(100, []byte("clean-data"), time.Now(), "")
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_MODIFIED,
 		Inode:     100,
 	}, cache, []*ObjectFS{fs})
@@ -5440,7 +5444,7 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 	cache.WriteAt(200, 0, []byte("dirty-data"), time.Now())
 	fs.manifests[200] = &fileManifest{inode: 200}
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType: pb.WatchEventType_EVENT_MODIFIED,
 		Inode:     200,
 	}, cache, []*ObjectFS{fs})
@@ -5457,7 +5461,7 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 
 	// Dirty skip also applies to DELETED and RENAMED
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:   pb.WatchEventType_EVENT_DELETED,
 		Inode:       200,
 		ParentInode: 1,
@@ -5468,7 +5472,7 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 	}
 
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_RENAMED,
 		Inode:          200,
 		OldParentInode: 1,
@@ -5482,7 +5486,7 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 
 	// 3. EVENT_CREATED: emits EntryNotify(parent, name)
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:   pb.WatchEventType_EVENT_CREATED,
 		Inode:       300,
 		ParentInode: 1,
@@ -5497,7 +5501,7 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 
 	// 4. EVENT_DELETED with known child inode: emits DeleteNotify(parent, child, name)
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:   pb.WatchEventType_EVENT_DELETED,
 		Inode:       400,
 		ParentInode: 1,
@@ -5512,7 +5516,7 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 
 	// 5. EVENT_DELETED with unknown child inode (0): emits EntryNotify(parent, name)
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:   pb.WatchEventType_EVENT_DELETED,
 		Inode:       0,
 		ParentInode: 1,
@@ -5528,7 +5532,7 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 	// 6. EVENT_RENAMED across different directories:
 	// emits EntryNotify on both (old_parent, old_name) and (parent, name), plus InodeNotify on both directories
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_RENAMED,
 		Inode:          500,
 		OldParentInode: 1,
@@ -5555,7 +5559,7 @@ func TestWatchEventDecisionLogic(t *testing.T) {
 	// 7. EVENT_RENAMED within the same directory:
 	// emits EntryNotify for old and new name, plus InodeNotify on the directory once
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_RENAMED,
 		Inode:          500,
 		OldParentInode: 1,
@@ -5875,6 +5879,7 @@ func TestWriteCacheWritebackGetAttrFailureReturnsEIO(t *testing.T) {
 }
 
 func TestWatchEventPositionDecisionLogic(t *testing.T) {
+	ctx := t.Context()
 	cache := NewNodeCache(1024 * 1024)
 	fs := &ObjectFS{
 		manifests: make(map[uint64]*fileManifest),
@@ -5895,7 +5900,7 @@ func TestWatchEventPositionDecisionLogic(t *testing.T) {
 	cache.Put(100, []byte("cached-data"), time.Now(), "")
 	events = nil
 
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_MODIFIED,
 		Inode:          100,
 		StreamPosition: 50,
@@ -5912,7 +5917,7 @@ func TestWatchEventPositionDecisionLogic(t *testing.T) {
 	}
 
 	// Also an older event (pos 40 <= 50) is skipped.
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_MODIFIED,
 		Inode:          100,
 		StreamPosition: 40,
@@ -5922,7 +5927,7 @@ func TestWatchEventPositionDecisionLogic(t *testing.T) {
 	}
 
 	// 2. Foreign event with a higher position is NOT skipped.
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_MODIFIED,
 		Inode:          100,
 		StreamPosition: 51,
@@ -5956,7 +5961,7 @@ func TestWatchEventPositionDecisionLogic(t *testing.T) {
 	events = nil
 
 	// Stale-looking event at pos 50 (previously lower than 100, but now KnownPosition is 0)
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_MODIFIED,
 		Inode:          100,
 		StreamPosition: 50,
@@ -5978,7 +5983,7 @@ func TestWatchEventPositionDecisionLogic(t *testing.T) {
 	cache.RecordPosition(1, 59) // parent known position is lower than event pos 60
 
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_CREATED,
 		Inode:          100,
 		ParentInode:    1,
@@ -5993,7 +5998,7 @@ func TestWatchEventPositionDecisionLogic(t *testing.T) {
 	// When both are known >= event.position, it is skipped.
 	cache.RecordPosition(1, 60)
 	events = nil
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_CREATED,
 		Inode:          100,
 		ParentInode:    1,
@@ -6036,6 +6041,7 @@ func TestWatchEventPositionDecisionLogic(t *testing.T) {
 }
 
 func TestDirectoryGetAttrDoesNotSuppressDeleteNotify(t *testing.T) {
+	ctx := t.Context()
 	cache := NewNodeCache(1024 * 1024)
 	fs := &ObjectFS{
 		cache:     cache,
@@ -6069,7 +6075,7 @@ func TestDirectoryGetAttrDoesNotSuppressDeleteNotify(t *testing.T) {
 
 	// Node A unlinks child "x" at position 100 (which is <= parentAttr.Position 105).
 	// When Node B receives the EVENT_DELETED watch event, it must NOT skip the notification.
-	handleWatchEvent(&pb.WatchVolumeResponse{
+	handleWatchEvent(ctx, &pb.WatchVolumeResponse{
 		EventType:      pb.WatchEventType_EVENT_DELETED,
 		Inode:          childIno,
 		ParentInode:    parentIno,
@@ -6510,6 +6516,7 @@ func TestHealthGatedTimeouts(t *testing.T) {
 }
 
 func TestReconnectSweep(t *testing.T) {
+	ctx := t.Context()
 	client, cleanup := createTestClient(t)
 	defer cleanup()
 
@@ -6554,7 +6561,7 @@ func TestReconnectSweep(t *testing.T) {
 	events = nil
 	notifyMu.Unlock()
 
-	rawFS.SweepRevalidateInodes()
+	rawFS.SweepRevalidateInodes(ctx)
 
 	notifyMu.Lock()
 	sweepEvents := make([]notifyEvent, len(events))
@@ -6612,7 +6619,7 @@ func TestReconnectSweep(t *testing.T) {
 	events = nil
 	notifyMu.Unlock()
 
-	rawFS.SweepRevalidateInodes()
+	rawFS.SweepRevalidateInodes(ctx)
 
 	notifyMu.Lock()
 	sweepEvents2 := make([]notifyEvent, len(events))
@@ -6634,6 +6641,7 @@ func TestReconnectSweep(t *testing.T) {
 }
 
 func TestTwoClientsDentryAndInodeReconnectSweep(t *testing.T) {
+	ctx := t.Context()
 	client, cleanup := createTestClient(t)
 	defer cleanup()
 
@@ -6682,7 +6690,7 @@ func TestTwoClientsDentryAndInodeReconnectSweep(t *testing.T) {
 	eventsB = nil
 	notifyMu.Unlock()
 
-	rawFSB.SweepRevalidateInodes()
+	rawFSB.SweepRevalidateInodes(ctx)
 
 	notifyMu.Lock()
 	sweep1 := make([]notifyEvent, len(eventsB))
@@ -6715,7 +6723,7 @@ func TestTwoClientsDentryAndInodeReconnectSweep(t *testing.T) {
 	eventsB = nil
 	notifyMu.Unlock()
 
-	rawFSB.SweepRevalidateInodes()
+	rawFSB.SweepRevalidateInodes(ctx)
 
 	notifyMu.Lock()
 	sweep2 := make([]notifyEvent, len(eventsB))
@@ -7360,4 +7368,36 @@ func TestCloseToOpen_TwoNodeReaderCacheInvalidation(t *testing.T) {
 		}
 	}
 	fsB.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: ino16m}, Fh: openOutB16_2.Fh})
+}
+
+func TestFUSEOperationContextCarriesMountLogger(t *testing.T) {
+	var loggedArgs string
+	mountLogger := funcr.New(func(prefix, args string) {
+		loggedArgs = args
+	}, funcr.Options{}).WithValues("volume", "test-vol-xyz", "target", "/test/mount")
+
+	rawFS := NewObjectFS(nil, "test-vol-xyz", pb.WriteMode_FSYNC, nil)
+	rawFS.SetLogger(mountLogger)
+
+	// Verify makeContext attaches the mount logger
+	ctx, cancel := rawFS.makeContext(nil)
+	defer cancel()
+
+	scoped.Log(ctx).Info("test fuse operation")
+	if !strings.Contains(loggedArgs, `"volume"="test-vol-xyz"`) {
+		t.Fatalf("expected logged args to contain volume key, got: %s", loggedArgs)
+	}
+	if !strings.Contains(loggedArgs, `"target"="/test/mount"`) {
+		t.Fatalf("expected logged args to contain target key, got: %s", loggedArgs)
+	}
+
+	// Verify makeSyncContext attaches the mount logger
+	loggedArgs = ""
+	syncCtx, syncCancel := rawFS.makeSyncContext(nil)
+	defer syncCancel()
+
+	scoped.Log(syncCtx).Info("test sync operation")
+	if !strings.Contains(loggedArgs, `"volume"="test-vol-xyz"`) {
+		t.Fatalf("expected logged sync args to contain volume key, got: %s", loggedArgs)
+	}
 }

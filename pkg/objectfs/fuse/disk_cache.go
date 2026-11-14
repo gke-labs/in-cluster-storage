@@ -164,7 +164,7 @@ func (c *DiskBlobCache) reconcileDiskState() error {
 	}
 	c.curBytes = totalBytes
 
-	c.evictIfNeededLocked()
+	c.evictIfNeededLocked(context.Background())
 	return nil
 }
 
@@ -179,7 +179,7 @@ func (c *DiskBlobCache) HasBlob(sha string) bool {
 }
 
 // ReadBlob reads a blob directly from disk and updates its access time.
-func (c *DiskBlobCache) ReadBlob(sha string) ([]byte, error) {
+func (c *DiskBlobCache) ReadBlob(ctx context.Context, sha string) ([]byte, error) {
 	if sha == "" {
 		return nil, fmt.Errorf("sha256 is required")
 	}
@@ -207,7 +207,7 @@ func (c *DiskBlobCache) ReadBlob(sha string) ([]byte, error) {
 
 // PutBlob stores data directly into the blob cache under its sha256 hash,
 // verifying the content hash before renaming into place.
-func (c *DiskBlobCache) PutBlob(sha string, data []byte) error {
+func (c *DiskBlobCache) PutBlob(ctx context.Context, sha string, data []byte) error {
 	if sha == "" {
 		return fmt.Errorf("sha256 is required")
 	}
@@ -252,7 +252,7 @@ func (c *DiskBlobCache) PutBlob(sha string, data []byte) error {
 	}
 
 	c.curBytes += int64(len(data))
-	c.evictIfNeededLocked()
+	c.evictIfNeededLocked(ctx)
 	return nil
 }
 
@@ -265,13 +265,13 @@ func (c *DiskBlobCache) FetchBlob(ctx context.Context, client pb.ObjectFSControl
 	}
 
 	if c.HasBlob(sha) {
-		return c.ReadBlob(sha)
+		return c.ReadBlob(ctx, sha)
 	}
 
 	res, err, _ := c.sf.Do(sha, func() (any, error) {
 		// Double check if another call completed it
 		if c.HasBlob(sha) {
-			return c.ReadBlob(sha)
+			return c.ReadBlob(ctx, sha)
 		}
 
 		if client == nil {
@@ -354,11 +354,11 @@ func (c *DiskBlobCache) FetchBlob(ctx context.Context, client pb.ObjectFSControl
 			klog.Warningf("DiskBlobCache: failed recording blob %s in SQLite: %v", sha, err)
 		}
 		c.curBytes += totalBytes
-		c.evictIfNeededLocked()
+		c.evictIfNeededLocked(ctx)
 		c.mu.Unlock()
 
 		success = true
-		return c.ReadBlob(sha)
+		return c.ReadBlob(ctx, sha)
 	})
 
 	if err != nil {
@@ -380,7 +380,7 @@ func (c *DiskBlobCache) EnsureBlob(ctx context.Context, client pb.ObjectFSContro
 }
 
 // RecordKnownBlobs inserts known sha256 hashes into the SQLite index without fetching them.
-func (c *DiskBlobCache) RecordKnownBlobs(shas []string) {
+func (c *DiskBlobCache) RecordKnownBlobs(ctx context.Context, shas []string) {
 	if len(shas) == 0 || c.closed.Load() {
 		return
 	}
@@ -402,7 +402,7 @@ func (c *DiskBlobCache) RecordKnownBlobs(shas []string) {
 }
 
 // evictIfNeededLocked evicts least recently accessed cached blobs when curBytes exceeds maxBytes.
-func (c *DiskBlobCache) evictIfNeededLocked() {
+func (c *DiskBlobCache) evictIfNeededLocked(ctx context.Context) {
 	if c.curBytes <= c.maxBytes {
 		return
 	}

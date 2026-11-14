@@ -397,7 +397,7 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 			sha := manifest.GetChunkSha256()[chunkIdx]
 			if sha != "" {
 				if d.diskCache.HasBlob(sha) {
-					if data, readErr := d.diskCache.ReadBlob(sha); readErr == nil {
+					if data, readErr := d.diskCache.ReadBlob(ctx, sha); readErr == nil {
 						chunkData = data
 					} else {
 						klog.V(4).Infof("disk cache ReadBlob %s: %v", sha, readErr)
@@ -433,7 +433,7 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 			if d.diskCache != nil && len(chunkData) > 0 {
 				sum := sha256.Sum256(chunkData)
 				sha := hex.EncodeToString(sum[:])
-				if putErr := d.diskCache.PutBlob(sha, chunkData); putErr != nil {
+				if putErr := d.diskCache.PutBlob(ctx, sha, chunkData); putErr != nil {
 					klog.V(4).Infof("disk cache PutBlob %s: %v", sha, putErr)
 				}
 			}
