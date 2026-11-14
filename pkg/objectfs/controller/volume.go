@@ -649,6 +649,33 @@ func (v *Volume) dropPackReferenceLocked(packID uint64) {
 	}
 }
 
+// finishRealSync completes an in-flight real sync operation.
+//
+// It acquires and releases v.stagingMu. Must be called WITHOUT v.stagingMu held.
+//
+// If v.currentSync matches operation, it clears v.currentSync (see Volume.currentSync
+// for the single-operation rule).
+//
+// On failure (err != nil), snapshotChunks remain staged in v.stagedChunks for retry,
+// and err is recorded in v.lastSyncError for each inode in snapshotChunks.
+//
+// On success (err == nil), it attempts to evict unreferenced uploaded packs to reclaim
+// staging space (evictUploadedPacksLocked), drops staged chunk references in snapshotChunks
+// from v.stagedChunks that have not been superseded by newer writes, and clears any
+// v.lastSyncError for those inodes.
+//
+// Finally, it calls completeWaitersAndRearmLocked under v.stagingMu to complete matching
+// coalesce waiters, re-arm timers, and broadcast v.syncCond.
+//
+// Parameters:
+//   - operation: the syncOperation installed in v.currentSync when the real sync began.
+//   - snapshotSeq: the staging sequence number (stagingSeq) captured when the snapshot was taken;
+//     waiters registered at or before this sequence are eligible for completion.
+//   - err: the sync error (pack upload, metadata append, or commit wait), or nil on success.
+//   - snapshotChunks: the staged chunks that were snapshot and processed by this sync.
+//   - pos: the WAL commit sequence number achieved by the sync, reported to waiters.
+//   - inodeFilter: optional set of target inode IDs; if non-nil, only waiters for these inodes
+//     are completed; if nil, all waiters with seq <= snapshotSeq are completed.
 func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, err error, snapshotChunks map[uint64]map[int]stagedChunkReference, pos uint64, inodeFilter map[uint64]struct{}) error {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
@@ -679,6 +706,26 @@ func (v *Volume) finishRealSync(operation *syncOperation, snapshotSeq uint64, er
 	return err
 }
 
+// finishEmptySync completes an empty sync operation that did not upload or commit new chunks.
+//
+// It acquires and releases v.stagingMu. Must be called WITHOUT v.stagingMu held.
+//
+// Unlike finishRealSync, it does not touch v.currentSync because empty syncs do not install
+// a syncOperation and can run alongside an in-flight real sync (see Volume.currentSync).
+//
+// On success (err == nil), it evicts unreferenced uploaded packs to reclaim staging space
+// (evictUploadedPacksLocked).
+//
+// It calls completeWaitersAndRearmLocked under v.stagingMu to deliver pos and err to matching
+// coalesce waiters, re-arm timers, and broadcast v.syncCond.
+//
+// Parameters:
+//   - snapshotSeq: the staging sequence number (stagingSeq) captured when the sync began;
+//     waiters registered at or before this sequence are eligible for completion.
+//   - err: the error encountered (e.g., from sealActivePackLocked), or nil on success.
+//   - pos: the stream position (v.Position()) delivered to completed waiters.
+//   - inodeFilter: optional set of target inode IDs; if non-nil, only waiters for these inodes
+//     are completed; if nil, all waiters with seq <= snapshotSeq are completed.
 func (v *Volume) finishEmptySync(snapshotSeq uint64, err error, pos uint64, inodeFilter map[uint64]struct{}) error {
 	v.stagingMu.Lock()
 	defer v.stagingMu.Unlock()
@@ -691,6 +738,31 @@ func (v *Volume) finishEmptySync(snapshotSeq uint64, err error, pos uint64, inod
 	return err
 }
 
+// completeWaitersAndRearmLocked notifies matching coalesce waiters, re-arms staging timers,
+// and broadcasts v.syncCond.
+//
+// Preconditions:
+//   - Requires v.stagingMu to be held by the caller (indicated by the Locked suffix).
+//   - Does not acquire or release v.stagingMu.
+//
+// It scans v.coalesceWaiters and completes any waiter whose seq is <= snapshotSeq and whose
+// inodeID is in inodeFilter (or all waiters with seq <= snapshotSeq if inodeFilter is nil).
+// Completed waiters receive syncResult{pos: pos, err: err} on waiter.ch, which is then closed.
+// Uncompleted waiters remain in v.coalesceWaiters.
+//
+// If the volume is accepting mutations (rejectMutationLocked() == nil), it re-arms
+// v.coalesceTimer if remaining waiters or staged chunks exist, and re-arms v.closeTimer
+// if pending closed inodes exist.
+//
+// Finally, it broadcasts v.syncCond to wake goroutines waiting on sync idle or staging space.
+//
+// Parameters:
+//   - snapshotSeq: staging sequence number cutoff; only waiters registered at or before this
+//     sequence (waiter.seq <= snapshotSeq) are completed.
+//   - err: error result to deliver to completed waiters, or nil on success.
+//   - pos: stream position (commit sequence number or current position) delivered to completed waiters.
+//   - inodeFilter: optional set of target inode IDs; if non-nil, restricts completion to waiters
+//     targeting these inodes; if nil, applies to all waiters with seq <= snapshotSeq.
 func (v *Volume) completeWaitersAndRearmLocked(snapshotSeq uint64, err error, pos uint64, inodeFilter map[uint64]struct{}) {
 	var remainingWaiters []*syncWaiter
 	for _, waiter := range v.coalesceWaiters {
@@ -1217,7 +1289,73 @@ func (v *Volume) waitForCommit(ctx context.Context, waitFn func(context.Context)
 	return nil
 }
 
-// executeSyncLocked executes a sync under stagingMu.
+// executeSyncLocked executes a sync for the volume under stagingMu.
+//
+// What a sync achieves:
+// A sync flushes staged in-memory writes and metadata updates to durable storage.
+// It snapshots staged chunk data, uploads un-uploaded sealed packfiles to the underlying
+// blob store, records file chunk entries and updated inode attributes/manifests in the WAL
+// metadata stream, waits for WAL commit durability, and retires successfully committed staged
+// chunks from memory.
+//
+// Staged data processed:
+//   - If inodeFilter is nil, it snapshots all staged chunks across all inodes in v.stagedChunks.
+//   - If inodeFilter is non-nil, it snapshots only staged chunks for the inodes present in inodeFilter.
+//
+// Uploads:
+// It first seals the active packfile via sealActivePackLocked. If staged chunks exist to sync,
+// it identifies all sealed packfiles in v.packs that have not yet been uploaded (state != packUploaded)
+// and uploads them to the underlying blob store via uploadPacks (with v.stagingMu released).
+//
+// Metadata records appended:
+// Under v.mu, inside a "syncVolume" transaction:
+//   - For each synced inode:
+//   - If inline (newSize <= maxInlineLen and len(chunks) <= 1), it inserts a pb.FileChunk
+//     containing InlineData and updates the pb.Inode row with size, mtime/ctime, and ContentSha256.
+//   - Otherwise, it inserts a pb.FileChunk row for each chunk index with its SHA-256 hash,
+//     generates an encoded blob.Manifest across all chunk hashes of the file, and updates the
+//     pb.Inode row with size, mtime/ctime, and ManifestSha256.
+//   - It commits the transaction via commitTxLocked to the WAL metadata stream at commitSeq.
+//   - It broadcasts WatchVolumeResponse modification events for each modified inode's attributes.
+//
+// Durability wait:
+// After committing metadata, it waits outside v.mu (waitForCommit):
+//   - It waits on the WAL stream up to commitSeq according to the volume's configured durability
+//     level (walclient.Permanent with sync=true, walclient.Witness with sync=false, or
+//     walclient.Local with sync=false).
+//   - If requirePermanent is true, it additionally flushes the stream (v.stream.Flush) to ensure
+//     permanent replication regardless of the volume's default level.
+//
+// Return on success (returns commitSeq, nil):
+//   - All sealed packfiles containing the snapshot chunks have been uploaded to object storage.
+//   - All metadata mutations (FileChunk rows and Inode updates) are committed to the WAL metadata
+//     stream at commitSeq and durable to the requested level (and flushed permanently if requirePermanent).
+//   - For each synced chunk, if the staged chunk reference in v.stagedChunks has not been superseded
+//     by a newer write, it is dropped from staging (dropStagedChunkLocked), reclaiming staging memory.
+//   - Unreferenced uploaded packfiles may be evicted (evictUploadedPacksLocked).
+//   - Any prior sync errors for the synced inodes in v.lastSyncError are cleared.
+//   - All coalesce waiters registered at or before snapshotSeq matching the synced inodes have
+//     been sent commitSeq and closed.
+//   - Staging timers (coalesceTimer, closeTimer) are re-armed if remaining staged chunks or waiters exist.
+//   - v.currentSync is cleared, and v.syncCond is broadcast.
+//
+// Return on failure (returns 0, err):
+//   - If pack sealing, pack upload, metadata append, or durability wait fails, all staged chunks
+//     in v.stagedChunks remain intact in memory (none are dropped) so subsequent sync attempts can retry.
+//   - The error is recorded in v.lastSyncError for all snapshotted inodes.
+//   - All matching coalesce waiters registered at or before snapshotSeq receive the error and their
+//     channels are closed.
+//   - v.currentSync is cleared, and v.syncCond is broadcast.
+//
+// Empty syncs:
+// An empty sync occurs when there are no staged chunks in the volume or none matching inodeFilter
+// (or if sealActivePackLocked fails before an operation is installed). If the volume stream replication
+// level is Permanent, an empty sync flushes the stream. Empty syncs do not upload packfiles or append
+// new metadata records, and they never install themselves into v.currentSync. Because of this, an empty
+// sync can run alongside an in-flight real sync without violating the single-operation rule (see
+// Volume.currentSync); it simply ensures stream durability if required and completes waiters up to
+// snapshotSeq.
+//
 // Preconditions:
 //   - Must be called with v.stagingMu held.
 //   - Must be called with no sync in flight (v.currentSync == nil).
