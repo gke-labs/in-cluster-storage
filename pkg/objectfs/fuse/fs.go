@@ -37,7 +37,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"k8s.io/klog/v2"
 )
 
 // MaxNameLength is the maximum allowed byte length for a path component name
@@ -374,7 +373,7 @@ func (fs *ObjectFS) prefetchChunks(ctx context.Context, manifest *fileManifest, 
 				wg.Done()
 			}()
 			if err := fs.diskCache.EnsureBlob(ctx, fs.client, chunkSHA); err != nil {
-				klog.V(4).Infof("prefetch EnsureBlob failed for %s: %v", chunkSHA, err)
+				scoped.Log(ctx).V(4).Info("prefetch EnsureBlob failed", "sha", chunkSHA, "err", err)
 			}
 		}(sha)
 	}
@@ -404,13 +403,13 @@ func (fs *ObjectFS) StartBackgroundSync(ctx context.Context) {
 			case <-ticker.C:
 				syncCtx, cancel := context.WithTimeout(ctx, fs.syncTimeout)
 				if err := fs.syncVolumeNonBlocking(syncCtx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC); err != nil {
-					klog.Warningf("ObjectFS volume %s background sync failed: %v", fs.volumeID, err)
+					scoped.Log(syncCtx).Info("ObjectFS background sync failed", "err", err)
 				}
 				cancel()
 			case <-fs.syncTrigger:
 				syncCtx, cancel := context.WithTimeout(ctx, fs.syncTimeout)
 				if err := fs.syncClosedInodes(syncCtx); err != nil {
-					klog.Warningf("ObjectFS volume %s sync on close failed: %v", fs.volumeID, err)
+					scoped.Log(syncCtx).Info("ObjectFS sync on close failed", "err", err)
 				}
 				cancel()
 			}
@@ -605,7 +604,7 @@ func (fs *ObjectFS) SweepRevalidateInodes(ctx context.Context) {
 	dentries := fs.TrackedDentries()
 	inodes := fs.HeldInodes()
 
-	klog.V(2).Infof("ObjectFS(%s): sweeping %d dentries and %d inodes on reconnect", fs.volumeID, len(dentries), len(inodes))
+	scoped.Log(ctx).V(2).Info("sweeping dentries and inodes on reconnect", "dentries", len(dentries), "inodes", len(inodes))
 
 	for _, d := range dentries {
 		fs.notifyEntry(ctx, d.Parent, d.Name)
@@ -654,7 +653,7 @@ func (fs *ObjectFS) logRPCError(ctx context.Context, op string, err error) {
 		if now.Sub(fs.lastLoggedErr) >= 1*time.Second {
 			fs.lastLoggedErr = now
 			fs.errMu.Unlock()
-			klog.Warningf("ObjectFS(%s): controller unreachable in %s: %v", fs.volumeID, op, err)
+			scoped.Log(ctx).Info("controller unreachable", "op", op, "err", err)
 			return
 		}
 		fs.errMu.Unlock()
@@ -1667,7 +1666,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 		var mErr error
 		manifest, mErr = fs.getOrLoadManifest(ctx, input.NodeId)
 		if mErr != nil {
-			klog.V(4).Infof("getOrLoadManifest failed for inode %d: %v", input.NodeId, mErr)
+			scoped.Log(ctx).V(4).Info("getOrLoadManifest failed", "inode", input.NodeId, "err", mErr)
 		}
 	}
 
@@ -1750,7 +1749,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 				slots[pIdx].data = data
 				continue
 			}
-			klog.V(4).Infof("ReadBlob failed for cached sha %s: %v", chunkSHA, err)
+			scoped.Log(ctx).V(4).Info("ReadBlob failed for cached sha", "sha", chunkSHA, "err", err)
 		}
 
 		uncached = append(uncached, uncachedChunk{
@@ -1768,7 +1767,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 			if err == nil {
 				return data, totalSize, fuse.OK, nil
 			}
-			klog.V(4).Infof("FetchBlob failed for sha %s, falling back to ReadFile: %v", uc.sha, err)
+			scoped.Log(fCtx).V(4).Info("FetchBlob failed, falling back to ReadFile", "sha", uc.sha, "err", err)
 		}
 
 		// Tier 4: Fallback to controller ReadFile RPC
@@ -1793,7 +1792,7 @@ func (fs *ObjectFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte)
 				sum := sha256.Sum256(fetchedData)
 				sha := hex.EncodeToString(sum[:])
 				if pErr := fs.diskCache.PutBlob(fCtx, sha, fetchedData); pErr != nil {
-					klog.V(4).Infof("cache PutBlob failed: %v", pErr)
+					scoped.Log(fCtx).V(4).Info("cache PutBlob failed", "err", pErr)
 				}
 			} else {
 				fs.cache.PutChunk(input.NodeId, uc.chunkIdx, uint32(cs), resp.GetTotalSize(), fetchedData, time.Now(), readGen)
@@ -1936,12 +1935,14 @@ func (fs *ObjectFS) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []by
 		if hasSize {
 			if int64(input.Offset) >= clientSize {
 				// Mapped page writeback completely beyond EOF (e.g. truncated page) is discarded.
-				klog.V(4).Infof("Write: discarding WRITE_CACHE write beyond EOF: inode=%d, offset=%d, length=%d, clientSize=%d", input.NodeId, input.Offset, len(data), clientSize)
+				ctx := scoped.WithLog(context.Background(), fs.Logger())
+				scoped.Log(ctx).V(4).Info("Write: discarding WRITE_CACHE write beyond EOF", "inode", input.NodeId, "offset", input.Offset, "length", len(data), "clientSize", clientSize)
 				return origLen, fuse.OK
 			}
 			if int64(input.Offset)+int64(len(data)) > clientSize {
 				// Page-aligned writeback must not grow the file beyond EOF.
-				klog.V(4).Infof("Write: clamping WRITE_CACHE write to EOF: inode=%d, offset=%d, length=%d, clientSize=%d", input.NodeId, input.Offset, len(data), clientSize)
+				ctx := scoped.WithLog(context.Background(), fs.Logger())
+				scoped.Log(ctx).V(4).Info("Write: clamping WRITE_CACHE write to EOF", "inode", input.NodeId, "offset", input.Offset, "length", len(data), "clientSize", clientSize)
 				data = data[:clientSize-int64(input.Offset)]
 			}
 		}
@@ -2170,7 +2171,7 @@ func (fs *ObjectFS) pushDirtyChunksToStaging(ctx context.Context, inode uint64) 
 				sum := sha256.Sum256(cData)
 				sha := hex.EncodeToString(sum[:])
 				if pErr := fs.diskCache.PutBlob(ctx, sha, cData); pErr != nil {
-					klog.V(4).Infof("stage PutBlob failed: %v", pErr)
+					scoped.Log(ctx).V(4).Info("stage PutBlob failed", "err", pErr)
 				}
 			}
 		}
@@ -2539,11 +2540,11 @@ func (fs *ObjectFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	})
 	if err != nil {
 		fs.logRPCError(ctx, "Release", err)
-		klog.Warningf("Release RPC failed for volume %s, inode %d, fh %d: %v", fs.volumeID, input.NodeId, input.Fh, err)
+		scoped.Log(ctx).Info("Release RPC failed", "inode", input.NodeId, "fh", input.Fh, "err", err)
 		return
 	}
 	if resp.GetError() != 0 {
-		klog.Warningf("Release returned error %d for volume %s, inode %d, fh %d", resp.GetError(), fs.volumeID, input.NodeId, input.Fh)
+		scoped.Log(ctx).Info("Release returned error", "error", resp.GetError(), "inode", input.NodeId, "fh", input.Fh)
 	}
 }
 
@@ -2634,9 +2635,9 @@ func (fs *ObjectFS) notifyInode(ctx context.Context, ino uint64, off, length int
 	if fs.server != nil {
 		if st := fs.server.InodeNotify(ino, off, length); !st.Ok() {
 			if st == fuse.ENOENT {
-				klog.V(4).Infof("InodeNotify(%d, off=%d, len=%d) returned ENOENT (kernel does not cache inode)", ino, off, length)
+				scoped.Log(ctx).V(4).Info("InodeNotify returned ENOENT (kernel does not cache inode)", "inode", ino, "offset", off, "length", length)
 			} else {
-				klog.V(2).Infof("InodeNotify(%d, off=%d, len=%d) returned status %v", ino, off, length, st)
+				scoped.Log(ctx).V(2).Info("InodeNotify returned status", "inode", ino, "offset", off, "length", length, "status", st)
 			}
 		}
 	}
@@ -2649,9 +2650,9 @@ func (fs *ObjectFS) notifyEntry(ctx context.Context, parent uint64, name string)
 	if fs.server != nil {
 		if st := fs.server.EntryNotify(parent, name); !st.Ok() {
 			if st == fuse.ENOENT {
-				klog.V(4).Infof("EntryNotify(parent=%d, name=%q) returned ENOENT (kernel does not cache entry)", parent, name)
+				scoped.Log(ctx).V(4).Info("EntryNotify returned ENOENT (kernel does not cache entry)", "parent", parent, "name", name)
 			} else {
-				klog.V(2).Infof("EntryNotify(parent=%d, name=%q) returned status %v", parent, name, st)
+				scoped.Log(ctx).V(2).Info("EntryNotify returned status", "parent", parent, "name", name, "status", st)
 			}
 		}
 	}
@@ -2664,9 +2665,9 @@ func (fs *ObjectFS) notifyDelete(ctx context.Context, parent, child uint64, name
 	if fs.server != nil {
 		if st := fs.server.DeleteNotify(parent, child, name); !st.Ok() {
 			if st == fuse.ENOENT {
-				klog.V(4).Infof("DeleteNotify(parent=%d, child=%d, name=%q) returned ENOENT (kernel does not cache entry)", parent, child, name)
+				scoped.Log(ctx).V(4).Info("DeleteNotify returned ENOENT (kernel does not cache entry)", "parent", parent, "child", child, "name", name)
 			} else {
-				klog.V(2).Infof("DeleteNotify(parent=%d, child=%d, name=%q) returned status %v", parent, child, name, st)
+				scoped.Log(ctx).V(2).Info("DeleteNotify returned status", "parent", parent, "child", child, "name", name, "status", st)
 			}
 		}
 	}
@@ -2703,8 +2704,17 @@ func handleWatchEvent(ctx context.Context, ev *pb.WatchVolumeResponse, cache *No
 		skip = allKnown
 	}
 
-	klog.V(4).Infof("handleWatchEvent: event_type=%v, inode=%d, parent=%d, name=%q, old_parent=%d, old_name=%q, pos=%d, dirty_skip=%v, pos_skip=%v",
-		ev.GetEventType(), ino, ev.GetParentInode(), ev.GetName(), ev.GetOldParentInode(), ev.GetOldName(), eventPos, isDirty, skip)
+	scoped.Log(ctx).V(4).Info("handleWatchEvent",
+		"eventType", ev.GetEventType(),
+		"inode", ino,
+		"parent", ev.GetParentInode(),
+		"name", ev.GetName(),
+		"oldParent", ev.GetOldParentInode(),
+		"oldName", ev.GetOldName(),
+		"position", eventPos,
+		"dirtySkip", isDirty,
+		"posSkip", skip,
+	)
 
 	for _, f := range fs {
 		if f == nil {
@@ -2828,10 +2838,10 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				}
 				gap := time.Since(disconnectTime)
 				if gap >= LongWatcherGapThreshold && !loggedLongGap {
-					klog.Warningf("WatchVolume disconnected for volume %s, node %s for %v (exceeds %v threshold)", volumeID, nodeID, gap.Round(time.Millisecond), LongWatcherGapThreshold)
+					scoped.Log(ctx).Info("WatchVolume disconnected", "node", nodeID, "gap", gap.Round(time.Millisecond), "threshold", LongWatcherGapThreshold)
 					loggedLongGap = true
 				}
-				klog.V(2).Infof("WatchVolume dial error for volume %s, node %s: %v; backing off %v", volumeID, nodeID, err, backoff)
+				scoped.Log(ctx).V(2).Info("WatchVolume dial error", "node", nodeID, "err", err, "backoff", backoff)
 				select {
 				case <-ctx.Done():
 					return
@@ -2844,10 +2854,10 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 				continue
 			}
 
-			klog.V(2).Infof("WatchVolume subscription established for volume %s, node %s", volumeID, nodeID)
+			scoped.Log(ctx).V(2).Info("WatchVolume subscription established", "node", nodeID)
 			if hasDisconnected {
 				totalGap := time.Since(disconnectTime)
-				klog.V(2).Infof("WatchVolume reconnected for volume %s, node %s after total gap of %v; invalidating clean cache and manifests", volumeID, nodeID, totalGap.Round(time.Millisecond))
+				scoped.Log(ctx).V(2).Info("WatchVolume reconnected; invalidating clean cache and manifests", "node", nodeID, "totalGap", totalGap.Round(time.Millisecond))
 				if cache != nil {
 					cache.ResetKnownPositions()
 					cache.InvalidateAllClean()
@@ -2871,6 +2881,9 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 			for {
 				ev, err := stream.Recv()
 				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
 					if !hasDisconnected {
 						hasDisconnected = true
 						disconnectTime = time.Now()
@@ -2881,7 +2894,7 @@ func StartWatcher(ctx context.Context, client pb.ObjectFSControllerClient, volum
 							f.SetWatcherConnected(false)
 						}
 					}
-					klog.V(2).Infof("WatchVolume stream error for volume %s, node %s: %v; backing off %v", volumeID, nodeID, err, backoff)
+					scoped.Log(ctx).V(2).Info("WatchVolume stream error", "node", nodeID, "err", err, "backoff", backoff)
 					break
 				}
 				handleWatchEvent(ctx, ev, cache, fs)

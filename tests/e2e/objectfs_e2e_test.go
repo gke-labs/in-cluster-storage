@@ -1544,6 +1544,29 @@ spec:
 	t.Logf("Successfully verified ObjectFS multi-node failover and stale segment recovery across nodes!")
 }
 
+// watchVolumeSubscribed reports whether logs contain a WatchVolume subscription line for the given volume and node.
+func watchVolumeSubscribed(logs, volumeID, nodeID string) bool {
+	return countWatchVolumeSubscriptions(logs, volumeID, nodeID) > 0
+}
+
+// countWatchVolumeSubscriptions counts WatchVolume subscription lines for the given volume and node in logs.
+func countWatchVolumeSubscriptions(logs, volumeID, nodeID string) int {
+	count := 0
+	volMatch := fmt.Sprintf("volume=%q", volumeID)
+	nodeMatch := fmt.Sprintf("node=%q", nodeID)
+	legacyMatch := fmt.Sprintf("WatchVolume subscription established for volume %s, node %s", volumeID, nodeID)
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, legacyMatch) {
+			count++
+		} else if strings.Contains(line, "WatchVolume subscription established") &&
+			strings.Contains(line, volMatch) &&
+			strings.Contains(line, nodeMatch) {
+			count++
+		}
+	}
+	return count
+}
+
 func TestObjectFSCrossNodeVisibilityE2E(t *testing.T) {
 	requireE2EGroup(t, "multinode")
 
@@ -1635,8 +1658,8 @@ spec:
 	subscribed := false
 	for time.Now().Before(deadline) {
 		daemonLogs = h.GetPodLogs("app=objectfs-node-daemon", "default")
-		hasNode1 := strings.Contains(daemonLogs, fmt.Sprintf("WatchVolume subscription established for volume %s, node %s", volumeID, node1))
-		hasNode2 := strings.Contains(daemonLogs, fmt.Sprintf("WatchVolume subscription established for volume %s, node %s", volumeID, node2))
+		hasNode1 := watchVolumeSubscribed(daemonLogs, volumeID, node1)
+		hasNode2 := watchVolumeSubscribed(daemonLogs, volumeID, node2)
 		if hasNode1 && hasNode2 {
 			subscribed = true
 			break
@@ -1801,7 +1824,7 @@ spec:
 	var daemonPodNode2 string
 	for _, pod := range h.getPodNames("app=objectfs-node-daemon", "default") {
 		logs := h.getContainerLogs(pod, "objectfs-node-daemon", "default", false)
-		if strings.Contains(logs, "node "+node2) {
+		if strings.Contains(logs, "node "+node2) || strings.Contains(logs, fmt.Sprintf("node=%q", node2)) {
 			daemonPodNode2 = pod
 			break
 		}
@@ -1810,9 +1833,8 @@ spec:
 		t.Fatalf("Failed to identify daemon pod on Node 2 (%s)", node2)
 	}
 
-	subMsg := fmt.Sprintf("WatchVolume subscription established for volume %s, node %s", volumeID, node2)
 	initialLogs := h.getContainerLogs(daemonPodNode2, "objectfs-node-daemon", "default", false)
-	initialSubCount := strings.Count(initialLogs, subMsg)
+	initialSubCount := countWatchVolumeSubscriptions(initialLogs, volumeID, node2)
 
 	// Restart controller to create a watcher outage
 	t.Logf("Restarting objectfs-controller to simulate watch stream outage")
@@ -1833,7 +1855,7 @@ spec:
 	reconnected := false
 	for time.Now().Before(reconnectDeadline) {
 		logs := h.getContainerLogs(daemonPodNode2, "objectfs-node-daemon", "default", false)
-		currentCount := strings.Count(logs, subMsg)
+		currentCount := countWatchVolumeSubscriptions(logs, volumeID, node2)
 		if currentCount > initialSubCount {
 			reconnected = true
 			break

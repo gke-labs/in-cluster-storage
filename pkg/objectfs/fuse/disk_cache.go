@@ -31,8 +31,8 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"golang.org/x/sync/singleflight"
-	"k8s.io/klog/v2"
 	_ "modernc.org/sqlite"
 )
 
@@ -76,11 +76,11 @@ func NewDiskBlobCache(ctx context.Context, dir string, maxBytes int64) (*DiskBlo
 	if err == nil {
 		for _, e := range tmpEntries {
 			if remErr := os.Remove(filepath.Join(tmpDir, e.Name())); remErr != nil {
-				klog.V(4).Infof("DiskBlobCache: error removing stale tmp entry %s: %v", e.Name(), remErr)
+				scoped.Log(ctx).V(4).Info("DiskBlobCache: error removing stale tmp entry", "entry", e.Name(), "err", remErr)
 			}
 		}
 	} else if !os.IsNotExist(err) {
-		klog.V(4).Infof("DiskBlobCache: error reading tmp dir %s: %v", tmpDir, err)
+		scoped.Log(ctx).V(4).Info("DiskBlobCache: error reading tmp dir", "dir", tmpDir, "err", err)
 	}
 
 	dbPath := filepath.Join(dir, "index.db")
@@ -101,7 +101,7 @@ func NewDiskBlobCache(ctx context.Context, dir string, maxBytes int64) (*DiskBlo
 	`
 	if _, err := db.Exec(schema); err != nil {
 		if closeErr := db.Close(); closeErr != nil {
-			klog.V(4).Infof("DiskBlobCache: error closing db after schema init failure: %v", closeErr)
+			scoped.Log(ctx).V(4).Info("DiskBlobCache: error closing db after schema init failure", "err", closeErr)
 		}
 		return nil, fmt.Errorf("failed to initialize sqlite index schema: %w", err)
 	}
@@ -115,7 +115,7 @@ func NewDiskBlobCache(ctx context.Context, dir string, maxBytes int64) (*DiskBlo
 	}
 
 	if err := cache.reconcileDiskState(ctx); err != nil {
-		klog.Warningf("DiskBlobCache: error reconciling disk state: %v", err)
+		scoped.Log(ctx).Info("DiskBlobCache: error reconciling disk state", "err", err)
 	}
 
 	return cache, nil
@@ -153,7 +153,7 @@ func (c *DiskBlobCache) reconcileDiskState(ctx context.Context) error {
 				size = excluded.size
 		`, name, size, now)
 		if err != nil {
-			klog.Warningf("DiskBlobCache: failed indexing disk entry %s: %v", name, err)
+			scoped.Log(ctx).Info("DiskBlobCache: failed indexing disk entry", "entry", name, "err", err)
 		}
 	}
 
@@ -198,7 +198,7 @@ func (c *DiskBlobCache) ReadBlob(ctx context.Context, sha string) ([]byte, error
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if _, err := c.db.Exec("UPDATE blobs SET last_access = ? WHERE sha256 = ?", now, sha); err != nil {
-			klog.V(4).Infof("DiskBlobCache: error updating last_access for %s: %v", sha, err)
+			scoped.Log(ctx).V(4).Info("DiskBlobCache: error updating last_access", "sha", sha, "err", err)
 		}
 	}()
 
@@ -230,7 +230,7 @@ func (c *DiskBlobCache) PutBlob(ctx context.Context, sha string, data []byte) er
 	finalPath := filepath.Join(c.blobsDir, sha)
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		if remErr := os.Remove(tmpPath); remErr != nil {
-			klog.V(4).Infof("DiskBlobCache: failed removing tmp file %s: %v", tmpPath, remErr)
+			scoped.Log(ctx).V(4).Info("DiskBlobCache: failed removing tmp file", "path", tmpPath, "err", remErr)
 		}
 		return fmt.Errorf("failed renaming tmp blob to %s: %w", finalPath, err)
 	}
@@ -248,7 +248,7 @@ func (c *DiskBlobCache) PutBlob(ctx context.Context, sha string, data []byte) er
 			last_access = excluded.last_access
 	`, sha, int64(len(data)), now)
 	if err != nil {
-		klog.Warningf("DiskBlobCache: failed recording blob %s in SQLite: %v", sha, err)
+		scoped.Log(ctx).Info("DiskBlobCache: failed recording blob in SQLite", "sha", sha, "err", err)
 	}
 
 	c.curBytes += int64(len(data))
@@ -293,7 +293,7 @@ func (c *DiskBlobCache) FetchBlob(ctx context.Context, client pb.ObjectFSControl
 		defer func() {
 			if !success {
 				if remErr := os.Remove(tmpPath); remErr != nil && !os.IsNotExist(remErr) {
-					klog.V(4).Infof("DiskBlobCache: error removing tmp file %s: %v", tmpPath, remErr)
+					scoped.Log(ctx).V(4).Info("DiskBlobCache: error removing tmp file", "path", tmpPath, "err", remErr)
 				}
 			}
 		}()
@@ -351,7 +351,7 @@ func (c *DiskBlobCache) FetchBlob(ctx context.Context, client pb.ObjectFSControl
 				size = excluded.size,
 				last_access = excluded.last_access
 		`, sha, totalBytes, now); err != nil {
-			klog.Warningf("DiskBlobCache: failed recording blob %s in SQLite: %v", sha, err)
+			scoped.Log(ctx).Info("DiskBlobCache: failed recording blob in SQLite", "sha", sha, "err", err)
 		}
 		c.curBytes += totalBytes
 		c.evictIfNeededLocked(ctx)
@@ -396,7 +396,7 @@ func (c *DiskBlobCache) RecordKnownBlobs(ctx context.Context, shas []string) {
 			INSERT OR IGNORE INTO blobs (sha256, size, is_cached, last_access)
 			VALUES (?, 0, 0, ?)
 		`, sha, now); err != nil {
-			klog.V(4).Infof("DiskBlobCache: error inserting known blob %s: %v", sha, err)
+			scoped.Log(ctx).V(4).Info("DiskBlobCache: error inserting known blob", "sha", sha, "err", err)
 		}
 	}
 }
@@ -417,7 +417,7 @@ func (c *DiskBlobCache) evictIfNeededLocked(ctx context.Context) {
 			LIMIT 50
 		`)
 		if err != nil {
-			klog.Warningf("DiskBlobCache: eviction query failed: %v", err)
+			scoped.Log(ctx).Info("DiskBlobCache: eviction query failed", "err", err)
 			break
 		}
 
@@ -429,16 +429,16 @@ func (c *DiskBlobCache) evictIfNeededLocked(ctx context.Context) {
 		for rows.Next() {
 			var e toEvict
 			if err := rows.Scan(&e.sha, &e.size); err != nil {
-				klog.V(4).Infof("DiskBlobCache: eviction scan error: %v", err)
+				scoped.Log(ctx).V(4).Info("DiskBlobCache: eviction scan error", "err", err)
 				continue
 			}
 			batch = append(batch, e)
 		}
 		if err := rows.Close(); err != nil {
-			klog.V(4).Infof("DiskBlobCache: error closing eviction rows: %v", err)
+			scoped.Log(ctx).V(4).Info("DiskBlobCache: error closing eviction rows", "err", err)
 		}
 		if err := rows.Err(); err != nil {
-			klog.V(4).Infof("DiskBlobCache: eviction rows error: %v", err)
+			scoped.Log(ctx).V(4).Info("DiskBlobCache: eviction rows error", "err", err)
 		}
 
 		if len(batch) == 0 {
@@ -448,10 +448,10 @@ func (c *DiskBlobCache) evictIfNeededLocked(ctx context.Context) {
 		for _, item := range batch {
 			p := filepath.Join(c.blobsDir, item.sha)
 			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-				klog.V(4).Infof("DiskBlobCache: failed removing evicted file %s: %v", p, err)
+				scoped.Log(ctx).V(4).Info("DiskBlobCache: failed removing evicted file", "path", p, "err", err)
 			}
 			if _, err := c.db.Exec("UPDATE blobs SET is_cached = 0 WHERE sha256 = ?", item.sha); err != nil {
-				klog.V(4).Infof("DiskBlobCache: failed updating evicted entry %s: %v", item.sha, err)
+				scoped.Log(ctx).V(4).Info("DiskBlobCache: failed updating evicted entry", "sha", item.sha, "err", err)
 			}
 			c.curBytes -= item.size
 			if c.curBytes <= target {
