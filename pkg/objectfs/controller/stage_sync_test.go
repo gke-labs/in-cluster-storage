@@ -43,6 +43,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -1656,6 +1657,10 @@ func (m *mockWatchStream) Context() context.Context {
 }
 
 func (m *mockWatchStream) Send(*pb.WatchVolumeResponse) error {
+	return nil
+}
+
+func (m *mockWatchStream) SendHeader(metadata.MD) error {
 	return nil
 }
 
