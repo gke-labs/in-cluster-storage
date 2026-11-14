@@ -4022,13 +4022,14 @@ func TestPushDirtyChunksToStaging_DrainAndRetryOnInitialENOSPC(t *testing.T) {
 }
 
 func TestDiskBlobCacheColdAndWarmRead(t *testing.T) {
+	ctx := t.Context()
 	client, cleanup := createTestClient(t)
 	defer cleanup()
 
 	volumeID := "vol-disk-cache-warm"
 	cacheDir := t.TempDir()
 
-	diskCache, err := NewDiskBlobCache(cacheDir, 10*1024*1024)
+	diskCache, err := NewDiskBlobCache(ctx, cacheDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache failed: %v", err)
 	}
@@ -4102,13 +4103,14 @@ func TestDiskBlobCacheColdAndWarmRead(t *testing.T) {
 }
 
 func TestDiskBlobCachePrefetchOnOpen(t *testing.T) {
+	ctx := t.Context()
 	client, cleanup := createTestClient(t)
 	defer cleanup()
 
 	volumeID := "vol-prefetch-open"
 	cacheDir := t.TempDir()
 
-	diskCache, err := NewDiskBlobCache(cacheDir, 10*1024*1024)
+	diskCache, err := NewDiskBlobCache(ctx, cacheDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache failed: %v", err)
 	}
@@ -4148,7 +4150,7 @@ func TestDiskBlobCachePrefetchOnOpen(t *testing.T) {
 
 	// Close and recreate a fresh disk cache (empty) on same or new dir to test prefetch on open
 	emptyCacheDir := t.TempDir()
-	emptyDiskCache, err := NewDiskBlobCache(emptyCacheDir, 10*1024*1024)
+	emptyDiskCache, err := NewDiskBlobCache(ctx, emptyCacheDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache failed: %v", err)
 	}
@@ -4187,13 +4189,14 @@ func TestDiskBlobCachePrefetchOnOpen(t *testing.T) {
 }
 
 func TestDiskBlobCacheSequentialReadPrefetchExtension(t *testing.T) {
+	ctx := t.Context()
 	client, cleanup := createTestClient(t)
 	defer cleanup()
 
 	volumeID := "vol-prefetch-seq"
 	cacheDir := t.TempDir()
 
-	diskCache, err := NewDiskBlobCache(cacheDir, 20*1024*1024)
+	diskCache, err := NewDiskBlobCache(ctx, cacheDir, 20*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache failed: %v", err)
 	}
@@ -4236,7 +4239,7 @@ func TestDiskBlobCacheSequentialReadPrefetchExtension(t *testing.T) {
 	}
 
 	freshCacheDir := t.TempDir()
-	freshDiskCache, err := NewDiskBlobCache(freshCacheDir, 20*1024*1024)
+	freshDiskCache, err := NewDiskBlobCache(ctx, freshCacheDir, 20*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache failed: %v", err)
 	}
@@ -4279,6 +4282,7 @@ func TestDiskBlobCacheSequentialReadPrefetchExtension(t *testing.T) {
 }
 
 func TestDiskBlobCacheRemountThroughput(t *testing.T) {
+	ctx := t.Context()
 	client, cleanup := createTestClient(t)
 	defer cleanup()
 
@@ -4323,7 +4327,7 @@ func TestDiskBlobCacheRemountThroughput(t *testing.T) {
 	}
 
 	// Mount 1 (Cold Read into shared disk cache)
-	diskCache1, err := NewDiskBlobCache(sharedCacheDir, 50*1024*1024)
+	diskCache1, err := NewDiskBlobCache(ctx, sharedCacheDir, 50*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache 1 failed: %v", err)
 	}
@@ -4348,7 +4352,7 @@ func TestDiskBlobCacheRemountThroughput(t *testing.T) {
 	_ = diskCache1.Close()
 
 	// Mount 2 (Remount with same cache directory - Warm Read from persistent disk cache)
-	diskCache2, err := NewDiskBlobCache(sharedCacheDir, 50*1024*1024)
+	diskCache2, err := NewDiskBlobCache(ctx, sharedCacheDir, 50*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache 2 (remount) failed: %v", err)
 	}
@@ -4384,6 +4388,7 @@ func TestDiskBlobCacheRemountThroughput(t *testing.T) {
 }
 
 func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
+	ctx := t.Context()
 	clientA, cleanup := createTestClient(t)
 	defer cleanup()
 	clientB := clientA
@@ -4391,7 +4396,7 @@ func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
 	volumeID := "vol-cross-node-watch"
 	cacheA := NewNodeCache(1024 * 1024)
 	fsA := NewObjectFS(clientA, volumeID, pb.WriteMode_FSYNC, cacheA)
-	diskCacheA, err := NewDiskBlobCache(t.TempDir(), 10*1024*1024)
+	diskCacheA, err := NewDiskBlobCache(ctx, t.TempDir(), 10*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache failed: %v", err)
 	}
@@ -4399,7 +4404,7 @@ func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
 	fsA.SetDiskBlobCache(diskCacheA)
 
 	// Start watcher on fsA for node-A
-	watchCtx, cancelWatch := context.WithCancel(t.Context())
+	watchCtx, cancelWatch := context.WithCancel(ctx)
 	defer cancelWatch()
 	StartWatcher(watchCtx, clientA, volumeID, "node-A", pb.ConsistencyMode_STANDARD, cacheA, fsA)
 
@@ -4451,7 +4456,7 @@ func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
 
 	// Client B (simulating another node) writes and fsyncs version 2 directly to controller
 	dataV2 := []byte("version-2-updated-content-from-client-B")
-	wResp, err := clientB.WriteFile(t.Context(), &pb.WriteFileRequest{
+	wResp, err := clientB.WriteFile(ctx, &pb.WriteFileRequest{
 		VolumeId:  volumeID,
 		Inode:     inode,
 		Offset:    0,
@@ -4462,7 +4467,7 @@ func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
 		t.Fatalf("Client B WriteFile failed: %v, code=%d", err, wResp.GetError())
 	}
 
-	fResp, err := clientB.Fsync(t.Context(), &pb.FsyncRequest{
+	fResp, err := clientB.Fsync(ctx, &pb.FsyncRequest{
 		VolumeId: volumeID,
 		Inode:    inode,
 		Blocking: true,
@@ -4506,12 +4511,13 @@ func TestTwoClientsCrossNodeWriteVisibleViaWatcher(t *testing.T) {
 }
 
 func TestSharedDiskBlobCacheAcrossMounts(t *testing.T) {
+	ctx := t.Context()
 	client, cleanup := createTestClient(t)
 	defer cleanup()
 
 	sharedDir := t.TempDir()
 	// Shared budget of 500 bytes
-	sharedCache, err := NewDiskBlobCache(sharedDir, 500)
+	sharedCache, err := NewDiskBlobCache(ctx, sharedDir, 500)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache failed: %v", err)
 	}

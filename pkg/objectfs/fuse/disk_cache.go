@@ -53,7 +53,7 @@ type DiskBlobCache struct {
 }
 
 // NewDiskBlobCache initializes or opens an on-disk blob cache in dir.
-func NewDiskBlobCache(dir string, maxBytes int64) (*DiskBlobCache, error) {
+func NewDiskBlobCache(ctx context.Context, dir string, maxBytes int64) (*DiskBlobCache, error) {
 	if dir == "" {
 		dir = "/var/cache/objectfs"
 	}
@@ -114,7 +114,7 @@ func NewDiskBlobCache(dir string, maxBytes int64) (*DiskBlobCache, error) {
 		maxBytes: maxBytes,
 	}
 
-	if err := cache.reconcileDiskState(); err != nil {
+	if err := cache.reconcileDiskState(ctx); err != nil {
 		klog.Warningf("DiskBlobCache: error reconciling disk state: %v", err)
 	}
 
@@ -122,7 +122,7 @@ func NewDiskBlobCache(dir string, maxBytes int64) (*DiskBlobCache, error) {
 }
 
 // reconcileDiskState reconciles files present in blobsDir with the SQLite index.
-func (c *DiskBlobCache) reconcileDiskState() error {
+func (c *DiskBlobCache) reconcileDiskState(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -164,7 +164,7 @@ func (c *DiskBlobCache) reconcileDiskState() error {
 	}
 	c.curBytes = totalBytes
 
-	c.evictIfNeededLocked(context.Background())
+	c.evictIfNeededLocked(ctx)
 	return nil
 }
 

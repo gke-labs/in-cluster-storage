@@ -95,7 +95,7 @@ func TestDiskBlobCachePutAndRead(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	cache, err := NewDiskBlobCache(tempDir, 10*1024*1024)
+	cache, err := NewDiskBlobCache(ctx, tempDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDiskBlobCache failed: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestDiskBlobCacheVerifyIntegrity(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	cache, err := NewDiskBlobCache(tempDir, 10*1024*1024)
+	cache, err := NewDiskBlobCache(ctx, tempDir, 10*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestDiskBlobCachePersistenceAcrossRestart(t *testing.T) {
 	sha2 := shaString(data2)
 
 	// Session 1: create cache, store blobs, close
-	cache1, err := NewDiskBlobCache(tempDir, 10*1024*1024)
+	cache1, err := NewDiskBlobCache(ctx, tempDir, 10*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestDiskBlobCachePersistenceAcrossRestart(t *testing.T) {
 	}
 
 	// Session 2: reopen same directory, verify blobs and SQLite state
-	cache2, err := NewDiskBlobCache(tempDir, 10*1024*1024)
+	cache2, err := NewDiskBlobCache(ctx, tempDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("reopening cache failed: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestDiskBlobCacheLRUEviction(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 
 	// 300 byte max capacity
-	cache, err := NewDiskBlobCache(tempDir, 300)
+	cache, err := NewDiskBlobCache(ctx, tempDir, 300)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestDiskBlobCacheFetchAndSingleflight(t *testing.T) {
 		},
 	}
 
-	cache, err := NewDiskBlobCache(tempDir, 10*1024*1024)
+	cache, err := NewDiskBlobCache(ctx, tempDir, 10*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +355,7 @@ func TestDiskBlobCacheFetchCloseError(t *testing.T) {
 		},
 	}
 
-	cache, err := NewDiskBlobCache(tempDir, 10*1024*1024)
+	cache, err := NewDiskBlobCache(ctx, tempDir, 10*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}

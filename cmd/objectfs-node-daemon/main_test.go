@@ -66,6 +66,7 @@ func TestParseEndpoint(t *testing.T) {
 }
 
 func setupTestDriver(t *testing.T) *objectFSDriver {
+	ctx := t.Context()
 	server := controllertest.NewTestServer(nil)
 	listener := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
@@ -77,7 +78,7 @@ func setupTestDriver(t *testing.T) *objectFSDriver {
 	}()
 	t.Cleanup(grpcServer.Stop)
 
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "/run/objectfs/fuse-holder.sock")
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "/run/objectfs/fuse-holder.sock")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -180,9 +181,10 @@ func TestNodeGetVolumeStats(t *testing.T) {
 }
 
 func TestNodeDaemonSecurityFlags(t *testing.T) {
+	ctx := t.Context()
 	// 1. Without insecure, non-existent client cert dir -> fails closed
 	nonExistentDir := "/nonexistent/test/certs/client"
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, nonExistentDir, false, "")
+	driver, err := newDriver(ctx, "test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, nonExistentDir, false, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -509,7 +511,8 @@ func TestNodeUnpublishVolume_HolderFailurePreservesMount(t *testing.T) {
 }
 
 func TestNodePublishVolume_RequiresFuseHolderSocket(t *testing.T) {
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	ctx := t.Context()
+	driver, err := newDriver(ctx, "test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -519,7 +522,7 @@ func TestNodePublishVolume_RequiresFuseHolderSocket(t *testing.T) {
 		}
 	})
 
-	_, err = driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+	_, err = driver.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
 		VolumeId:   "test-vol",
 		TargetPath: t.TempDir(),
 		VolumeContext: map[string]string{
