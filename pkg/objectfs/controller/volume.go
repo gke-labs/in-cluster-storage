@@ -1007,11 +1007,11 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 			pos := v.Position()
 			v.stagingMu.Unlock()
 			if err := v.waitForSequence(ctx, pos); err != nil {
-				return epoch, 0, err
+				return epoch, 0, v.finishEmptySync(snapSeq, err, 0, nil)
 			}
 			if requirePermanent {
 				if err := v.stream.Flush(ctx); err != nil {
-					return epoch, 0, err
+					return epoch, 0, v.finishEmptySync(snapSeq, err, 0, nil)
 				}
 			}
 			return epoch, pos, v.finishEmptySync(snapSeq, nil, pos, nil)
@@ -1446,7 +1446,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 		}
 		if v.stream.ReplicationLevel() == walclient.Permanent {
 			if err := v.stream.Flush(ctx); err != nil {
-				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
+				return 0, v.finishEmptySync(snapSeq, err, 0, inodeFilter)
 			}
 		}
 		return pos, v.finishEmptySync(snapSeq, nil, pos, inodeFilter)
@@ -1475,7 +1475,7 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 		}
 		if v.stream.ReplicationLevel() == walclient.Permanent {
 			if err := v.stream.Flush(ctx); err != nil {
-				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
+				return 0, v.finishEmptySync(snapSeq, err, 0, inodeFilter)
 			}
 		}
 		return pos, v.finishEmptySync(snapSeq, nil, pos, inodeFilter)
