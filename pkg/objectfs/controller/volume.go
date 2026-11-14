@@ -142,6 +142,80 @@ type packInfo struct {
 	uploadError    error
 }
 
+// syncCoalesceState groups the state used to coalesce non-blocking sync requests
+// across a configurable time window, batching multiple writes and fsync calls into
+// a single durable pack upload and metadata commit to reduce I/O overhead.
+//
+// All fields are guarded by Volume.stagingMu.
+type syncCoalesceState struct {
+	// timer triggers a background coalesce sync when the coalesce window expires,
+	// or is nil if no timer is currently active.
+	timer *time.Timer
+
+	// waiters holds callers waiting for a staged sync sequence to commit,
+	// including both volume-wide non-blocking syncs and close-triggered syncs
+	// that are filtered and answered by inode ID.
+	waiters []*syncWaiter
+
+	// window is the duration to batch non-blocking sync requests before triggering
+	// an asynchronous sync operation.
+	window time.Duration
+}
+
+// armTimer arms the coalesce timer with trigger if it is not already armed.
+// Must be called with Volume.stagingMu held.
+func (c *syncCoalesceState) armTimer(trigger func()) {
+	if c.timer == nil {
+		c.timer = time.AfterFunc(c.window, trigger)
+	}
+}
+
+// stopTimer stops the coalesce timer if armed and clears the timer reference.
+// Must be called with Volume.stagingMu held.
+func (c *syncCoalesceState) stopTimer() {
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+}
+
+// addWaiter records a waiter waiting for a sync sequence to commit.
+// Must be called with Volume.stagingMu held.
+func (c *syncCoalesceState) addWaiter(sequence uint64, inodeID uint64, channel chan syncResult) {
+	c.waiters = append(c.waiters, &syncWaiter{seq: sequence, inodeID: inodeID, ch: channel})
+}
+
+// answerWaiters completes all waiters whose sequence is at or before snapshotSeq
+// and matching inodeFilter (or all if inodeFilter is nil), and retains remaining waiters.
+// Must be called with Volume.stagingMu held.
+func (c *syncCoalesceState) answerWaiters(snapshotSeq uint64, err error, pos uint64, inodeFilter map[uint64]struct{}) {
+	var remainingWaiters []*syncWaiter
+	for _, waiter := range c.waiters {
+		shouldComplete := waiter.seq <= snapshotSeq
+		if shouldComplete && inodeFilter != nil {
+			_, shouldComplete = inodeFilter[waiter.inodeID]
+		}
+
+		if shouldComplete {
+			waiter.ch <- syncResult{pos: pos, err: err}
+			close(waiter.ch)
+		} else {
+			remainingWaiters = append(remainingWaiters, waiter)
+		}
+	}
+	c.waiters = remainingWaiters
+}
+
+// failWaiters completes all pending waiters with err and clears the waiter list.
+// Must be called with Volume.stagingMu held.
+func (c *syncCoalesceState) failWaiters(err error) {
+	for _, waiter := range c.waiters {
+		waiter.ch <- syncResult{err: err}
+		close(waiter.ch)
+	}
+	c.waiters = nil
+}
+
 type Volume struct {
 	// Lock order: stagingMu may be held while taking mu for reading; mu must never be held while taking stagingMu.
 	mu           sync.RWMutex
@@ -176,11 +250,9 @@ type Volume struct {
 	maxStagingBytes int64
 	lastSyncError   map[uint64]error
 
-	coalesceTimer   *time.Timer
-	coalesceWaiters []*syncWaiter
-	coalesceWindow  time.Duration
-	closeTimer      *time.Timer
-	closeInodes     map[uint64]struct{}
+	coalesce    syncCoalesceState
+	closeTimer  *time.Timer
+	closeInodes map[uint64]struct{}
 	// currentSync tracks the single real sync operation currently in flight, or nil if idle.
 	// At most one real sync is in flight at a time. Every path that starts one waits for
 	// idle (waitForSyncIdleLocked) or skips if a sync is already running, all under stagingMu.
@@ -244,7 +316,7 @@ func WithAcceptUnversioned(accept bool) VolumeOption {
 func WithSyncCoalesceWindow(d time.Duration) VolumeOption {
 	return func(v *Volume) {
 		if d > 0 {
-			v.coalesceWindow = d
+			v.coalesce.window = d
 		}
 	}
 }
@@ -556,7 +628,7 @@ func NewVolume(volumeID string, backend ObjectStorageBackend, broadcaster *Event
 		maxStagingBytes:    64 * 1024 * 1024,
 		packs:              make(map[uint64]*packInfo),
 		uploadSemaphore:    make(chan struct{}, 2),
-		coalesceWindow:     1 * time.Second,
+		coalesce:           syncCoalesceState{window: 1 * time.Second},
 		syncTimeout:        10 * time.Minute,
 		openBarrierTimeout: 30 * time.Second,
 	}
@@ -692,31 +764,11 @@ func (v *Volume) finishEmptySync(snapshotSeq uint64, err error, pos uint64, inod
 }
 
 func (v *Volume) completeWaitersAndRearmLocked(snapshotSeq uint64, err error, pos uint64, inodeFilter map[uint64]struct{}) {
-	var remainingWaiters []*syncWaiter
-	for _, waiter := range v.coalesceWaiters {
-		shouldComplete := false
-		if waiter.seq <= snapshotSeq {
-			if inodeFilter == nil {
-				shouldComplete = true
-			} else {
-				if _, ok := inodeFilter[waiter.inodeID]; ok {
-					shouldComplete = true
-				}
-			}
-		}
-
-		if shouldComplete {
-			waiter.ch <- syncResult{pos: pos, err: err}
-			close(waiter.ch)
-		} else {
-			remainingWaiters = append(remainingWaiters, waiter)
-		}
-	}
-	v.coalesceWaiters = remainingWaiters
+	v.coalesce.answerWaiters(snapshotSeq, err, pos, inodeFilter)
 
 	if v.rejectMutationLocked() == nil {
-		if (len(remainingWaiters) > 0 || len(v.stagedChunks) > 0) && v.coalesceTimer == nil {
-			v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
+		if len(v.coalesce.waiters) > 0 || len(v.stagedChunks) > 0 {
+			v.coalesce.armTimer(v.triggerCoalesceSync)
 		}
 		if len(v.closeInodes) > 0 && v.closeTimer == nil {
 			v.closeTimer = time.AfterFunc(closeCoalesceWindow, v.triggerCloseSync)
@@ -728,7 +780,7 @@ func (v *Volume) completeWaitersAndRearmLocked(snapshotSeq uint64, err error, po
 
 func (v *Volume) triggerCoalesceSync() {
 	v.stagingMu.Lock()
-	v.coalesceTimer = nil
+	v.coalesce.timer = nil
 	if v.rejectMutationLocked() != nil || v.currentSync != nil {
 		v.stagingMu.Unlock()
 		return
@@ -853,10 +905,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 			return epoch, 0, prevErr
 		}
 
-		if v.coalesceTimer != nil {
-			v.coalesceTimer.Stop()
-			v.coalesceTimer = nil
-		}
+		v.coalesce.stopTimer()
 		if v.closeTimer != nil {
 			v.closeTimer.Stop()
 			v.closeTimer = nil
@@ -903,7 +952,7 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 
 		waitSeq := v.stagingSeq
 		waitCh := make(chan syncResult, 1)
-		v.coalesceWaiters = append(v.coalesceWaiters, &syncWaiter{seq: waitSeq, inodeID: inodeID, ch: waitCh})
+		v.coalesce.addWaiter(waitSeq, inodeID, waitCh)
 
 		if v.closeTimer == nil {
 			v.closeTimer = time.AfterFunc(closeCoalesceWindow, v.triggerCloseSync)
@@ -928,11 +977,8 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 
 	waitSeq := v.stagingSeq
 	waitCh := make(chan syncResult, 1)
-	v.coalesceWaiters = append(v.coalesceWaiters, &syncWaiter{seq: waitSeq, inodeID: inodeID, ch: waitCh})
-
-	if v.coalesceTimer == nil {
-		v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
-	}
+	v.coalesce.addWaiter(waitSeq, inodeID, waitCh)
+	v.coalesce.armTimer(v.triggerCoalesceSync)
 
 	v.stagingMu.Unlock()
 
@@ -1785,10 +1831,7 @@ func (v *Volume) startFinalSyncLocked() {
 	if len(v.stagedChunks) == 0 || v.currentSync != nil {
 		return
 	}
-	if v.coalesceTimer != nil {
-		v.coalesceTimer.Stop()
-		v.coalesceTimer = nil
-	}
+	v.coalesce.stopTimer()
 	if v.closeTimer != nil {
 		v.closeTimer.Stop()
 		v.closeTimer = nil
@@ -1836,20 +1879,13 @@ func (v *Volume) closeStagingLocked() bool {
 	v.stopping = true
 	v.stagingClosed = true
 	drained := v.currentSync == nil && len(v.stagedChunks) == 0
-	if v.coalesceTimer != nil {
-		v.coalesceTimer.Stop()
-		v.coalesceTimer = nil
-	}
+	v.coalesce.stopTimer()
 	if v.closeTimer != nil {
 		v.closeTimer.Stop()
 		v.closeTimer = nil
 	}
 	v.closeInodes = nil
-	for _, w := range v.coalesceWaiters {
-		w.ch <- syncResult{err: fmt.Errorf("volume closed")}
-		close(w.ch)
-	}
-	v.coalesceWaiters = nil
+	v.coalesce.failWaiters(fmt.Errorf("volume closed"))
 	if v.cancelUpload != nil {
 		v.cancelUpload()
 	}
@@ -4522,8 +4558,8 @@ func (v *Volume) WriteFileWithEpoch(ctx context.Context, inodeID uint64, offset 
 	v.stagedMtimes[inodeID] = now
 	v.stagingSeq++
 
-	if v.currentSync != nil && v.coalesceTimer == nil {
-		v.coalesceTimer = time.AfterFunc(v.coalesceWindow, v.triggerCoalesceSync)
+	if v.currentSync != nil {
+		v.coalesce.armTimer(v.triggerCoalesceSync)
 	}
 
 	return dataLength, calculatedSize, now, v.stagingEpoch, nil

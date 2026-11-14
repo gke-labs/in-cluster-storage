@@ -2735,7 +2735,7 @@ func TestVolume_Close_WithoutStopCancelsParkedSync(t *testing.T) {
 
 	volume.stagingMu.Lock()
 	defer volume.stagingMu.Unlock()
-	if volume.coalesceTimer != nil || !os.IsNotExist(retErr(os.Stat(volume.stagingDir))) {
+	if volume.coalesce.timer != nil || !os.IsNotExist(retErr(os.Stat(volume.stagingDir))) {
 		t.Fatal("coalesceTimer re-armed or staging directory still exists after Close")
 	}
 }
