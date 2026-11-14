@@ -119,6 +119,9 @@ func volInitError(err error) error {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, ErrVolumeDeleted) {
+		return status.Errorf(codes.NotFound, "%v", err)
+	}
 	if _, ok := status.FromError(err); ok {
 		return err
 	}
@@ -546,6 +549,9 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	defer s.mu.Unlock()
 
 	volume, ok := s.volumes[volumeID]
+	if ok && volume.IsDeleted() {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
+	}
 	if !ok {
 		var err error
 		volume, err = s.createVolumeInstanceLocked(volumeID)
@@ -553,7 +559,13 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 			return nil, fmt.Errorf("failed to create volume %s: %w", volumeID, err)
 		}
 		if err := volume.LoadFromBackend(context.Background()); err != nil {
+			if errors.Is(err, ErrVolumeDeleted) {
+				return nil, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
+			}
 			return nil, fmt.Errorf("failed to load volume %s from backend: %w", volumeID, err)
+		}
+		if volume.IsDeleted() {
+			return nil, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
 		}
 		s.volumes[volumeID] = volume
 	}
