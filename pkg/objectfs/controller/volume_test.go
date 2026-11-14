@@ -17,7 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
@@ -223,5 +225,58 @@ func TestMetadataStreamTypeResolution_NewStreamRoundTrip(t *testing.T) {
 	}
 	if attr.GetInode().GetSize() != int64(len("roundtrip content")) {
 		t.Errorf("size mismatch: got %d, want %d", attr.GetInode().GetSize(), len("roundtrip content"))
+	}
+}
+
+func TestSyncCoalesceState(t *testing.T) {
+	var state syncCoalesceState
+	state.window = 50 * time.Millisecond
+
+	state.armTimer(func() {})
+	if state.timer == nil {
+		t.Fatal("expected timer to be non-nil after armTimer")
+	}
+	existingTimer := state.timer
+	state.armTimer(func() {})
+	if state.timer != existingTimer {
+		t.Fatal("armTimer overwrote active timer")
+	}
+	state.stopTimer()
+	if state.timer != nil {
+		t.Fatal("expected timer to be nil after stopTimer")
+	}
+
+	channel1, channel2, channel3 := make(chan syncResult, 1), make(chan syncResult, 1), make(chan syncResult, 1)
+	state.addWaiter(10, 1, channel1)
+	state.addWaiter(20, 2, channel2)
+	state.addWaiter(30, 1, channel3)
+
+	state.answerWaiters(20, nil, 100, map[uint64]struct{}{1: {}})
+	select {
+	case result := <-channel1:
+		if result.pos != 100 || result.err != nil {
+			t.Fatalf("unexpected result: %+v", result)
+		}
+	default:
+		t.Fatal("channel1 was not answered")
+	}
+	select {
+	case <-channel2:
+		t.Fatal("channel2 should not be answered")
+	default:
+	}
+	if len(state.waiters) != 2 {
+		t.Fatalf("expected 2 remaining waiters, got %d", len(state.waiters))
+	}
+
+	testErr := errors.New("volume closed")
+	state.failWaiters(testErr)
+	if len(state.waiters) != 0 {
+		t.Fatalf("expected 0 waiters after failWaiters, got %d", len(state.waiters))
+	}
+	for _, channel := range []chan syncResult{channel2, channel3} {
+		if result := <-channel; !errors.Is(result.err, testErr) {
+			t.Fatalf("unexpected err: %v", result.err)
+		}
 	}
 }
