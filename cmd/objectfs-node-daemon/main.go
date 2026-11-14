@@ -102,7 +102,8 @@ func main() {
 		klog.Fatalf("failed to initialize driver: %v", err)
 	}
 	driver.debug = *debug
-	if err := driver.reattachHeldMounts(); err != nil {
+	ctx := scoped.WithLog(context.Background(), klog.Background())
+	if err := driver.reattachHeldMounts(ctx); err != nil {
 		klog.Fatalf("failed to re-attach held mounts: %v", err)
 	}
 	defer func() {
@@ -278,7 +279,7 @@ func parseMountModes(values map[string]string) (pb.WriteMode, pb.ConsistencyMode
 	return writeMode, consistencyMode, nil
 }
 
-func (d *objectFSDriver) reattachHeldMounts() error {
+func (d *objectFSDriver) reattachHeldMounts(ctx context.Context) error {
 	if d.fuseHolderSocket == "" {
 		return nil
 	}
@@ -301,7 +302,7 @@ func (d *objectFSDriver) reattachHeldMounts() error {
 		if entry.Mode != volumemode.String(pb.VolumeMode_FUSE) {
 			continue
 		}
-		mountLogger := scoped.Log(context.Background()).WithValues("volume", entry.VolumeID, "target", entry.Target)
+		mountLogger := scoped.Log(ctx).WithValues("volume", entry.VolumeID, "target", entry.Target)
 		if entry.Attributes == nil {
 			mountLogger.Info("skipping held mount: missing attributes")
 			continue
@@ -321,7 +322,7 @@ func (d *objectFSDriver) reattachHeldMounts() error {
 		if maxWrite <= 0 {
 			maxWrite = 128 * 1024
 		}
-		if err := d.serveFUSE(entry.Target, entry.VolumeID, descriptor, maxWrite, writeMode, consistencyMode); err != nil {
+		if err := d.serveFUSE(ctx, entry.Target, entry.VolumeID, descriptor, maxWrite, writeMode, consistencyMode); err != nil {
 			mountLogger.Error(err, "failed to serve reattached mount")
 			continue
 		}
@@ -330,8 +331,8 @@ func (d *objectFSDriver) reattachHeldMounts() error {
 	return nil
 }
 
-func (d *objectFSDriver) newObjectFS(volumeID string, writeMode pb.WriteMode, consistencyMode pb.ConsistencyMode) (pb.ObjectFSControllerClient, *objectfuse.NodeCache, *objectfuse.ObjectFS, error) {
-	client, err := d.getClient()
+func (d *objectFSDriver) newObjectFS(ctx context.Context, volumeID string, writeMode pb.WriteMode, consistencyMode pb.ConsistencyMode) (pb.ObjectFSControllerClient, *objectfuse.NodeCache, *objectfuse.ObjectFS, error) {
+	client, err := d.getClient(ctx)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -348,8 +349,8 @@ func (d *objectFSDriver) newObjectFS(volumeID string, writeMode pb.WriteMode, co
 	return client, nodeCache, rawFS, nil
 }
 
-func (d *objectFSDriver) serveFUSE(targetPath, volumeID string, descriptor int, maxWrite int, writeMode pb.WriteMode, consistencyMode pb.ConsistencyMode) error {
-	client, nodeCache, rawFS, err := d.newObjectFS(volumeID, writeMode, consistencyMode)
+func (d *objectFSDriver) serveFUSE(ctx context.Context, targetPath, volumeID string, descriptor int, maxWrite int, writeMode pb.WriteMode, consistencyMode pb.ConsistencyMode) error {
+	client, nodeCache, rawFS, err := d.newObjectFS(ctx, volumeID, writeMode, consistencyMode)
 	if err != nil {
 		if closeErr := unix.Close(descriptor); closeErr != nil {
 			klog.Warningf("failed to close descriptor %d: %v", descriptor, closeErr)
@@ -415,7 +416,7 @@ func (d *objectFSDriver) serveFUSE(targetPath, volumeID string, descriptor int, 
 	return nil
 }
 
-func (d *objectFSDriver) getClient() (pb.ObjectFSControllerClient, error) {
+func (d *objectFSDriver) getClient(ctx context.Context) (pb.ObjectFSControllerClient, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -430,7 +431,7 @@ func (d *objectFSDriver) getClient() (pb.ObjectFSControllerClient, error) {
 		if !grpcutil.DirExists(d.clientCertDir) {
 			return nil, fmt.Errorf("client certificate directory %s does not exist; pass --insecure for plaintext local dev", d.clientCertDir)
 		}
-		tlsCreds, err := grpcutil.NewClientTLSFromDir(d.clientCertDir)
+		tlsCreds, err := grpcutil.NewClientTLSFromDir(ctx, d.clientCertDir)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load client TLS credentials from %s: %w", d.clientCertDir, err)
 		}
@@ -590,7 +591,7 @@ func (d *objectFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		maxWrite = heldEntry.MaxRead
 	}
 
-	if err := d.serveFUSE(targetPath, volumeID, descriptor, maxWrite, writeMode, consistencyMode); err != nil {
+	if err := d.serveFUSE(ctx, targetPath, volumeID, descriptor, maxWrite, writeMode, consistencyMode); err != nil {
 		if unmountErr := holder.Unmount(targetPath, false); unmountErr != nil {
 			klog.Warningf("failed to unmount %s via holder after serve error: %v", targetPath, unmountErr)
 		}
@@ -622,7 +623,7 @@ func (d *objectFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 	}
 
 	if ok && mountInfo != nil {
-		client, err := d.getClient()
+		client, err := d.getClient(ctx)
 		if err != nil {
 			klog.Warningf("Failed to get ObjectFS client to fsync volume %s: %v", mountInfo.volumeID, err)
 			return nil, fmt.Errorf("failed to get ObjectFS client to fsync volume: %w", err)
@@ -676,7 +677,7 @@ func (d *objectFSDriver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGe
 		return nil, status.Error(codes.InvalidArgument, "volume_id or volume_path is required")
 	}
 
-	client, err := d.getClient()
+	client, err := d.getClient(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get ObjectFS client: %v", err)
 	}

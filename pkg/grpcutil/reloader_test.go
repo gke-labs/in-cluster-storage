@@ -217,6 +217,7 @@ func writeMaterial(t *testing.T, dir string, certPEM, keyPEM, caPEM []byte) {
 }
 
 func TestServerCertReload_NoRestart(t *testing.T) {
+	ctx := t.Context()
 	// Setup material: initial server cert 1 and client cert 1
 	b1 := generateCertBundle(t, "ca-1", "localhost", true, 101)
 	bClient := generateCertBundle(t, "client-ca", "client-1", false, 201)
@@ -227,7 +228,7 @@ func TestServerCertReload_NoRestart(t *testing.T) {
 	clientDir := t.TempDir()
 	writeMaterial(t, clientDir, bClient.certPEM, bClient.keyPEM, b1.caPEM)
 
-	serverCreds, err := NewServerTLSFromDir(serverDir)
+	serverCreds, err := NewServerTLSFromDir(ctx, serverDir)
 	if err != nil {
 		t.Fatalf("NewServerTLSFromDir failed: %v", err)
 	}
@@ -251,7 +252,7 @@ func TestServerCertReload_NoRestart(t *testing.T) {
 	defer srv.Stop()
 
 	// 1. Initial client handshake receives ServerCert1
-	clientCreds1, err := NewClientTLSFromDir(clientDir)
+	clientCreds1, err := NewClientTLSFromDir(ctx, clientDir)
 	if err != nil {
 		t.Fatalf("NewClientTLSFromDir failed: %v", err)
 	}
@@ -272,10 +273,10 @@ func TestServerCertReload_NoRestart(t *testing.T) {
 
 	client1 := testpb.NewTestServiceClient(conn1)
 	var p1 peer.Peer
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if _, err := client1.EmptyCall(ctx, &testpb.Empty{}, grpc.Peer(&p1)); err != nil {
+	if _, err := client1.EmptyCall(callCtx, &testpb.Empty{}, grpc.Peer(&p1)); err != nil {
 		t.Fatalf("call with initial server cert failed: %v", err)
 	}
 	tlsInfo1 := p1.AuthInfo.(credentials.TLSInfo)
@@ -299,7 +300,7 @@ func TestServerCertReload_NoRestart(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// 3. New handshake without restarting server observes ServerCert2
-	clientCreds2, err := NewClientTLSFromDir(clientDir)
+	clientCreds2, err := NewClientTLSFromDir(ctx, clientDir)
 	if err != nil {
 		t.Fatalf("NewClientTLSFromDir failed: %v", err)
 	}
@@ -333,6 +334,7 @@ func TestServerCertReload_NoRestart(t *testing.T) {
 }
 
 func TestClientCertReload_NoRestart(t *testing.T) {
+	ctx := t.Context()
 	// Setup material: server cert and two client certs signed by same client CA
 	bServer := generateCertBundle(t, "server-ca", "localhost", true, 100)
 	bClient1 := generateCertBundle(t, "client-ca", "client-identity-1", false, 301)
@@ -344,7 +346,7 @@ func TestClientCertReload_NoRestart(t *testing.T) {
 	clientDir := t.TempDir()
 	writeMaterial(t, clientDir, bClient1.certPEM, bClient1.keyPEM, bServer.caPEM)
 
-	serverCreds, err := NewServerTLSFromDir(serverDir)
+	serverCreds, err := NewServerTLSFromDir(ctx, serverDir)
 	if err != nil {
 		t.Fatalf("NewServerTLSFromDir failed: %v", err)
 	}
@@ -368,7 +370,7 @@ func TestClientCertReload_NoRestart(t *testing.T) {
 	}()
 	defer srv.Stop()
 
-	clientCreds, err := NewClientTLSFromDir(clientDir)
+	clientCreds, err := NewClientTLSFromDir(ctx, clientDir)
 	if err != nil {
 		t.Fatalf("NewClientTLSFromDir failed: %v", err)
 	}
@@ -388,7 +390,7 @@ func TestClientCertReload_NoRestart(t *testing.T) {
 	defer conn1.Close()
 
 	client := testpb.NewTestServiceClient(conn1)
-	ctx1, cancel1 := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx1, cancel1 := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel1()
 
 	if _, err := client.EmptyCall(ctx1, &testpb.Empty{}); err != nil {
@@ -425,6 +427,7 @@ func TestClientCertReload_NoRestart(t *testing.T) {
 }
 
 func TestClientCAReload_OnVerificationFailure(t *testing.T) {
+	ctx := t.Context()
 	bServer1 := generateCertBundle(t, "server-ca-1", "localhost", true, 501)
 	bServer2 := generateCertBundle(t, "server-ca-2", "localhost", true, 502)
 	bClient := generateCertBundle(t, "client-ca", "test-client", false, 601)
@@ -436,7 +439,7 @@ func TestClientCAReload_OnVerificationFailure(t *testing.T) {
 	// Client initially only trusts server-ca-1
 	writeMaterial(t, clientDir, bClient.certPEM, bClient.keyPEM, bServer1.caPEM)
 
-	serverCreds, err := NewServerTLSFromDir(serverDir)
+	serverCreds, err := NewServerTLSFromDir(ctx, serverDir)
 	if err != nil {
 		t.Fatalf("NewServerTLSFromDir failed: %v", err)
 	}
@@ -459,7 +462,7 @@ func TestClientCAReload_OnVerificationFailure(t *testing.T) {
 	}()
 	defer srv.Stop()
 
-	clientCreds, err := NewClientTLSFromDir(clientDir)
+	clientCreds, err := NewClientTLSFromDir(ctx, clientDir)
 	if err != nil {
 		t.Fatalf("NewClientTLSFromDir failed: %v", err)
 	}
@@ -521,6 +524,7 @@ func TestIsVerificationError(t *testing.T) {
 }
 
 func TestConcurrentReloadAndHandshake(t *testing.T) {
+	ctx := t.Context()
 	bServerCA := generateCertBundle(t, "server-ca", "localhost", true, 901)
 	bServer2 := generateLeafCert(t, bServerCA, "localhost", true, 902)
 	bClient := generateCertBundle(t, "client-ca", "client", false, 903)
@@ -531,7 +535,7 @@ func TestConcurrentReloadAndHandshake(t *testing.T) {
 	clientDir := t.TempDir()
 	writeMaterial(t, clientDir, bClient.certPEM, bClient.keyPEM, bServerCA.caPEM)
 
-	serverCreds, err := NewServerTLSFromDir(serverDir)
+	serverCreds, err := NewServerTLSFromDir(ctx, serverDir)
 	if err != nil {
 		t.Fatalf("NewServerTLSFromDir failed: %v", err)
 	}
@@ -554,7 +558,7 @@ func TestConcurrentReloadAndHandshake(t *testing.T) {
 	}()
 	defer srv.Stop()
 
-	clientCreds, err := NewClientTLSFromDir(clientDir)
+	clientCreds, err := NewClientTLSFromDir(ctx, clientDir)
 	if err != nil {
 		t.Fatalf("NewClientTLSFromDir failed: %v", err)
 	}
@@ -583,7 +587,7 @@ func TestConcurrentReloadAndHandshake(t *testing.T) {
 					writeMaterial(t, serverDir, bServer2.certPEM, bServer2.keyPEM, bClient.caPEM)
 				}
 				toggle = !toggle
-				if rErr := reloader.Reload(); rErr != nil {
+				if rErr := reloader.Reload(ctx); rErr != nil {
 					t.Logf("reloader.Reload: %v", rErr)
 				}
 			}
@@ -621,11 +625,12 @@ func TestConcurrentReloadAndHandshake(t *testing.T) {
 }
 
 func TestReloader_FailedReloadKeepsLastGoodMaterial(t *testing.T) {
+	ctx := t.Context()
 	b := generateCertBundle(t, "ca-1", "localhost", true, 701)
 	dir := t.TempDir()
 	writeMaterial(t, dir, b.certPEM, b.keyPEM, b.caPEM)
 
-	reloader, err := NewCertReloader(dir)
+	reloader, err := NewCertReloader(ctx, dir)
 	if err != nil {
 		t.Fatalf("NewCertReloader failed: %v", err)
 	}
@@ -649,7 +654,7 @@ func TestReloader_FailedReloadKeepsLastGoodMaterial(t *testing.T) {
 	}
 
 	// Force reload; should return error and retain last good material
-	if err := reloader.Reload(); err == nil {
+	if err := reloader.Reload(ctx); err == nil {
 		t.Fatalf("expected Reload to fail for corrupted key, but succeeded")
 	}
 
@@ -665,7 +670,7 @@ func TestReloader_FailedReloadKeepsLastGoodMaterial(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "tls.key"), b.keyPEM, 0600); err != nil {
 		t.Fatalf("failed to restore key: %v", err)
 	}
-	if err := reloader.Reload(); err != nil {
+	if err := reloader.Reload(ctx); err != nil {
 		t.Fatalf("expected reload to succeed after key restore, got: %v", err)
 	}
 }

@@ -273,12 +273,13 @@ func (s *testServer) EmptyCall(ctx context.Context, in *testpb.Empty) (*testpb.E
 }
 
 func TestGRPCRoundTrip_MTLS(t *testing.T) {
+	ctx := t.Context()
 	certs := generateTestCerts(t)
 
 	serverDir := setupCertDir(t, certs.serverKeyM, certs.serverPEM, certs.caPEM)
 	clientDir := setupCertDir(t, certs.clientKeyM, certs.clientPEM, certs.caPEM)
 
-	serverCreds, err := NewServerTLSFromDir(serverDir)
+	serverCreds, err := NewServerTLSFromDir(ctx, serverDir)
 	if err != nil {
 		t.Fatalf("NewServerTLSFromDir failed: %v", err)
 	}
@@ -302,7 +303,7 @@ func TestGRPCRoundTrip_MTLS(t *testing.T) {
 	defer srv.Stop()
 
 	// 1. Valid mTLS client succeeds
-	clientCreds, err := NewClientTLSFromDir(clientDir)
+	clientCreds, err := NewClientTLSFromDir(ctx, clientDir)
 	if err != nil {
 		t.Fatalf("NewClientTLSFromDir failed: %v", err)
 	}
@@ -322,10 +323,10 @@ func TestGRPCRoundTrip_MTLS(t *testing.T) {
 	defer conn.Close()
 
 	client := testpb.NewTestServiceClient(conn)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+	if _, err := client.EmptyCall(callCtx, &testpb.Empty{}); err != nil {
 		t.Fatalf("mTLS call failed: %v", err)
 	}
 

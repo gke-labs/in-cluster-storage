@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"syscall"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/fuseholder"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"k8s.io/klog/v2"
 )
 
@@ -33,6 +35,8 @@ var socketPath = flag.String("socket-path", "/run/objectfs/fuse-holder.sock", "P
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	ctx := scoped.WithLog(context.Background(), klog.Background())
 
 	if *socketPath == "" {
 		klog.Fatal("--socket-path is required")
@@ -44,14 +48,14 @@ func main() {
 	}
 	defer func() {
 		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			klog.Warningf("failed to close listener: %v", closeErr)
+			scoped.Log(ctx).Info("failed to close listener", "err", closeErr)
 		}
 	}()
 
 	holder := fuseholder.New()
 	defer func() {
 		if closeErr := holder.Close(); closeErr != nil {
-			klog.Warningf("failed to close holder: %v", closeErr)
+			scoped.Log(ctx).Info("failed to close holder", "err", closeErr)
 		}
 	}()
 
@@ -60,14 +64,14 @@ func main() {
 	go func() {
 		<-stopSignal
 		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			klog.Warningf("failed to close listener on signal: %v", err)
+			scoped.Log(ctx).Info("failed to close listener on signal", "err", err)
 		}
 		if err := holder.Close(); err != nil {
-			klog.Warningf("failed to close holder on signal: %v", err)
+			scoped.Log(ctx).Info("failed to close holder on signal", "err", err)
 		}
 	}()
 
-	klog.Infof("FUSE holder listening on %s", *socketPath)
+	scoped.Log(ctx).Info("FUSE holder listening", "path", *socketPath)
 	if err := holder.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
 		klog.Fatalf("holder serve error: %v", err)
 	}

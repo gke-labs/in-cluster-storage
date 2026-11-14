@@ -89,14 +89,14 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		klog.Infof("Shutting down WAL buffer server...")
+		scoped.Log(ctx).Info("Shutting down WAL buffer server...")
 		grpcServer.GracefulStop()
 	}()
 
-	klog.Infof("WAL Buffer Service listening on port %d (last_position=%d, backend=%s, data-dir=%s)", *port, srv.LastPosition(), *backendType, *dataDir)
+	scoped.Log(ctx).Info("WAL Buffer Service listening", "port", *port, "lastPosition", srv.LastPosition(), "backend", *backendType, "dataDir", *dataDir)
 	serveErr := grpcServer.Serve(listener)
 	if err := srv.Close(); err != nil {
-		klog.Errorf("failed to close server on shutdown: %v", err)
+		scoped.Log(ctx).Error(err, "failed to close server on shutdown")
 		klog.Flush()
 		os.Exit(1)
 	}

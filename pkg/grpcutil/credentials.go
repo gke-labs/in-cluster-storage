@@ -17,6 +17,7 @@ limitations under the License.
 package grpcutil
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -137,8 +138,8 @@ func ServerTLSConfigFromDir(dir string) (*tls.Config, error) {
 
 // NewServerTLSFromDir creates gRPC server TransportCredentials requiring client certificates,
 // backed by dynamic live reload of certificates and trust pools.
-func NewServerTLSFromDir(dir string) (credentials.TransportCredentials, error) {
-	reloader, err := NewCertReloader(dir)
+func NewServerTLSFromDir(ctx context.Context, dir string) (credentials.TransportCredentials, error) {
+	reloader, err := NewCertReloader(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -186,8 +187,8 @@ func ClientTLSConfigFromDir(dir string) (*tls.Config, error) {
 
 // NewClientTLSFromDir creates gRPC client TransportCredentials presenting client certificates,
 // backed by dynamic live reload of certificates and trust pools.
-func NewClientTLSFromDir(dir string) (credentials.TransportCredentials, error) {
-	reloader, err := NewCertReloader(dir)
+func NewClientTLSFromDir(ctx context.Context, dir string) (credentials.TransportCredentials, error) {
+	reloader, err := NewCertReloader(ctx, dir)
 	if err != nil {
 		return nil, err
 	}

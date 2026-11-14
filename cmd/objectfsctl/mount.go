@@ -93,7 +93,7 @@ func runMount(ctx context.Context, opts *mountOptions, mountpoint string) error 
 		return fmt.Errorf("failed to create mountpoint %s: %w", mountpoint, err)
 	}
 
-	client, conn, err := dialServer(opts.options)
+	client, conn, err := dialServer(ctx, opts.options)
 	if err != nil {
 		return err
 	}

@@ -192,7 +192,7 @@ func TestNodeDaemonSecurityFlags(t *testing.T) {
 		}
 	}()
 
-	_, err = driver.getClient()
+	_, err = driver.getClient(t.Context())
 	if err == nil {
 		t.Fatalf("expected error from getClient with non-existent cert dir")
 	}
@@ -562,7 +562,7 @@ func TestStartupReattach_ServesHeldMountsAndDuplicatePublishDoesNotMount(t *test
 		return fakeHolder, nil
 	}
 
-	if err := driver.reattachHeldMounts(); err != nil {
+	if err := driver.reattachHeldMounts(ctx); err != nil {
 		t.Fatalf("reattachHeldMounts failed: %v", err)
 	}
 
@@ -655,7 +655,7 @@ func TestStartupReattach_CloseToOpen(t *testing.T) {
 	fakeHolder.heldMounts[targetDirectory].mountDescriptor = newMountDescriptor
 	fakeHolder.heldMounts[targetDirectory].peerDescriptor = newPeerDescriptor
 
-	if err := driver.reattachHeldMounts(); err != nil {
+	if err := driver.reattachHeldMounts(ctx); err != nil {
 		t.Fatalf("reattachHeldMounts failed: %v", err)
 	}
 
