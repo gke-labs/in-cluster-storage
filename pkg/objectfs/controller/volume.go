@@ -828,14 +828,14 @@ func (v *Volume) finishEmptySync(snapshotSeq uint64, err error, pos uint64, inod
 //   - Does not acquire or release v.stagingMu.
 //
 // Waiters:
-// It scans v.coalesceWaiters and completes any waiter whose seq is <= snapshotSeq and whose
+// It scans v.coalesce.waiters and completes any waiter whose seq is <= snapshotSeq and whose
 // inodeID is in inodeFilter (or all waiters with seq <= snapshotSeq if inodeFilter is nil).
 // Completed waiters receive syncResult{pos: pos, err: err} on waiter.ch, which is then closed.
-// Uncompleted waiters remain in v.coalesceWaiters.
+// Uncompleted waiters remain in v.coalesce.waiters.
 //
 // Timers:
 // If the volume is accepting mutations (v.rejectMutationLocked() == nil, i.e. not stopping or closed):
-//   - v.coalesceTimer is armed (if not already armed) when remaining waiters or staged chunks exist.
+//   - v.coalesce.timer is armed (if not already armed) when remaining waiters or staged chunks exist.
 //   - v.closeTimer is armed (if not already armed) when pending closed inodes exist (v.closeInodes),
 //     independent of staged chunks or waiters.
 //
@@ -1388,6 +1388,8 @@ func (v *Volume) waitForCommit(ctx context.Context, waitFn func(context.Context)
 //     recorded in v.lastSyncError).
 //   - Empty-sync wait failure: If waitForSequence fails on an empty sync path, it delegates to
 //     finishEmptySync with the error and pos = 0.
+//   - Empty-sync flush failure: If v.stream.Flush fails on a permanent stream on an empty sync path,
+//     it delegates to finishEmptySync with the error and pos = 0.
 //   - Completion: On success or later failure (pack upload, metadata append, or durability wait),
 //     it delegates to finishRealSync. On a failed durability wait, packfiles are uploaded and
 //     metadata records already committed and applied in memory while chunk references remain staged
@@ -1399,7 +1401,7 @@ func (v *Volume) waitForCommit(ctx context.Context, waitFn func(context.Context)
 // An empty sync runs when there are no staged chunks in the volume or none matching inodeFilter.
 // It does not upload packfiles, append metadata records, or install v.currentSync. An empty sync
 // waits for v.Position() to reach the volume's durability level and returns that error if the wait
-// fails; on a permanent stream it then calls Flush, whose error is logged and not returned;
+// fails; on a permanent stream it then calls Flush and returns any error through finishEmptySync;
 // requirePermanent is not consulted; the seal-failure path neither waits nor flushes.
 //
 // Concurrency rule:

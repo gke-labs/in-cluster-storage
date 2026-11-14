@@ -259,11 +259,7 @@ func TestSyncBarrier_EmptySyncFlushFailureReturnsError(t *testing.T) {
 
 		volume.stagingMu.Lock()
 		waitChannel := make(chan syncResult, 1)
-		volume.coalesceWaiters = append(volume.coalesceWaiters, &syncWaiter{
-			seq:     volume.stagingSeq,
-			inodeID: fileInodeID,
-			ch:      waitChannel,
-		})
+		volume.coalesce.addWaiter(volume.stagingSeq, fileInodeID, waitChannel)
 		volume.stagingMu.Unlock()
 
 		stream.flushError.Store(&expectedError)
@@ -298,11 +294,7 @@ func TestSyncBarrier_EmptySyncFlushFailureReturnsError(t *testing.T) {
 
 		volume.stagingMu.Lock()
 		waitChannel := make(chan syncResult, 1)
-		volume.coalesceWaiters = append(volume.coalesceWaiters, &syncWaiter{
-			seq:     volume.stagingSeq,
-			inodeID: fileInodeID,
-			ch:      waitChannel,
-		})
+		volume.coalesce.addWaiter(volume.stagingSeq, fileInodeID, waitChannel)
 		volume.waitForSyncIdleLocked()
 		stream.flushError.Store(&expectedError)
 
@@ -349,11 +341,7 @@ func TestSyncBarrier_EmptySyncFlushFailureReturnsError(t *testing.T) {
 		targetInodeID := stagedInodeID + 1000
 		volume.stagingMu.Lock()
 		waitChannel := make(chan syncResult, 1)
-		volume.coalesceWaiters = append(volume.coalesceWaiters, &syncWaiter{
-			seq:     volume.stagingSeq,
-			inodeID: targetInodeID,
-			ch:      waitChannel,
-		})
+		volume.coalesce.addWaiter(volume.stagingSeq, targetInodeID, waitChannel)
 		volume.waitForSyncIdleLocked()
 		stream.flushError.Store(&expectedError)
 
