@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"sync/atomic"
 	"testing"
@@ -31,6 +32,8 @@ type recordingStream struct {
 	appendCount      atomic.Int64
 	waitCount        atomic.Int64
 	lastWaitSequence atomic.Uint64
+	level            walclient.Level
+	flushError       atomic.Pointer[error]
 }
 
 func (s *recordingStream) Append(ctx context.Context, payload []byte) (uint64, error) {
@@ -44,7 +47,12 @@ func (s *recordingStream) Wait(ctx context.Context, sequence uint64, level walcl
 	return nil
 }
 
-func (s *recordingStream) Flush(ctx context.Context) error { return nil }
+func (s *recordingStream) Flush(ctx context.Context) error {
+	if err := s.flushError.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
 
 func (s *recordingStream) Watermarks() (uint64, uint64, uint64) {
 	appends := uint64(s.appendCount.Load())
@@ -53,7 +61,12 @@ func (s *recordingStream) Watermarks() (uint64, uint64, uint64) {
 
 func (s *recordingStream) RecoveredRecords() []*wal.ClientRecord { return nil }
 
-func (s *recordingStream) ReplicationLevel() walclient.Level { return walclient.Witness }
+func (s *recordingStream) ReplicationLevel() walclient.Level {
+	if s.level != 0 {
+		return s.level
+	}
+	return walclient.Witness
+}
 
 func (s *recordingStream) Tail(ctx context.Context, fromSequence uint64) (iter.Seq2[uint64, []byte], error) {
 	return func(yield func(uint64, []byte) bool) {}, nil
@@ -189,4 +202,153 @@ func TestSyncBarrier_EmptyFilteredSyncWaitsOnNewestCommitSequence(t *testing.T) 
 	if lastWait := stream.lastWaitSequence.Load(); lastWait != expectedPosition {
 		t.Fatalf("expected lastWaitSequence = %d, got %d", expectedPosition, lastWait)
 	}
+}
+
+func TestSyncBarrier_EmptySyncFlushFailureReturnsError(t *testing.T) {
+	ctx := t.Context()
+	expectedError := errors.New("stream flush failed")
+
+	newPermanentServer := func(t *testing.T, stream *recordingStream) *Server {
+		t.Helper()
+		server := NewTestServer(t, NewMemoryBackend(),
+			WithServerStreamFactory(func(volumeID string) (walclient.Stream, error) {
+				return stream, nil
+			}),
+			WithServerDurability(walclient.Permanent),
+		)
+		t.Cleanup(func() {
+			if err := server.Close(); err != nil {
+				t.Errorf("server.Close failed: %v", err)
+			}
+		})
+		return server
+	}
+
+	assertWaiterReceivedError := func(t *testing.T, waitChannel <-chan syncResult) {
+		t.Helper()
+		select {
+		case result := <-waitChannel:
+			if !errors.Is(result.err, expectedError) {
+				t.Fatalf("expected coalesce waiter error %v, got: %v", expectedError, result.err)
+			}
+		default:
+			t.Fatal("expected coalesce waiter to receive error")
+		}
+	}
+
+	t.Run("FsyncNothingStaged", func(t *testing.T) {
+		stream := &recordingStream{level: walclient.Permanent}
+		server := newPermanentServer(t, stream)
+
+		volumeID := "test-sync-barrier-flush-fsync"
+		createResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        "file.txt",
+			Mode:        0644,
+		})
+		if err != nil || createResponse.GetError() != 0 {
+			t.Fatalf("CreateFile failed: %v (code %d)", err, createResponse.GetError())
+		}
+		fileInodeID := createResponse.GetAttr().GetInode().GetIno()
+
+		volume, err := server.getOrCreateVolume(volumeID)
+		if err != nil {
+			t.Fatalf("getOrCreateVolume failed: %v", err)
+		}
+
+		volume.stagingMu.Lock()
+		waitChannel := make(chan syncResult, 1)
+		volume.coalesce.addWaiter(volume.stagingSeq, fileInodeID, waitChannel)
+		volume.stagingMu.Unlock()
+
+		stream.flushError.Store(&expectedError)
+
+		_, _, fsyncErr := volume.FsyncWithEpoch(ctx, fileInodeID, true, 0, pb.FsyncRequest_SYNC_TRIGGER_UNSPECIFIED)
+		if !errors.Is(fsyncErr, expectedError) {
+			t.Fatalf("expected FsyncWithEpoch error %v, got: %v", expectedError, fsyncErr)
+		}
+		assertWaiterReceivedError(t, waitChannel)
+	})
+
+	t.Run("ExecuteSyncNothingStaged", func(t *testing.T) {
+		stream := &recordingStream{level: walclient.Permanent}
+		server := newPermanentServer(t, stream)
+
+		volumeID := "test-sync-barrier-flush-empty-volume"
+		createResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        "file.txt",
+			Mode:        0644,
+		})
+		if err != nil || createResponse.GetError() != 0 {
+			t.Fatalf("CreateFile failed: %v (code %d)", err, createResponse.GetError())
+		}
+		fileInodeID := createResponse.GetAttr().GetInode().GetIno()
+
+		volume, err := server.getOrCreateVolume(volumeID)
+		if err != nil {
+			t.Fatalf("getOrCreateVolume failed: %v", err)
+		}
+
+		volume.stagingMu.Lock()
+		waitChannel := make(chan syncResult, 1)
+		volume.coalesce.addWaiter(volume.stagingSeq, fileInodeID, waitChannel)
+		volume.waitForSyncIdleLocked()
+		stream.flushError.Store(&expectedError)
+
+		_, syncErr := volume.executeSyncLocked(ctx, pb.FsyncRequest_SYNC_TRIGGER_PERIODIC, true, nil)
+		if !errors.Is(syncErr, expectedError) {
+			t.Fatalf("expected executeSyncLocked error %v, got: %v", expectedError, syncErr)
+		}
+		assertWaiterReceivedError(t, waitChannel)
+	})
+
+	t.Run("ExecuteSyncFilteredNothingStaged", func(t *testing.T) {
+		stream := &recordingStream{level: walclient.Permanent}
+		server := newPermanentServer(t, stream)
+
+		volumeID := "test-sync-barrier-flush-empty-filter"
+		createResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        "staged.bin",
+			Mode:        0644,
+		})
+		if err != nil || createResponse.GetError() != 0 {
+			t.Fatalf("CreateFile failed: %v (code %d)", err, createResponse.GetError())
+		}
+		stagedInodeID := createResponse.GetAttr().GetInode().GetIno()
+
+		// Stage chunk data on stagedInodeID so len(v.stagedChunks) > 0.
+		writeResponse, err := server.WriteFile(ctx, &pb.WriteFileRequest{
+			VolumeId:  volumeID,
+			Inode:     stagedInodeID,
+			Offset:    0,
+			Data:      []byte("hello world"),
+			WriteMode: pb.WriteMode_LAZY,
+		})
+		if err != nil || writeResponse.GetError() != 0 {
+			t.Fatalf("WriteFile failed: %v (code %d)", err, writeResponse.GetError())
+		}
+
+		volume, err := server.getOrCreateVolume(volumeID)
+		if err != nil {
+			t.Fatalf("getOrCreateVolume failed: %v", err)
+		}
+
+		targetInodeID := stagedInodeID + 1000
+		volume.stagingMu.Lock()
+		waitChannel := make(chan syncResult, 1)
+		volume.coalesce.addWaiter(volume.stagingSeq, targetInodeID, waitChannel)
+		volume.waitForSyncIdleLocked()
+		stream.flushError.Store(&expectedError)
+
+		_, syncErr := volume.executeSyncLocked(ctx, pb.FsyncRequest_SYNC_TRIGGER_CLOSE, true, map[uint64]struct{}{targetInodeID: {}})
+		if !errors.Is(syncErr, expectedError) {
+			t.Fatalf("expected executeSyncLocked error %v, got: %v", expectedError, syncErr)
+		}
+		assertWaiterReceivedError(t, waitChannel)
+	})
 }
