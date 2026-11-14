@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -34,6 +35,11 @@ type recordingStream struct {
 	lastWaitSequence atomic.Uint64
 	level            walclient.Level
 	flushError       atomic.Pointer[error]
+	lastWaitLevel    atomic.Value
+	waitError        atomic.Pointer[error]
+
+	contextMutex    sync.Mutex
+	lastWaitContext context.Context
 }
 
 func (s *recordingStream) Append(ctx context.Context, payload []byte) (uint64, error) {
@@ -44,7 +50,30 @@ func (s *recordingStream) Append(ctx context.Context, payload []byte) (uint64, e
 func (s *recordingStream) Wait(ctx context.Context, sequence uint64, level walclient.Level, requestFlush bool) error {
 	s.waitCount.Add(1)
 	s.lastWaitSequence.Store(sequence)
+	s.lastWaitLevel.Store(level)
+	s.contextMutex.Lock()
+	s.lastWaitContext = ctx
+	s.contextMutex.Unlock()
+	if errorPointer := s.waitError.Load(); errorPointer != nil && *errorPointer != nil {
+		return *errorPointer
+	}
 	return nil
+}
+
+// waitContext returns the caller context recorded on the most recent Wait call.
+func (s *recordingStream) waitContext() context.Context {
+	s.contextMutex.Lock()
+	defer s.contextMutex.Unlock()
+	return s.lastWaitContext
+}
+
+// setWaitError configures an injected error returned by subsequent Wait calls.
+func (s *recordingStream) setWaitError(err error) {
+	if err == nil {
+		s.waitError.Store(nil)
+		return
+	}
+	s.waitError.Store(&err)
 }
 
 func (s *recordingStream) Flush(ctx context.Context) error {
@@ -351,4 +380,155 @@ func TestSyncBarrier_EmptySyncFlushFailureReturnsError(t *testing.T) {
 		}
 		assertWaiterReceivedError(t, waitChannel)
 	})
+}
+
+// newBarrierTestVolume creates a test server and volume backed by stream at Witness durability.
+func newBarrierTestVolume(t *testing.T, stream *recordingStream, volumeID string) (*Server, *Volume) {
+	t.Helper()
+	server := NewTestServer(t, NewMemoryBackend(),
+		WithServerStreamFactory(func(string) (walclient.Stream, error) { return stream, nil }),
+		WithServerDurability(walclient.Witness),
+	)
+	volume, err := server.getOrCreateVolume(volumeID)
+	if err != nil {
+		t.Fatalf("getOrCreateVolume failed: %v", err)
+	}
+	return server, volume
+}
+
+// assertWait verifies that exactly one durability wait occurred on stream with the expected sequence, level, and context.
+func assertWait(t *testing.T, stream *recordingStream, expectedSequence uint64, expectedContext context.Context) {
+	t.Helper()
+	if waits := stream.waitCount.Load(); waits != 1 {
+		t.Fatalf("expected 1 durability wait, got %d", waits)
+	}
+	if lastWait := stream.lastWaitSequence.Load(); lastWait != expectedSequence {
+		t.Fatalf("expected lastWaitSequence = %d, got %d", expectedSequence, lastWait)
+	}
+	if level, ok := stream.lastWaitLevel.Load().(walclient.Level); !ok || level != walclient.Witness {
+		t.Fatalf("expected wait level Witness, got %v", level)
+	}
+	if lastContext := stream.waitContext(); lastContext != expectedContext {
+		t.Fatalf("expected caller context, got %v", lastContext)
+	}
+}
+
+// TestSyncBarrier_CreateSnapshotWaitsAndSurfacesFailure verifies that CreateSnapshot
+// waits on the sequence it wrote at the volume's durability level, and returns any wait error.
+func TestSyncBarrier_CreateSnapshotWaitsAndSurfacesFailure(t *testing.T) {
+	ctx := t.Context()
+	stream := &recordingStream{}
+	server, volume := newBarrierTestVolume(t, stream, "test-sync-barrier-snapshot")
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close failed: %v", err)
+		}
+	}()
+
+	stream.waitCount.Store(0)
+	stream.lastWaitSequence.Store(0)
+
+	if snapshotName, err := volume.CreateSnapshot(ctx, "snap-1"); err != nil || snapshotName != "snap-1" {
+		t.Fatalf("CreateSnapshot failed: %v (name %q)", err, snapshotName)
+	}
+
+	assertWait(t, stream, uint64(stream.appendCount.Load()), ctx)
+
+	// Verify that wait failure surfaces to the caller, and that the pointer was recorded in memory.
+	injectedError := errors.New("injected snapshot wait failure")
+	stream.setWaitError(injectedError)
+	if _, err := volume.CreateSnapshot(ctx, "snap-fail"); !errors.Is(err, injectedError) {
+		t.Fatalf("expected error wrapping %v, got %v", injectedError, err)
+	}
+	pointers, err := volume.ListSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshots failed: %v", err)
+	}
+	var recordedPointer bool
+	for _, pointer := range pointers {
+		if pointer.GetName() == "snap-fail" {
+			recordedPointer = true
+			break
+		}
+	}
+	if !recordedPointer {
+		t.Fatal("expected snap-fail pointer to be recorded in memory despite wait failure")
+	}
+}
+
+// TestSyncBarrier_RestoreSnapshotWaitsAndSurfacesFailure verifies that RestoreSnapshot
+// waits on the sequence it wrote at the volume's durability level, and returns any wait error.
+func TestSyncBarrier_RestoreSnapshotWaitsAndSurfacesFailure(t *testing.T) {
+	ctx := t.Context()
+	stream := &recordingStream{}
+	server, volume := newBarrierTestVolume(t, stream, "test-sync-barrier-restore")
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close failed: %v", err)
+		}
+	}()
+
+	if _, err := volume.CreateSnapshot(ctx, "snap-base"); err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+
+	stream.waitCount.Store(0)
+	stream.lastWaitSequence.Store(0)
+
+	if snapshotInfo, err := volume.RestoreSnapshot(ctx, "snap-base"); err != nil || snapshotInfo == nil {
+		t.Fatalf("RestoreSnapshot failed: %v", err)
+	}
+
+	assertWait(t, stream, uint64(stream.appendCount.Load()), ctx)
+
+	pointersBefore, err := volume.ListSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshots before failed: %v", err)
+	}
+
+	// Verify that wait failure surfaces to the caller, and that the restore was applied in memory.
+	injectedError := errors.New("injected restore wait failure")
+	stream.setWaitError(injectedError)
+	if _, err := volume.RestoreSnapshot(ctx, "snap-base"); !errors.Is(err, injectedError) {
+		t.Fatalf("expected error wrapping %v, got %v", injectedError, err)
+	}
+	pointersAfter, err := volume.ListSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshots after failed: %v", err)
+	}
+	if len(pointersAfter) != len(pointersBefore)+1 {
+		t.Fatalf("expected %d snapshots recorded in memory after restore, got %d", len(pointersBefore)+1, len(pointersAfter))
+	}
+}
+
+// TestSyncBarrier_PersistConsistencyModeWaitsAndSurfacesFailure verifies that PersistConsistencyMode
+// waits on the sequence it wrote at the volume's durability level, and returns any wait error.
+func TestSyncBarrier_PersistConsistencyModeWaitsAndSurfacesFailure(t *testing.T) {
+	ctx := t.Context()
+	stream := &recordingStream{}
+	server, volume := newBarrierTestVolume(t, stream, "test-sync-barrier-consistency")
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close failed: %v", err)
+		}
+	}()
+
+	stream.waitCount.Store(0)
+	stream.lastWaitSequence.Store(0)
+
+	if err := volume.PersistConsistencyMode(ctx, pb.ConsistencyMode_CLOSE_TO_OPEN); err != nil {
+		t.Fatalf("PersistConsistencyMode failed: %v", err)
+	}
+
+	assertWait(t, stream, uint64(stream.appendCount.Load()), ctx)
+
+	// Verify that wait failure surfaces to the caller, and that consistency mode was set in memory.
+	injectedError := errors.New("injected consistency mode wait failure")
+	stream.setWaitError(injectedError)
+	if err := volume.PersistConsistencyMode(ctx, pb.ConsistencyMode_STANDARD); !errors.Is(err, injectedError) {
+		t.Fatalf("expected error wrapping %v, got %v", injectedError, err)
+	}
+	if mode := volume.ConsistencyMode(); mode != pb.ConsistencyMode_STANDARD {
+		t.Fatalf("expected consistency mode updated to STANDARD in memory, got %v", mode)
+	}
 }

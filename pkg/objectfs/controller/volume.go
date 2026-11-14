@@ -1845,8 +1845,25 @@ func (v *Volume) SetConsistencyMode(mode pb.ConsistencyMode) {
 	v.consistencyMode = mode
 }
 
-// PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store.
+// PersistConsistencyMode updates the volume's consistency mode and persists it to the metadata store,
+// waiting until the persisted VolumeInfo record reaches the volume's durability level.
 func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.ConsistencyMode) error {
+	commitSequence, err := v.persistVolumeInfo(ctx, mode)
+	if err != nil {
+		return err
+	}
+	// Wait for the VolumeInfo record's sequence to reach the volume's durability level
+	// with no locks held. On wait failure, the record is already sequenced and applied
+	// in memory, so the updated consistency mode is visible although the caller gets an error.
+	if err := v.waitForSequence(ctx, commitSequence); err != nil {
+		return fmt.Errorf("failed to wait for consistency mode durability: %w", err)
+	}
+	return nil
+}
+
+// persistVolumeInfo updates consistency mode in memory and commits VolumeInfo to the metadata stream.
+// Takes v.mu.
+func (v *Volume) persistVolumeInfo(ctx context.Context, mode pb.ConsistencyMode) (uint64, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -1859,7 +1876,7 @@ func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.Consistency
 
 	volInfoKey, err := pkVolumeInfo.Extract(volInfo)
 	if err != nil {
-		return fmt.Errorf("failed to extract VolumeInfo key: %w", err)
+		return 0, fmt.Errorf("failed to extract VolumeInfo key: %w", err)
 	}
 
 	var beforeMsg proto.Message
@@ -1867,7 +1884,7 @@ func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.Consistency
 	if v.metadataView != nil {
 		msg, ok, err := v.metadataView.Get(ctx, VolumeInfoTypeName, volInfoKey)
 		if err != nil {
-			return fmt.Errorf("failed to get VolumeInfo: %w", err)
+			return 0, fmt.Errorf("failed to get VolumeInfo: %w", err)
 		}
 		if ok && msg != nil {
 			beforeMsg = msg
@@ -1875,26 +1892,29 @@ func (v *Volume) PersistConsistencyMode(ctx context.Context, mode pb.Consistency
 		}
 	}
 
+	var commitSequence uint64
 	tx := v.beginTxLocked("PersistConsistencyMode")
 	if tx != nil {
 		v.recordReadLocked(tx, VolumeInfoTypeName, volInfoKey, beforeMsg)
 		if exists {
 			if _, err := tx.Update(ctx, volInfo); err != nil {
-				return fmt.Errorf("failed to update VolumeInfo: %w", err)
+				return 0, fmt.Errorf("failed to update VolumeInfo: %w", err)
 			}
 		} else {
 			if _, err := tx.Insert(ctx, volInfo); err != nil {
-				return fmt.Errorf("failed to insert VolumeInfo: %w", err)
+				return 0, fmt.Errorf("failed to insert VolumeInfo: %w", err)
 			}
 		}
-		if _, err := v.commitTxLocked(ctx, tx); err != nil {
-			return fmt.Errorf("failed to commit VolumeInfo transaction: %w", err)
+		sequence, err := v.commitTxLocked(ctx, tx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to commit VolumeInfo transaction: %w", err)
 		}
+		commitSequence = sequence
 		if err := v.flushOverlayLocked(ctx); err != nil {
-			return fmt.Errorf("failed to flush overlay for VolumeInfo: %w", err)
+			return 0, fmt.Errorf("failed to flush overlay for VolumeInfo: %w", err)
 		}
 	}
-	return nil
+	return commitSequence, nil
 }
 
 func (v *Volume) commitTxLocked(ctx context.Context, tx *sds.Tx) (uint64, error) {
@@ -6894,8 +6914,25 @@ func (v *Volume) LoadFromBackend(ctx context.Context) error {
 	return v.loadFromBackendMetadataLocked(ctx)
 }
 
-// CreateSnapshot creates and returns a new index snapshot of the current volume state.
+// CreateSnapshot creates and returns a new index snapshot of the current volume state,
+// waiting until the appended SnapshotPointer record reaches the volume's durability level.
 func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error) {
+	snapshotName, sequence, err := v.writeSnapshotPointer(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	// Wait for the SnapshotPointer record's sequence to reach the volume's durability level
+	// with no locks held. On wait failure, the pointer is already sequenced and applied
+	// in memory, so a retry with the same name appends a second pointer with that name.
+	if err := v.waitForSequence(ctx, sequence); err != nil {
+		return "", fmt.Errorf("failed to wait for snapshot pointer durability: %w", err)
+	}
+	return snapshotName, nil
+}
+
+// writeSnapshotPointer publishes a snapshot to backend and records its pointer under locks.
+// Takes snapshotMu and v.mu.
+func (v *Volume) writeSnapshotPointer(ctx context.Context, name string) (string, uint64, error) {
 	if err := v.Fsync(ctx, v.rootInodeID); err != nil {
 		klog.Warningf("ObjectFS volume %s Fsync before CreateSnapshot: %v", v.volumeID, err)
 	}
@@ -6907,21 +6944,21 @@ func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error
 	defer v.mu.Unlock()
 
 	if v.backend == nil {
-		return "", fmt.Errorf("no backend configured")
+		return "", 0, fmt.Errorf("no backend configured")
 	}
 
 	snap, ok := v.metadataView.Index().(sds.Snapshotter)
 	if !ok {
-		return "", fmt.Errorf("volume metadata index does not support snapshots")
+		return "", 0, fmt.Errorf("volume metadata index does not support snapshots")
 	}
 
 	if err := v.flushOverlayLocked(ctx); err != nil {
-		return "", fmt.Errorf("failed to flush overlay before snapshot: %w", err)
+		return "", 0, fmt.Errorf("failed to flush overlay before snapshot: %w", err)
 	}
 
 	snapKey, actualPos, err := snap.PublishSnapshot(ctx, v.backend)
 	if err != nil {
-		return "", fmt.Errorf("failed to publish index snapshot: %w", err)
+		return "", 0, fmt.Errorf("failed to publish index snapshot: %w", err)
 	}
 
 	format := ""
@@ -6929,27 +6966,30 @@ func (v *Volume) CreateSnapshot(ctx context.Context, name string) (string, error
 		format = v.indexFactory.Format()
 	}
 
-	snapName := name
-	if snapName == "" {
-		snapName = path.Base(snapKey)
+	snapshotName := name
+	if snapshotName == "" {
+		snapshotName = path.Base(snapKey)
 	}
 
 	ptr := &sdsv1.SnapshotPointer{
 		Position:  actualPos,
 		Format:    format,
 		Location:  snapKey,
-		Name:      snapName,
+		Name:      snapshotName,
 		CreatedAt: timestamppb.Now(),
 	}
 
+	var sequence uint64
 	if v.metadataStream != nil && snapKey != "" {
-		if _, err := v.metadataStream.AppendSnapshotPointer(ctx, ptr); err != nil {
-			return "", fmt.Errorf("failed to append snapshot pointer: %w", err)
+		appendedSequence, err := v.metadataStream.AppendSnapshotPointer(ctx, ptr)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to append snapshot pointer: %w", err)
 		}
+		sequence = appendedSequence
 	}
 	v.snapshotPointers = append(v.snapshotPointers, ptr)
 
-	return snapName, nil
+	return snapshotName, sequence, nil
 }
 
 // ListSnapshots returns all snapshot pointers for this volume sorted chronologically / by position.
@@ -7130,18 +7170,35 @@ func (v *Volume) DeleteSnapshot(ctx context.Context, name string) error {
 // ErrVolumeAlreadyExists indicates that the volume already has durable state.
 var ErrVolumeAlreadyExists = errors.New("volume already exists")
 
-// RestoreSnapshot restores the volume filesystem state to a specific snapshot.
+// RestoreSnapshot restores the volume filesystem state to a specific snapshot,
+// waiting until the appended restore record reaches the volume's durability level.
 // A restore is appended to the stream as a Restore record (SnapshotPointer with restored_from set)
 // at the head (H+1). The index is restored from the snapshot, its position set to H+1, stats and
 // allocator re-initialized (with inode numbers monotonic across the restore), and a fresh index
 // snapshot published at H+1 so recovery has a snapshot that already reflects the restore.
 // Returns the published snapshot info on success.
 func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.SnapshotInfo, error) {
+	snapshotInfo, restoreSequence, err := v.writeRestoreRecord(ctx, snapshotName)
+	if err != nil {
+		return nil, err
+	}
+	// Wait for the restore record's sequence to reach the volume's durability level
+	// with no locks held. On wait failure, the restore has already occurred in memory
+	// and published a fresh snapshot, so a retry will perform the restore again.
+	if err := v.waitForSequence(ctx, restoreSequence); err != nil {
+		return nil, fmt.Errorf("failed to wait for restore record durability: %w", err)
+	}
+	return snapshotInfo, nil
+}
+
+// writeRestoreRecord restores the filesystem state under locks and returns the new snapshot info and restore sequence.
+// Takes stagingMu (temporarily), snapshotMu, and v.mu.
+func (v *Volume) writeRestoreRecord(ctx context.Context, snapshotName string) (*pb.SnapshotInfo, uint64, error) {
 	v.stagingMu.Lock()
 	v.waitForSyncIdleLocked()
 	if err := v.resetStagingDirLocked(); err != nil {
 		v.stagingMu.Unlock()
-		return nil, err
+		return nil, 0, err
 	}
 	v.stagedChunks = make(map[uint64]map[int]stagedChunkReference)
 	v.stagedSizes = make(map[uint64]int64)
@@ -7156,15 +7213,15 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 	defer v.mu.Unlock()
 
 	if v.backend == nil {
-		return nil, fmt.Errorf("no backend configured")
+		return nil, 0, fmt.Errorf("no backend configured")
 	}
 	if v.indexFactory == nil {
-		return nil, fmt.Errorf("no index factory configured")
+		return nil, 0, fmt.Errorf("no index factory configured")
 	}
 
 	pointers, err := v.listSnapshotsLocked(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list snapshots: %w", err)
+		return nil, 0, fmt.Errorf("failed to list snapshots: %w", err)
 	}
 
 	var targetPtr *sdsv1.SnapshotPointer
@@ -7175,11 +7232,11 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 		}
 	}
 	if targetPtr == nil {
-		return nil, fmt.Errorf("%w: %q", ErrSnapshotNotFound, snapshotName)
+		return nil, 0, fmt.Errorf("%w: %q", ErrSnapshotNotFound, snapshotName)
 	}
 
 	if err := v.flushOverlayLocked(ctx); err != nil {
-		return nil, fmt.Errorf("failed to flush overlay before restore: %w", err)
+		return nil, 0, fmt.Errorf("failed to flush overlay before restore: %w", err)
 	}
 
 	var preRestoreMaxIno uint64
@@ -7203,7 +7260,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 	if v.metadataStream != nil {
 		seq, err := v.metadataStream.AppendSnapshotPointer(ctx, restorePtr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to append restore record: %w", err)
+			return nil, 0, fmt.Errorf("failed to append restore record: %w", err)
 		}
 		restoreSeq = seq
 	} else {
@@ -7213,7 +7270,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 
 	if v.stream.ReplicationLevel() == walclient.Permanent {
 		if err := v.stream.Flush(ctx); err != nil {
-			return nil, fmt.Errorf("failed to flush WAL stream after restore: %w", err)
+			return nil, 0, fmt.Errorf("failed to flush WAL stream after restore: %w", err)
 		}
 	}
 
@@ -7221,18 +7278,18 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 	if v.metadataView != nil {
 		oldIdx = v.metadataView.Index()
 		if err := v.metadataView.Close(); err != nil {
-			return nil, fmt.Errorf("failed to close metadata view: %w", err)
+			return nil, 0, fmt.Errorf("failed to close metadata view: %w", err)
 		}
 		v.metadataView = nil
 	}
 
 	restoredIdx, err := v.rebuildRestoreSnapshot(ctx, oldIdx, restorePtr, restoreSeq, preRestoreMaxIno)
 	if err != nil {
-		return nil, fmt.Errorf("failed to restore snapshot %q: %w", snapshotName, err)
+		return nil, 0, fmt.Errorf("failed to restore snapshot %q: %w", snapshotName, err)
 	}
 
 	if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
-		return nil, fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
+		return nil, 0, fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
 	}
 	v.lastCommitSeq = restoreSeq
 
@@ -7243,18 +7300,18 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 	// are retained across snapshot restore because they refer to the running clients.
 	v.initLiveStatsLocked()
 	if err := v.initNextInodeFromStatsLocked(ctx, preRestoreMaxIno); err != nil {
-		return nil, fmt.Errorf("failed to initialize next inode from stats: %w", err)
+		return nil, 0, fmt.Errorf("failed to initialize next inode from stats: %w", err)
 	}
 	v.assertStatsMatchLocked("after RestoreSnapshot")
 
 	snap, ok := v.metadataView.Index().(sds.Snapshotter)
 	if !ok {
-		return nil, fmt.Errorf("volume metadata index does not support snapshots")
+		return nil, 0, fmt.Errorf("volume metadata index does not support snapshots")
 	}
 
 	freshKey, freshPos, err := snap.PublishSnapshot(ctx, v.backend)
 	if err != nil {
-		return nil, fmt.Errorf("failed to publish fresh index snapshot after restore: %w", err)
+		return nil, 0, fmt.Errorf("failed to publish fresh index snapshot after restore: %w", err)
 	}
 
 	format := ""
@@ -7273,7 +7330,7 @@ func (v *Volume) RestoreSnapshot(ctx context.Context, snapshotName string) (*pb.
 	v.replaySnapshotLocation = freshKey
 	v.snapshotPointers = append(v.snapshotPointers, restorePtr, freshPtr)
 
-	return snapshotInfoFromPointer(freshPtr), nil
+	return snapshotInfoFromPointer(freshPtr), restoreSeq, nil
 }
 
 // InitFromSnapshot initializes the volume with a fresh metadata stream whose initial state
