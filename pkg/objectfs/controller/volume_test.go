@@ -18,10 +18,17 @@ package controller
 
 import (
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/record"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -278,5 +285,268 @@ func TestSyncCoalesceState(t *testing.T) {
 		if result := <-channel; !errors.Is(result.err, testErr) {
 			t.Fatalf("unexpected err: %v", result.err)
 		}
+	}
+}
+
+func TestConcurrentGetAttrLookup_ColdVolume_NoDataRace(t *testing.T) {
+	ctx := t.Context()
+	storageBackend := inmemorystorage.New()
+	broadcaster := NewEventBroadcaster()
+	volumeID := "test-cold-volume-race"
+	localDirectory := t.TempDir()
+
+	initialVolume := MustNewVolume(t, volumeID, storageBackend, broadcaster,
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDirectory),
+	)
+	if err := initialVolume.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed on initial volume: %v", err)
+	}
+
+	var directoryInodeIDs []uint64
+	var directoryNames []string
+	for index := 0; index < 4; index++ {
+		directoryName := fmt.Sprintf("test_dir_%d", index)
+		entryAttribute, err := initialVolume.Mkdir(ctx, 1, directoryName, 0755, 0, 0)
+		if err != nil {
+			t.Fatalf("Mkdir %s failed: %v", directoryName, err)
+		}
+		directoryInodeIDs = append(directoryInodeIDs, entryAttribute.GetInode().GetIno())
+		directoryNames = append(directoryNames, directoryName)
+	}
+
+	if err := initialVolume.Close(); err != nil {
+		t.Fatalf("Close failed on initial volume: %v", err)
+	}
+
+	coldVolume := MustNewVolume(t, volumeID, storageBackend, broadcaster,
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDirectory),
+	)
+	t.Cleanup(func() {
+		if closeErr := coldVolume.Close(); closeErr != nil {
+			t.Errorf("coldVolume.Close failed: %v", closeErr)
+		}
+	})
+	if err := coldVolume.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed on cold volume: %v", err)
+	}
+
+	const workerCount = 16
+	const iterationsPerWorker = 50
+	var waitGroup sync.WaitGroup
+	startSignal := make(chan struct{})
+
+	for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
+		waitGroup.Add(1)
+		go func(workerID int) {
+			defer waitGroup.Done()
+			<-startSignal
+			for iteration := 0; iteration < iterationsPerWorker; iteration++ {
+				targetIndex := (workerID + iteration) % len(directoryInodeIDs)
+				entryAttribute, err := coldVolume.GetAttr(ctx, directoryInodeIDs[targetIndex])
+				if err != nil {
+					t.Errorf("GetAttr failed for inode %d: %v", directoryInodeIDs[targetIndex], err)
+					return
+				}
+				if !entryAttribute.GetInode().GetIsDir() {
+					t.Errorf("expected directory for inode %d", directoryInodeIDs[targetIndex])
+					return
+				}
+
+				lookupAttribute, err := coldVolume.Lookup(ctx, 1, directoryNames[targetIndex])
+				if err != nil {
+					t.Errorf("Lookup failed for %s: %v", directoryNames[targetIndex], err)
+					return
+				}
+				if lookupAttribute.GetInode().GetIno() != directoryInodeIDs[targetIndex] {
+					t.Errorf("Lookup ino mismatch for %s: got %d, want %d", directoryNames[targetIndex], lookupAttribute.GetInode().GetIno(), directoryInodeIDs[targetIndex])
+					return
+				}
+			}
+		}(workerIndex)
+	}
+
+	close(startSignal)
+	waitGroup.Wait()
+}
+
+func TestRename_DirectoryIntoOwnSubtree_ColdVolumeFailsWithEINVAL(t *testing.T) {
+	ctx := t.Context()
+	storageBackend := inmemorystorage.New()
+	broadcaster := NewEventBroadcaster()
+	volumeID := "test-cold-rename-cycle"
+	localDirectory := t.TempDir()
+
+	initialVolume := MustNewVolume(t, volumeID, storageBackend, broadcaster,
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDirectory),
+	)
+	if err := initialVolume.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed on initial volume: %v", err)
+	}
+
+	entryAttributeA, err := initialVolume.Mkdir(ctx, 1, "a", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir a failed: %v", err)
+	}
+	directoryInodeIDA := entryAttributeA.GetInode().GetIno()
+
+	entryAttributeB, err := initialVolume.Mkdir(ctx, directoryInodeIDA, "b", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir b failed: %v", err)
+	}
+	directoryInodeIDB := entryAttributeB.GetInode().GetIno()
+
+	entryAttributeC, err := initialVolume.Mkdir(ctx, directoryInodeIDB, "c", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir c failed: %v", err)
+	}
+	directoryInodeIDC := entryAttributeC.GetInode().GetIno()
+
+	if err := initialVolume.Close(); err != nil {
+		t.Fatalf("Close failed on initial volume: %v", err)
+	}
+
+	coldVolume := MustNewVolume(t, volumeID, storageBackend, broadcaster,
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDirectory),
+	)
+	t.Cleanup(func() {
+		if closeErr := coldVolume.Close(); closeErr != nil {
+			t.Errorf("coldVolume.Close failed: %v", closeErr)
+		}
+	})
+	if err := coldVolume.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed on cold volume: %v", err)
+	}
+
+	// Renaming a into its direct child b must fail with EINVAL.
+	_, renameToChildError := coldVolume.Rename(ctx, 1, "a", directoryInodeIDB, "loop")
+	if !errors.Is(renameToChildError, syscall.EINVAL) {
+		t.Fatalf("expected EINVAL when renaming a into child b, got: %v", renameToChildError)
+	}
+
+	// Renaming a into its grandchild c must fail with EINVAL.
+	_, renameToGrandchildError := coldVolume.Rename(ctx, 1, "a", directoryInodeIDC, "loop")
+	if !errors.Is(renameToGrandchildError, syscall.EINVAL) {
+		t.Fatalf("expected EINVAL when renaming a into grandchild c, got: %v", renameToGrandchildError)
+	}
+}
+
+func TestRename_DirectoryAncestryCycle_FailsWithELOOP(t *testing.T) {
+	ctx := t.Context()
+	storageBackend := inmemorystorage.New()
+	broadcaster := NewEventBroadcaster()
+	volumeID := "test-rename-cycle-guard"
+	localDirectory := t.TempDir()
+
+	initialVolume := MustNewVolume(t, volumeID, storageBackend, broadcaster,
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDirectory),
+	)
+	if err := initialVolume.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed on initial volume: %v", err)
+	}
+
+	entryAttributeA, err := initialVolume.Mkdir(ctx, 1, "dir_a", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir dir_a failed: %v", err)
+	}
+	directoryInodeIDA := entryAttributeA.GetInode().GetIno()
+
+	entryAttributeB, err := initialVolume.Mkdir(ctx, 1, "dir_b", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir dir_b failed: %v", err)
+	}
+	directoryInodeIDB := entryAttributeB.GetInode().GetIno()
+
+	_, err = initialVolume.Mkdir(ctx, 1, "dir_target", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("Mkdir dir_target failed: %v", err)
+	}
+
+	if err := initialVolume.Close(); err != nil {
+		t.Fatalf("Close failed on initial volume: %v", err)
+	}
+
+	coldVolume := MustNewVolume(t, volumeID, storageBackend, broadcaster,
+		WithMetadataIndex("sqlite"),
+		WithLocalStorageDir(localDirectory),
+	)
+	t.Cleanup(func() {
+		if closeErr := coldVolume.Close(); closeErr != nil {
+			t.Errorf("coldVolume.Close failed: %v", closeErr)
+		}
+	})
+	if err := coldVolume.LoadFromBackend(ctx); err != nil {
+		t.Fatalf("LoadFromBackend failed on cold volume: %v", err)
+	}
+
+	// Synthesize a cycle where dir_a's parent is dir_b and dir_b's parent is dir_a.
+	inodeRowA := &pb.Inode{
+		Ino:       proto.Uint64(directoryInodeIDA),
+		Mode:      0755 | syscall.S_IFDIR,
+		IsDir:     true,
+		Nlink:     2,
+		ParentIno: proto.Uint64(directoryInodeIDB),
+	}
+	keyBytesA, valueBytesA, err := sds.SplitKeyAndNonKey(inodeRowA, []int32{1})
+	if err != nil {
+		t.Fatalf("SplitKeyAndNonKey inode A failed: %v", err)
+	}
+
+	inodeRowB := &pb.Inode{
+		Ino:       proto.Uint64(directoryInodeIDB),
+		Mode:      0755 | syscall.S_IFDIR,
+		IsDir:     true,
+		Nlink:     2,
+		ParentIno: proto.Uint64(directoryInodeIDA),
+	}
+	keyBytesB, valueBytesB, err := sds.SplitKeyAndNonKey(inodeRowB, []int32{1})
+	if err != nil {
+		t.Fatalf("SplitKeyAndNonKey inode B failed: %v", err)
+	}
+
+	cycleChanges := []sds.Change{
+		{
+			TypeName: InodeTypeName,
+			Op:       sds.OpUpdate,
+			Key:      sds.NewKeyFromBytes(keyBytesA),
+			RawKey:   keyBytesA,
+			RawVal:   valueBytesA,
+			Row:      inodeRowA,
+		},
+		{
+			TypeName: InodeTypeName,
+			Op:       sds.OpUpdate,
+			Key:      sds.NewKeyFromBytes(keyBytesB),
+			RawKey:   keyBytesB,
+			RawVal:   valueBytesB,
+			Row:      inodeRowB,
+		},
+	}
+	if err := coldVolume.metadataView.ApplyChangesSync(ctx, cycleChanges); err != nil {
+		t.Fatalf("ApplyChangesSync failed: %v", err)
+	}
+	coldVolume.metadataView.ClearCache()
+
+	// Attempting to move dir_target into dir_a must fail with ELOOP without hanging.
+	renameDoneChannel := make(chan error, 1)
+	go func() {
+		_, renameError := coldVolume.Rename(ctx, 1, "dir_target", directoryInodeIDA, "dir_target")
+		renameDoneChannel <- renameError
+	}()
+
+	select {
+	case renameError := <-renameDoneChannel:
+		if !errors.Is(renameError, syscall.ELOOP) {
+			t.Fatalf("expected error wrapping syscall.ELOOP, got: %v", renameError)
+		}
+		if !strings.Contains(renameError.Error(), "directory ancestry forms a cycle") {
+			t.Fatalf("expected error to mention 'directory ancestry forms a cycle', got: %v", renameError)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Rename hung due to cycle in directory ancestry")
 	}
 }
