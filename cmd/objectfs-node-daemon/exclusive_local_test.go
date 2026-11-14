@@ -714,7 +714,7 @@ func TestPublishExclusiveLocal_RecoversLeftoverUpper(t *testing.T) {
 	}
 
 	// Verify controller received the salvaged file
-	client, err = driver.getClient()
+	client, err = driver.getClient(ctx)
 	if err != nil {
 		t.Fatalf("getClient: %v", err)
 	}

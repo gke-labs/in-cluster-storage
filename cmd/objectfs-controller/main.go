@@ -177,36 +177,36 @@ func (o *Options) Validate() error {
 	return nil
 }
 
-func evaluateLeafExpiry(cert *x509.Certificate, now time.Time) {
+func evaluateLeafExpiry(ctx context.Context, cert *x509.Certificate, now time.Time) {
 	if cert == nil {
 		return
 	}
 	remaining := cert.NotAfter.Sub(now)
 	if remaining <= 0 {
-		klog.Errorf("TLS leaf certificate expired at %s (expired %s ago). Rotate secret and rollout restart controller and node daemons immediately!", cert.NotAfter.Format(time.RFC3339), (-remaining).Round(time.Second))
+		scoped.Log(ctx).Error(nil, "TLS leaf certificate expired. Rotate secret and rollout restart controller and node daemons immediately!", "notAfter", cert.NotAfter.Format(time.RFC3339), "expiredAgo", (-remaining).Round(time.Second))
 	} else if remaining <= 30*24*time.Hour {
 		days := int(remaining.Hours() / 24)
-		klog.Warningf("TLS leaf certificate will expire in %d days (at %s). Rotate secret and rollout restart controller and node daemons to avoid outage!", days, cert.NotAfter.Format(time.RFC3339))
+		scoped.Log(ctx).Info("TLS leaf certificate will expire soon. Rotate secret and rollout restart controller and node daemons to avoid outage!", "days", days, "notAfter", cert.NotAfter.Format(time.RFC3339))
 	}
 }
 
-func checkLeafExpiry(certFile string, now time.Time) {
+func checkLeafExpiry(ctx context.Context, certFile string, now time.Time) {
 	data, err := os.ReadFile(certFile)
 	if err != nil {
-		klog.Warningf("could not read leaf cert %s for expiry check: %v", certFile, err)
+		scoped.Log(ctx).Info("could not read leaf cert for expiry check", "path", certFile, "err", err)
 		return
 	}
 	block, _ := pem.Decode(data)
 	if block == nil {
-		klog.Warningf("could not decode PEM in leaf cert %s", certFile)
+		scoped.Log(ctx).Info("could not decode PEM in leaf cert", "path", certFile)
 		return
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		klog.Warningf("could not parse leaf cert %s: %v", certFile, err)
+		scoped.Log(ctx).Info("could not parse leaf cert", "path", certFile, "err", err)
 		return
 	}
-	evaluateLeafExpiry(cert, now)
+	evaluateLeafExpiry(ctx, cert, now)
 }
 
 func parseEndpoint(endpoint string) (string, string, error) {
@@ -306,7 +306,7 @@ func run(options Options) error {
 
 	var grpcServer *grpc.Server
 	if options.Insecure {
-		klog.Warning("Serving plaintext gRPC without TLS or authentication (--insecure is set)")
+		scoped.Log(ctx).Info("Serving plaintext gRPC without TLS or authentication (--insecure is set)")
 		grpcServer = grpc.NewServer(
 			grpc.UnaryInterceptor(grpcutil.UnaryServerInterceptor()),
 			grpc.StreamInterceptor(grpcutil.StreamServerInterceptor()),
@@ -316,7 +316,7 @@ func run(options Options) error {
 			return fmt.Errorf("server certificate directory %s does not exist; pass --insecure for plaintext local dev", options.ServerCertDir)
 		}
 
-		checkLeafExpiry(filepath.Join(options.ServerCertDir, "tls.crt"), time.Now())
+		checkLeafExpiry(ctx, filepath.Join(options.ServerCertDir, "tls.crt"), time.Now())
 		go func() {
 			ticker := time.NewTicker(24 * time.Hour)
 			defer ticker.Stop()
@@ -325,12 +325,12 @@ func run(options Options) error {
 				case <-ctx.Done():
 					return
 				case t := <-ticker.C:
-					checkLeafExpiry(filepath.Join(options.ServerCertDir, "tls.crt"), t)
+					checkLeafExpiry(ctx, filepath.Join(options.ServerCertDir, "tls.crt"), t)
 				}
 			}
 		}()
 
-		tlsCreds, err := grpcutil.NewServerTLSFromDir(options.ServerCertDir)
+		tlsCreds, err := grpcutil.NewServerTLSFromDir(ctx, options.ServerCertDir)
 		if err != nil {
 			return fmt.Errorf("failed to load server TLS credentials from %s: %w", options.ServerCertDir, err)
 		}
@@ -347,7 +347,6 @@ func run(options Options) error {
 			Namespace: ns,
 			Insecure:  false,
 		})
-
 		grpcServer = grpc.NewServer(
 			grpc.Creds(tlsCreds),
 			grpc.ChainUnaryInterceptor(grpcutil.UnaryServerInterceptor(), authInterceptor.UnaryServerInterceptor()),
@@ -392,7 +391,7 @@ func run(options Options) error {
 		csi.RegisterControllerServer(csiServer, csiController)
 
 		go func() {
-			klog.Infof("ObjectFS CSI controller listening on %s", options.CSIEndpoint)
+			scoped.Log(ctx).Info("ObjectFS CSI controller listening", "endpoint", options.CSIEndpoint)
 			if err := csiServer.Serve(csiListener); err != nil {
 				klog.Fatalf("failed to serve CSI controller: %v", err)
 			}
@@ -403,19 +402,19 @@ func run(options Options) error {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		klog.Infof("Shutting down ObjectFS controller...")
+		scoped.Log(ctx).Info("Shutting down ObjectFS controller...")
 		if csiServer != nil {
 			csiServer.GracefulStop()
 		}
 		grpcServer.GracefulStop()
 	}()
 
-	klog.Infof("ObjectFS Controller listening on port %d (flushInterval=%v)", options.Port, options.FlushInterval)
+	scoped.Log(ctx).Info("ObjectFS Controller listening", "port", options.Port, "flushInterval", options.FlushInterval)
 	serveErr := grpcServer.Serve(listener)
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), options.ShutdownTimeout)
 	defer shutdownCancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		klog.Errorf("failed to shutdown server: %v", err)
+		scoped.Log(ctx).Error(err, "failed to shutdown server")
 		klog.Flush()
 		os.Exit(1)
 	}

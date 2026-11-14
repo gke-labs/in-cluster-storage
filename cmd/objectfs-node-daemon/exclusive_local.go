@@ -103,7 +103,7 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 	upperPath := filepath.Join(volumeDir, "upper")
 	workPath := filepath.Join(volumeDir, "work")
 
-	client, err := d.getClient()
+	client, err := d.getClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get controller client: %w", err)
 	}
@@ -440,7 +440,7 @@ func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.N
 		mountID = mountInfo.mountID
 	}
 
-	client, err := d.getClient()
+	client, err := d.getClient(ctx)
 	if err != nil {
 		log.Error(err, "failed to connect to controller for checkpoint, leaving upper layer intact")
 		return nil, fmt.Errorf("failed to get controller client: %w", err)

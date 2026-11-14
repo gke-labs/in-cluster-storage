@@ -28,8 +28,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"google.golang.org/grpc/credentials"
-	"k8s.io/klog/v2"
 )
 
 // CertReloader dynamically monitors and reloads TLS certificates and trust pools from a directory.
@@ -79,7 +79,7 @@ func (r *CertReloader) reload() error {
 
 // Reload forces a reload of the certificate and trust bundle from disk.
 // If reload fails, the last valid material is retained and a warning is logged once.
-func (r *CertReloader) Reload() error {
+func (r *CertReloader) Reload(ctx context.Context) error {
 	r.reloadMu.Lock()
 	defer r.reloadMu.Unlock()
 
@@ -90,19 +90,19 @@ func (r *CertReloader) Reload() error {
 	if err != nil {
 		if !r.lastFailed {
 			r.lastFailed = true
-			klog.Warningf("failed to reload TLS material from %s (keeping last good material): %v", r.dir, err)
+			scoped.Log(ctx).Info("failed to reload TLS material (keeping last good material)", "dir", r.dir, "err", err)
 		}
 		return err
 	}
 
 	if r.lastFailed {
 		r.lastFailed = false
-		klog.Infof("successfully reloaded TLS material from %s", r.dir)
+		scoped.Log(ctx).Info("successfully reloaded TLS material", "dir", r.dir)
 	}
 	return nil
 }
 
-func (r *CertReloader) run() {
+func (r *CertReloader) run(ctx context.Context) {
 	defer close(r.doneCh)
 
 	ticker := time.NewTicker(60 * time.Second)
@@ -115,8 +115,8 @@ func (r *CertReloader) run() {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
-			if err := r.Reload(); err != nil {
-				klog.V(4).Infof("periodic reload failed for %s: %v", r.dir, err)
+			if err := r.Reload(ctx); err != nil {
+				scoped.Log(ctx).V(4).Info("periodic reload failed", "dir", r.dir, "err", err)
 			}
 		case event, ok := <-r.watcher.Events:
 			if !ok {
@@ -124,24 +124,24 @@ func (r *CertReloader) run() {
 			}
 			if event.Op&fsnotify.Create != 0 && DirExists(trustDir) {
 				if err := r.watcher.Add(trustDir); err != nil {
-					klog.V(4).Infof("watching trust directory %s: %v", trustDir, err)
+					scoped.Log(ctx).V(4).Info("watching trust directory", "dir", trustDir, "err", err)
 				}
 			}
-			if err := r.Reload(); err != nil {
-				klog.V(4).Infof("event-triggered reload failed for %s: %v", r.dir, err)
+			if err := r.Reload(ctx); err != nil {
+				scoped.Log(ctx).V(4).Info("event-triggered reload failed", "dir", r.dir, "err", err)
 			}
 		case err, ok := <-r.watcher.Errors:
 			if !ok {
 				return
 			}
-			klog.Warningf("watcher error for %s: %v", r.dir, err)
+			scoped.Log(ctx).Info("watcher error", "dir", r.dir, "err", err)
 		}
 	}
 }
 
 // NewCertReloader initializes a reloader that watches dir for certificate updates
 // and periodically reloads trust material.
-func NewCertReloader(dir string) (*CertReloader, error) {
+func NewCertReloader(ctx context.Context, dir string) (*CertReloader, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("certificate directory path must not be empty")
 	}
@@ -164,7 +164,7 @@ func NewCertReloader(dir string) (*CertReloader, error) {
 
 	if err := watcher.Add(dir); err != nil {
 		if closeErr := watcher.Close(); closeErr != nil {
-			klog.Warningf("failed to close watcher: %v", closeErr)
+			scoped.Log(ctx).Info("failed to close watcher", "err", closeErr)
 		}
 		return nil, fmt.Errorf("failed to watch directory %s: %w", dir, err)
 	}
@@ -173,13 +173,13 @@ func NewCertReloader(dir string) (*CertReloader, error) {
 	if DirExists(trustDir) {
 		if err := watcher.Add(trustDir); err != nil {
 			if closeErr := watcher.Close(); closeErr != nil {
-				klog.Warningf("failed to close watcher: %v", closeErr)
+				scoped.Log(ctx).Info("failed to close watcher", "err", closeErr)
 			}
 			return nil, fmt.Errorf("failed to watch trust directory %s: %w", trustDir, err)
 		}
 	}
 
-	go r.run()
+	go r.run(ctx)
 
 	return r, nil
 }
@@ -327,8 +327,8 @@ func (c *clientTransportCredentials) ClientHandshake(ctx context.Context, author
 	conn, authInfo, err := inner.ClientHandshake(ctx, authority, rawConn)
 	if err != nil {
 		if isVerificationError(err) {
-			if reloadErr := c.reloader.Reload(); reloadErr != nil {
-				klog.V(4).Infof("reload after handshake verification error: %v", reloadErr)
+			if reloadErr := c.reloader.Reload(ctx); reloadErr != nil {
+				scoped.Log(ctx).V(4).Info("reload after handshake verification error", "err", reloadErr)
 			}
 		}
 		return nil, nil, err

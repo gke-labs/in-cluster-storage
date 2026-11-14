@@ -39,7 +39,7 @@ type options struct {
 	insecure      bool
 }
 
-func dialServer(opts *options) (pb.ObjectFSControllerClient, io.Closer, error) {
+func dialServer(ctx context.Context, opts *options) (pb.ObjectFSControllerClient, io.Closer, error) {
 	addr := opts.serverAddr
 	if addr == "" {
 		addr = os.Getenv("OBJECTFS_SERVER")
@@ -73,7 +73,7 @@ func dialServer(opts *options) (pb.ObjectFSControllerClient, io.Closer, error) {
 			return nil, nil, fmt.Errorf("client certificate directory %s does not exist; pass --insecure for plaintext local dev", certDir)
 		}
 
-		tlsCreds, err := grpcutil.NewClientTLSFromDir(certDir)
+		tlsCreds, err := grpcutil.NewClientTLSFromDir(ctx, certDir)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to load client TLS credentials from %s: %w", certDir, err)
 		}
@@ -144,7 +144,7 @@ func newBlobsListCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("--server is required")
 			}
 
-			client, conn, err := dialServer(listOpts.options)
+			client, conn, err := dialServer(cmd.Context(), listOpts.options)
 			if err != nil {
 				return err
 			}
@@ -209,7 +209,7 @@ func newBlobsGetCommand(opts *options) *cobra.Command {
 			}
 
 			sha := args[0]
-			client, conn, err := dialServer(getOpts.options)
+			client, conn, err := dialServer(cmd.Context(), getOpts.options)
 			if err != nil {
 				return err
 			}
@@ -274,7 +274,7 @@ func newVolumesDeleteCommand(opts *options) *cobra.Command {
 			}
 
 			volumeID := args[0]
-			client, connection, err := dialServer(opts)
+			client, connection, err := dialServer(cmd.Context(), opts)
 			if err != nil {
 				return err
 			}
@@ -309,7 +309,7 @@ func newVolumesDescribeCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("volume ID is required")
 			}
 
-			client, conn, err := dialServer(opts)
+			client, conn, err := dialServer(cmd.Context(), opts)
 			if err != nil {
 				return err
 			}
@@ -412,7 +412,7 @@ func newVolumesRepairCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("volume ID is required")
 			}
 
-			client, conn, err := dialServer(repairOpts.options)
+			client, conn, err := dialServer(cmd.Context(), repairOpts.options)
 			if err != nil {
 				return err
 			}
@@ -462,7 +462,7 @@ func newVolumesListCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("--server is required")
 			}
 
-			client, conn, err := dialServer(listOpts.options)
+			client, conn, err := dialServer(cmd.Context(), listOpts.options)
 			if err != nil {
 				return err
 			}
@@ -588,7 +588,7 @@ func newSnapshotsListCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("volume_id is required")
 			}
 
-			client, conn, err := dialServer(listOpts.options)
+			client, conn, err := dialServer(cmd.Context(), listOpts.options)
 			if err != nil {
 				return err
 			}
@@ -706,7 +706,7 @@ func newSnapshotCreateCommand(opts *options) *cobra.Command {
 				snapName = args[1]
 			}
 
-			client, conn, err := dialServer(createOpts.options)
+			client, conn, err := dialServer(cmd.Context(), createOpts.options)
 			if err != nil {
 				return err
 			}
@@ -745,7 +745,7 @@ func newSnapshotRestoreCommand(opts *options) *cobra.Command {
 
 			volumeID := args[0]
 			snapshotName := args[1]
-			client, connection, err := dialServer(opts)
+			client, connection, err := dialServer(cmd.Context(), opts)
 			if err != nil {
 				return err
 			}
@@ -783,7 +783,7 @@ func newSnapshotsDeleteCommand(opts *options) *cobra.Command {
 
 			volumeID := args[0]
 			snapshotName := args[1]
-			client, connection, err := dialServer(opts)
+			client, connection, err := dialServer(cmd.Context(), opts)
 			if err != nil {
 				return err
 			}
@@ -819,7 +819,7 @@ func newCheckpointCommand(opts *options) *cobra.Command {
 				return fmt.Errorf("volume ID is required")
 			}
 
-			client, conn, err := dialServer(opts)
+			client, conn, err := dialServer(cmd.Context(), opts)
 			if err != nil {
 				return err
 			}

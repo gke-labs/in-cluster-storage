@@ -242,26 +242,27 @@ func TestControllerTableRegistration(t *testing.T) {
 }
 
 func TestCheckLeafExpiry(t *testing.T) {
+	ctx := t.Context()
 	now := time.Now()
 
 	t.Run("expired certificate", func(t *testing.T) {
 		cert := &x509.Certificate{
 			NotAfter: now.Add(-1 * time.Hour),
 		}
-		evaluateLeafExpiry(cert, now)
+		evaluateLeafExpiry(ctx, cert, now)
 	})
 
 	t.Run("warning when within 30 days of expiry (10 days left)", func(t *testing.T) {
 		cert := &x509.Certificate{
 			NotAfter: now.Add(10 * 24 * time.Hour),
 		}
-		evaluateLeafExpiry(cert, now)
+		evaluateLeafExpiry(ctx, cert, now)
 	})
 
 	t.Run("ok when well before 30-day window (200 days left)", func(t *testing.T) {
 		cert := &x509.Certificate{
 			NotAfter: now.Add(200 * 24 * time.Hour),
 		}
-		evaluateLeafExpiry(cert, now)
+		evaluateLeafExpiry(ctx, cert, now)
 	})
 }
