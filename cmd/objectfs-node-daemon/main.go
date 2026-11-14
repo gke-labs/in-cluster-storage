@@ -97,7 +97,7 @@ func main() {
 		grpc.StreamInterceptor(grpcutil.StreamServerInterceptor()),
 	)
 
-	driver, err := newDriver(*nodeID, *controllerAddress, *cacheDir, *cacheSizeMB*1024*1024, *diskCacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval, *clientCertDir, *insecureFlag, *fuseHolderSocket)
+	driver, err := newDriver(context.Background(), *nodeID, *controllerAddress, *cacheDir, *cacheSizeMB*1024*1024, *diskCacheSizeMB*1024*1024, *controllerRPCTimeout, *controllerSyncTimeout, *syncOnClose, *backgroundSyncInterval, *clientCertDir, *insecureFlag, *fuseHolderSocket)
 	if err != nil {
 		klog.Fatalf("failed to initialize driver: %v", err)
 	}
@@ -194,7 +194,7 @@ func dialFuseHolder(socketPath string) (fuseHolderClient, error) {
 	return client, nil
 }
 
-func newDriver(nodeID, controllerAddress, cacheDir string, cacheBytes, diskCacheBytes int64, rpcTimeout, syncTimeout time.Duration, syncOnClose bool, backgroundSyncInterval time.Duration, clientCertDir string, insecure bool, fuseHolderSocket string) (*objectFSDriver, error) {
+func newDriver(ctx context.Context, nodeID, controllerAddress, cacheDir string, cacheBytes, diskCacheBytes int64, rpcTimeout, syncTimeout time.Duration, syncOnClose bool, backgroundSyncInterval time.Duration, clientCertDir string, insecure bool, fuseHolderSocket string) (*objectFSDriver, error) {
 	if rpcTimeout <= 0 {
 		rpcTimeout = 30 * time.Second
 	}
@@ -207,7 +207,7 @@ func newDriver(nodeID, controllerAddress, cacheDir string, cacheBytes, diskCache
 	if diskCacheBytes <= 0 {
 		diskCacheBytes = 10 * 1024 * 1024 * 1024 // 10 GiB
 	}
-	diskCache, err := objectfuse.NewDiskBlobCache(cacheDir, diskCacheBytes)
+	diskCache, err := objectfuse.NewDiskBlobCache(ctx, cacheDir, diskCacheBytes)
 	if err != nil {
 		klog.Warningf("Failed to initialize DiskBlobCache at %s: %v", cacheDir, err)
 	}

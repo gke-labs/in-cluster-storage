@@ -161,7 +161,7 @@ func TestNodeDaemon_FuseMountContext_LoggerHasVolumeAndTarget(t *testing.T) {
 	}()
 	defer grpcServer.Stop()
 
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "/run/objectfs/fuse-holder.sock")
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "/run/objectfs/fuse-holder.sock")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}

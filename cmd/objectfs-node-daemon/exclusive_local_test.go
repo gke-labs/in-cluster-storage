@@ -354,7 +354,7 @@ func TestReplayOperations(t *testing.T) {
 // TestNodePublish_AccessModeValidation verifies that exclusive-local mode requires SINGLE_NODE_SINGLE_WRITER (ReadWriteOncePod).
 func TestNodePublish_AccessModeValidation(t *testing.T) {
 	ctx := t.Context()
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	driver, err := newDriver(ctx, "test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -422,7 +422,7 @@ func TestNodePublish_AccessModeValidation(t *testing.T) {
 // TestNodeGetCapabilities_IncludesSingleNodeMultiWriter verifies advertising capability for ReadWriteOncePod.
 func TestNodeGetCapabilities_IncludesSingleNodeMultiWriter(t *testing.T) {
 	ctx := t.Context()
-	driver, err := newDriver("test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	driver, err := newDriver(ctx, "test-node", "localhost:50051", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -462,7 +462,7 @@ func TestCheckpointFailure_NeverDiscardsUpperLayer(t *testing.T) {
 		t.Fatalf("write uncommitted file: %v", err)
 	}
 
-	driver, err := newDriver("test-node", "localhost:50051", cacheDir, 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	driver, err := newDriver(ctx, "test-node", "localhost:50051", cacheDir, 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -556,7 +556,7 @@ func TestMaterialiseVolume(t *testing.T) {
 		t.Fatalf("CreateFile root_file failed: %v", err)
 	}
 
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -681,7 +681,7 @@ func TestPublishExclusiveLocal_RecoversLeftoverUpper(t *testing.T) {
 		t.Fatalf("write leftover file: %v", err)
 	}
 
-	driver, err := newDriver("test-node", "passthrough://bufnet", cacheDir, 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", cacheDir, 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -860,7 +860,7 @@ func TestPublishExclusiveLocal_FailsIfCleanupAfterRecoveryFails(t *testing.T) {
 		t.Fatalf("write leftover file: %v", err)
 	}
 
-	driver, err := newDriver("test-node", "passthrough://bufnet", cacheDir, 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", cacheDir, 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -968,7 +968,7 @@ func TestMaterialiseVolume_Resumable(t *testing.T) {
 	}
 	fileMtime := createResp.GetAttr().GetInode().GetMtime().AsTime()
 
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver: %v", err)
 	}
@@ -1370,7 +1370,7 @@ func TestMaterialiseVolume_XAttrs(t *testing.T) {
 		t.Fatalf("SetXAttr on dir failed: %v", err)
 	}
 
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
@@ -1450,7 +1450,7 @@ func TestMaterialiseVolume_FailingSetXAttrReturnsError(t *testing.T) {
 		t.Fatalf("SetXAttr failed: %v", err)
 	}
 
-	driver, err := newDriver("test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
+	driver, err := newDriver(ctx, "test-node", "passthrough://bufnet", t.TempDir(), 1024*1024, 10*1024*1024, 30*time.Second, 10*time.Minute, true, 30*time.Second, "", true, "")
 	if err != nil {
 		t.Fatalf("newDriver failed: %v", err)
 	}
