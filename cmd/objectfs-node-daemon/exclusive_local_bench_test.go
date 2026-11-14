@@ -154,7 +154,7 @@ func BenchmarkExclusiveLocalVsFUSE(b *testing.B) {
 			_ = f.Close()
 
 			// Checkpoint at unmount
-			ops, err := ScanUpperLayer(lowerDir, upperDir)
+			ops, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 			if err != nil {
 				b.Fatalf("ScanUpperLayer: %v", err)
 			}
@@ -246,7 +246,7 @@ func BenchmarkExclusiveLocalVsFUSE(b *testing.B) {
 			}
 
 			// Checkpoint at unmount
-			ops, err := ScanUpperLayer(lowerDir, upperDir)
+			ops, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 			if err != nil {
 				b.Fatalf("ScanUpperLayer: %v", err)
 			}

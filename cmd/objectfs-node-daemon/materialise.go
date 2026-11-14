@@ -28,8 +28,8 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"golang.org/x/sync/errgroup"
-	"k8s.io/klog/v2"
 )
 
 type dirMeta struct {
@@ -87,6 +87,9 @@ func applyXAttrs(ctx context.Context, client pb.ObjectFSControllerClient, volume
 }
 
 func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.ObjectFSControllerClient, volumeID, lowerPath string) error {
+	log := scoped.Log(ctx).WithValues("volume", volumeID)
+	ctx = scoped.WithLog(ctx, log)
+
 	type dirQueueItem struct {
 		ino     uint64
 		relPath string
@@ -200,7 +203,7 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 				totalBytes += ino.GetSize()
 			} else {
 				// Special files (fifos, device nodes, sockets) are skipped with a warning
-				klog.Warningf("exclusive-local: skipping unsupported special file %s (mode %o)", childRel, mode)
+				log.Info("exclusive-local: skipping unsupported special file", "path", childRel, "mode", fmt.Sprintf("%#o", mode))
 			}
 		}
 	}
@@ -239,8 +242,8 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 			case <-ticker.C:
 				fDone := filesDone.Load()
 				bDone := bytesDone.Load()
-				klog.Infof("Materialising volume %s into %s: %d/%d files (%d/%d bytes) completed",
-					volumeID, lowerPath, fDone, totalFiles, bDone, totalBytes)
+				scoped.Log(progressCtx).Info("materialising volume",
+					"path", lowerPath, "completedFiles", fDone, "totalFiles", totalFiles, "completedBytes", bDone, "totalBytes", totalBytes)
 			}
 		}
 	}()
@@ -264,8 +267,8 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 	}
 	cancelProgress()
 
-	klog.Infof("Completed materialisation of volume %s into %s: %d files (%d bytes)",
-		volumeID, lowerPath, filesDone.Load(), bytesDone.Load())
+	log.Info("completed materialisation of volume",
+		"path", lowerPath, "files", filesDone.Load(), "bytes", bytesDone.Load())
 
 	// Apply directory modes, ownership, mtimes, and xattrs bottom-up
 	for i := len(dirs) - 1; i >= 0; i-- {
@@ -275,17 +278,17 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 		}
 		if dm.mode != 0 {
 			if err := os.Chmod(dm.path, os.FileMode(dm.mode&07777)); err != nil {
-				klog.Warningf("chmod %s: %v", dm.path, err)
+				log.Info("chmod", "path", dm.path, "err", err)
 			}
 		}
 		if dm.uid != 0 || dm.gid != 0 {
 			if err := os.Chown(dm.path, int(dm.uid), int(dm.gid)); err != nil {
-				klog.V(4).Infof("chown %s: %v", dm.path, err)
+				log.V(4).Info("chown", "path", dm.path, "err", err)
 			}
 		}
 		if !dm.mtime.IsZero() {
 			if err := os.Chtimes(dm.path, dm.mtime, dm.mtime); err != nil {
-				klog.Warningf("chtimes %s: %v", dm.path, err)
+				log.Info("chtimes", "path", dm.path, "err", err)
 			}
 		}
 	}
@@ -293,14 +296,15 @@ func (d *objectFSDriver) materialiseVolume(ctx context.Context, client pb.Object
 	return nil
 }
 
-func closeAndRemove(f *os.File, path string) {
+// closeAndRemove closes the file and removes the path, logging any non-ignorable errors at verbosity 4.
+func closeAndRemove(ctx context.Context, f *os.File, path string) {
 	if f != nil {
 		if err := f.Close(); err != nil {
-			klog.V(4).Infof("close temp file %s: %v", path, err)
+			scoped.Log(ctx).V(4).Info("close temp file", "path", path, "err", err)
 		}
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		klog.V(4).Infof("remove temp file %s: %v", path, err)
+		scoped.Log(ctx).V(4).Info("remove temp file", "path", path, "err", err)
 	}
 }
 
@@ -333,17 +337,17 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 		}
 		if f.uid != 0 || f.gid != 0 {
 			if chownErr := os.Chown(tmpPath, int(f.uid), int(f.gid)); chownErr != nil {
-				klog.V(4).Infof("chown %s: %v", tmpPath, chownErr)
+				scoped.Log(ctx).V(4).Info("chown", "path", tmpPath, "err", chownErr)
 			}
 		}
 		if !f.mtime.IsZero() {
 			if chtimesErr := os.Chtimes(tmpPath, f.mtime, f.mtime); chtimesErr != nil {
-				klog.Warningf("chtimes %s: %v", tmpPath, chtimesErr)
+				scoped.Log(ctx).Info("chtimes", "path", tmpPath, "err", chtimesErr)
 			}
 		}
 		if err := applyXAttrs(ctx, client, volumeID, f.inode, tmpPath, f.xattrCount); err != nil {
 			if remErr := os.Remove(tmpPath); remErr != nil && !os.IsNotExist(remErr) {
-				klog.V(4).Infof("remove temp file %s: %v", tmpPath, remErr)
+				scoped.Log(ctx).V(4).Info("remove temp file", "path", tmpPath, "err", remErr)
 			}
 			return err
 		}
@@ -400,14 +404,14 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 					if data, readErr := d.diskCache.ReadBlob(ctx, sha); readErr == nil {
 						chunkData = data
 					} else {
-						klog.V(4).Infof("disk cache ReadBlob %s: %v", sha, readErr)
+						scoped.Log(ctx).V(4).Info("disk cache ReadBlob", "sha", sha, "err", readErr)
 					}
 				}
 				if len(chunkData) == 0 {
 					if data, fetchErr := d.diskCache.FetchBlob(ctx, client, sha); fetchErr == nil {
 						chunkData = data
 					} else {
-						klog.V(4).Infof("disk cache FetchBlob %s: %v", sha, fetchErr)
+						scoped.Log(ctx).V(4).Info("disk cache FetchBlob", "sha", sha, "err", fetchErr)
 					}
 				}
 			}
@@ -422,11 +426,11 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 				Size:     readLen,
 			})
 			if readErr != nil {
-				closeAndRemove(out, tmpPath)
+				closeAndRemove(ctx, out, tmpPath)
 				return fmt.Errorf("ReadFile %s (offset %d): %w", f.path, offset, readErr)
 			}
 			if readResp.GetError() != 0 {
-				closeAndRemove(out, tmpPath)
+				closeAndRemove(ctx, out, tmpPath)
 				return fmt.Errorf("ReadFile %s (offset %d) returned error: %d", f.path, offset, readResp.GetError())
 			}
 			chunkData = readResp.GetData()
@@ -434,7 +438,7 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 				sum := sha256.Sum256(chunkData)
 				sha := hex.EncodeToString(sum[:])
 				if putErr := d.diskCache.PutBlob(ctx, sha, chunkData); putErr != nil {
-					klog.V(4).Infof("disk cache PutBlob %s: %v", sha, putErr)
+					scoped.Log(ctx).V(4).Info("disk cache PutBlob", "sha", sha, "err", putErr)
 				}
 			}
 		}
@@ -443,37 +447,37 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 			chunkData = chunkData[:readLen]
 		}
 		if _, writeErr := out.Write(chunkData); writeErr != nil {
-			closeAndRemove(out, tmpPath)
+			closeAndRemove(ctx, out, tmpPath)
 			return fmt.Errorf("write %s: %w", tmpPath, writeErr)
 		}
 	}
 
 	if f.mode != 0 {
 		if chmodErr := os.Chmod(tmpPath, os.FileMode(f.mode&07777)); chmodErr != nil {
-			klog.Warningf("chmod %s: %v", tmpPath, chmodErr)
+			scoped.Log(ctx).Info("chmod", "path", tmpPath, "err", chmodErr)
 		}
 	}
 	if f.uid != 0 || f.gid != 0 {
 		if chownErr := os.Chown(tmpPath, int(f.uid), int(f.gid)); chownErr != nil {
-			klog.V(4).Infof("chown %s: %v", tmpPath, chownErr)
+			scoped.Log(ctx).V(4).Info("chown", "path", tmpPath, "err", chownErr)
 		}
 	}
 	if !f.mtime.IsZero() {
 		if chtimesErr := os.Chtimes(tmpPath, f.mtime, f.mtime); chtimesErr != nil {
-			klog.Warningf("chtimes %s: %v", tmpPath, chtimesErr)
+			scoped.Log(ctx).Info("chtimes", "path", tmpPath, "err", chtimesErr)
 		}
 	}
 
 	if closeErr := out.Close(); closeErr != nil {
 		if remErr := os.Remove(tmpPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.V(4).Infof("remove temp file %s: %v", tmpPath, remErr)
+			scoped.Log(ctx).V(4).Info("remove temp file", "path", tmpPath, "err", remErr)
 		}
 		return fmt.Errorf("close temp file %s: %w", tmpPath, closeErr)
 	}
 
 	if err := applyXAttrs(ctx, client, volumeID, f.inode, tmpPath, f.xattrCount); err != nil {
 		if remErr := os.Remove(tmpPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.V(4).Infof("remove temp file %s: %v", tmpPath, remErr)
+			scoped.Log(ctx).V(4).Info("remove temp file", "path", tmpPath, "err", remErr)
 		}
 		return err
 	}
@@ -481,7 +485,7 @@ func (d *objectFSDriver) downloadFile(ctx context.Context, client pb.ObjectFSCon
 	// Atomically rename into final path
 	if renameErr := os.Rename(tmpPath, f.path); renameErr != nil {
 		if remErr := os.Remove(tmpPath); remErr != nil && !os.IsNotExist(remErr) {
-			klog.V(4).Infof("remove temp file %s: %v", tmpPath, remErr)
+			scoped.Log(ctx).V(4).Info("remove temp file", "path", tmpPath, "err", remErr)
 		}
 		return fmt.Errorf("rename temp file %s to %s: %w", tmpPath, f.path, renameErr)
 	}

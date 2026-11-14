@@ -93,6 +93,7 @@ func unmountTarget(ctx context.Context, targetPath string) error {
 
 func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.NodePublishVolumeRequest, volumeID string) (*csi.NodePublishVolumeResponse, error) {
 	log := scoped.Log(ctx).WithValues("volume", volumeID)
+	ctx = scoped.WithLog(ctx, log)
 	targetPath := req.GetTargetPath()
 	mountID := targetPath
 	log.Info("publishing ObjectFS volume in exclusive-local mode", "target", targetPath)
@@ -146,7 +147,7 @@ func (d *objectFSDriver) publishExclusiveLocal(ctx context.Context, req *csi.Nod
 		return nil, fmt.Errorf("failed to inspect upper directory at %s: %w", upperPath, err)
 	} else if hasLeftover {
 		log.Info("found non-empty upper directory from previous uncommitted session, replaying checkpoint first", "path", upperPath)
-		opList, scanErr := ScanUpperLayer(lowerPath, upperPath)
+		opList, scanErr := ScanUpperLayer(ctx, lowerPath, upperPath)
 		if scanErr != nil {
 			return nil, fmt.Errorf("failed to scan leftover upper layer at %s: %w", upperPath, scanErr)
 		}
@@ -281,7 +282,7 @@ func (d *objectFSDriver) startExclusiveLocalSync(
 			return 0, fmt.Errorf("load checkpoint manifest: %w", err)
 		}
 
-		opList, err := ScanUpperLayer(lowerPath, upperPath, manifest)
+		opList, err := ScanUpperLayer(ctx, lowerPath, upperPath, manifest)
 		if err != nil {
 			return 0, fmt.Errorf("scan upper layer: %w", err)
 		}
@@ -426,6 +427,7 @@ func (d *objectFSDriver) startExclusiveLocalSync(
 
 func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, volumeID, volumeDir string, mountInfo *activeMount) (*csi.NodeUnpublishVolumeResponse, error) {
 	log := scoped.Log(ctx).WithValues("volume", volumeID)
+	ctx = scoped.WithLog(ctx, log)
 	targetPath := req.GetTargetPath()
 	log.Info("unpublishing ObjectFS exclusive-local volume", "target", targetPath)
 
@@ -480,7 +482,7 @@ func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.N
 	}
 
 	// 3. Unmount overlay from targetPath
-	if err := unmountTarget(scoped.WithLog(ctx, log), targetPath); err != nil {
+	if err := unmountTarget(ctx, targetPath); err != nil {
 		return nil, fmt.Errorf("failed to unmount overlay at %s: %w", targetPath, err)
 	}
 
@@ -491,7 +493,7 @@ func (d *objectFSDriver) unpublishExclusiveLocal(ctx context.Context, req *csi.N
 		manifest = nil
 	}
 
-	opList, err := ScanUpperLayer(lowerPath, upperPath, manifest)
+	opList, err := ScanUpperLayer(ctx, lowerPath, upperPath, manifest)
 	if err != nil {
 		log.Error(err, "failed to scan upper layer, leaving upper layer intact")
 		return nil, fmt.Errorf("checkpoint scan failed: %w", err)

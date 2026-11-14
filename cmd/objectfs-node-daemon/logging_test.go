@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -397,5 +399,165 @@ func TestNodeDaemon_ExclusiveLocalLogging(t *testing.T) {
 	}
 	if unpublishEntry["volume"] != objectFSVolumeID {
 		t.Fatalf("expected volume=%q (ObjectFS volume ID), got %v", objectFSVolumeID, unpublishEntry["volume"])
+	}
+}
+
+// TestNodeDaemon_MaterialiseLogging verifies that volume materialisation logs progress and completion carrying the resolved ObjectFS volume ID.
+func TestNodeDaemon_MaterialiseLogging(t *testing.T) {
+	sink := newNodeLoggingTestSink()
+	rootLogger := logr.New(sink)
+	csiHandle := "csi-vol-handle-mat"
+	objectFSVolumeID := "test-mat-logging-vol"
+
+	// Simulate gRPC interceptor setting CSI handle as volume on ctx.
+	ctx := scoped.WithLog(t.Context(), rootLogger.WithValues("volume", csiHandle))
+
+	server := controllertest.NewTestServer(nil)
+	listener := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			t.Errorf("grpcServer.Serve failed: %v", err)
+		}
+	}()
+	defer grpcServer.Stop()
+
+	connection, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer func() {
+		if err := connection.Close(); err != nil {
+			t.Errorf("connection.Close failed: %v", err)
+		}
+	}()
+	client := pb.NewObjectFSControllerClient(connection)
+
+	tempDirectory := t.TempDir()
+	lowerPath := filepath.Join(tempDirectory, "lower")
+
+	createResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       objectFSVolumeID,
+		ParentInode:    1,
+		Name:           "file.txt",
+		Mode:           0644,
+		InitialContent: []byte("materialised-content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+	if createResponse.GetError() != 0 {
+		t.Fatalf("CreateFile returned error code %d", createResponse.GetError())
+	}
+
+	driver := &objectFSDriver{
+		nodeID:   "test-node",
+		cacheDir: tempDirectory,
+		client:   client,
+	}
+
+	if err := driver.materialiseVolume(ctx, client, objectFSVolumeID, lowerPath); err != nil {
+		t.Fatalf("materialiseVolume failed: %v", err)
+	}
+
+	entry, found := sink.FindEntry("completed materialisation of volume")
+	if !found {
+		t.Fatal("expected log entry for completed materialisation of volume")
+	}
+	if entry["volume"] != objectFSVolumeID {
+		t.Fatalf("expected volume=%q (ObjectFS volume ID), got %v", objectFSVolumeID, entry["volume"])
+	}
+	if entry["path"] != lowerPath {
+		t.Fatalf("expected path=%q, got %v", lowerPath, entry["path"])
+	}
+	if entry["files"] != int64(1) {
+		t.Fatalf("expected files=1, got %v", entry["files"])
+	}
+	if entry["bytes"] != int64(len("materialised-content")) {
+		t.Fatalf("expected bytes=%d, got %v", len("materialised-content"), entry["bytes"])
+	}
+}
+
+// TestNodeDaemon_CheckpointLogging verifies that checkpoint scanning and replay log with the resolved ObjectFS volume ID and structured metadata.
+func TestNodeDaemon_CheckpointLogging(t *testing.T) {
+	sink := newNodeLoggingTestSink()
+	rootLogger := logr.New(sink)
+	csiHandle := "csi-vol-handle-checkpoint"
+	objectFSVolumeID := "test-checkpoint-logging-vol"
+
+	// Simulate gRPC interceptor setting CSI handle as volume on ctx.
+	ctx := scoped.WithLog(t.Context(), rootLogger.WithValues("volume", csiHandle))
+
+	// 1. Verify ScanUpperLayer skips unsupported special files and logs warning carrying ObjectFS volume ID
+	baseDirectory := t.TempDir()
+	lowerDirectory := filepath.Join(baseDirectory, "lower")
+	upperDirectory := filepath.Join(baseDirectory, "upper")
+	if err := os.MkdirAll(lowerDirectory, 0755); err != nil {
+		t.Fatalf("MkdirAll lowerDirectory failed: %v", err)
+	}
+	if err := os.MkdirAll(upperDirectory, 0755); err != nil {
+		t.Fatalf("MkdirAll upperDirectory failed: %v", err)
+	}
+
+	fifoPath := filepath.Join(upperDirectory, "test_fifo")
+	if err := unix.Mkfifo(fifoPath, 0666); err != nil {
+		t.Skipf("mkfifo not supported in environment: %v", err)
+	}
+
+	scanContext := scoped.WithLog(ctx, scoped.Log(ctx).WithValues("volume", objectFSVolumeID))
+	operations, err := ScanUpperLayer(scanContext, lowerDirectory, upperDirectory)
+	if err != nil {
+		t.Fatalf("ScanUpperLayer failed: %v", err)
+	}
+	if len(operations) != 0 {
+		t.Fatalf("expected special file to be skipped resulting in 0 operations, got %d: %+v", len(operations), operations)
+	}
+	entry, found := sink.FindEntry("exclusive-local: skipping unsupported special file")
+	if !found {
+		t.Fatal("expected log entry for skipping unsupported special file")
+	}
+	if entry["volume"] != objectFSVolumeID {
+		t.Fatalf("expected volume=%q (ObjectFS volume ID), got %v", objectFSVolumeID, entry["volume"])
+	}
+	if entry["path"] != "test_fifo" {
+		t.Fatalf("expected path=%q, got %v", "test_fifo", entry["path"])
+	}
+
+	// 2. Verify ReplayOperations logs attribute already removed on ENODATA carrying ObjectFS volume ID
+	fakeClient := &fakeRemoveXAttrClient{
+		errCode: int32(syscall.ENODATA),
+	}
+	replayOperations := []FileOp{
+		{
+			Type: OpRemoveXAttr,
+			Path: "file.txt",
+			Name: "user.missing",
+		},
+	}
+	position, err := ReplayOperations(ctx, fakeClient, objectFSVolumeID, replayOperations)
+	if err != nil {
+		t.Fatalf("ReplayOperations failed: %v", err)
+	}
+	if position != 42 {
+		t.Fatalf("expected stream position 42, got %d", position)
+	}
+	xattrEntry, found := sink.FindEntry("removeXAttr attribute already removed on inode")
+	if !found {
+		t.Fatal("expected log entry for removeXAttr attribute already removed on inode")
+	}
+	if xattrEntry["volume"] != objectFSVolumeID {
+		t.Fatalf("expected volume=%q (ObjectFS volume ID), got %v", objectFSVolumeID, xattrEntry["volume"])
+	}
+	if xattrEntry["path"] != "file.txt" {
+		t.Fatalf("expected path=%q, got %v", "file.txt", xattrEntry["path"])
+	}
+	if xattrEntry["name"] != "user.missing" {
+		t.Fatalf("expected name=%q, got %v", "user.missing", xattrEntry["name"])
 	}
 }
