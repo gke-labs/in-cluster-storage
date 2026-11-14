@@ -561,3 +561,132 @@ func TestNodeDaemon_CheckpointLogging(t *testing.T) {
 		t.Fatalf("expected name=%q, got %v", "user.missing", xattrEntry["name"])
 	}
 }
+
+// TestNodeDaemon_FUSELogging verifies that NodePublishVolume and NodeUnpublishVolume
+// emit structured log entries with the resolved ObjectFS volume ID rather than the CSI volume handle.
+func TestNodeDaemon_FUSELogging(t *testing.T) {
+	sink := newNodeLoggingTestSink()
+	rootLogger := logr.New(sink)
+	csiHandle := "csi-vol-fuse-handle-9999"
+	objectFSVolumeID := "test-fuse-logging-vol"
+	targetDirectory := t.TempDir()
+
+	// Simulate gRPC interceptor which sets the CSI handle as volume on ctx.
+	ctx := scoped.WithLog(t.Context(), rootLogger.WithValues("volume", csiHandle))
+
+	server := controllertest.NewTestServer(nil)
+	listener := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			t.Errorf("grpcServer.Serve failed: %v", err)
+		}
+	}()
+	defer grpcServer.Stop()
+
+	connection, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer func() {
+		if closeErr := connection.Close(); closeErr != nil {
+			t.Errorf("connection.Close failed: %v", closeErr)
+		}
+	}()
+	client := pb.NewObjectFSControllerClient(connection)
+
+	socketDescriptors, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("unix.Socketpair failed: %v", err)
+	}
+	defer func() {
+		if closeErr := unix.Close(socketDescriptors[1]); closeErr != nil {
+			t.Errorf("failed to close peer descriptor: %v", closeErr)
+		}
+	}()
+
+	fakeHolder := &fakeHolderClient{
+		mountDescriptor: socketDescriptors[0],
+		peerDescriptor:  socketDescriptors[1],
+	}
+
+	driver := &objectFSDriver{
+		nodeID:           "test-node",
+		cacheDir:         t.TempDir(),
+		client:           client,
+		dialHolder:       func(string) (fuseHolderClient, error) { return fakeHolder, nil },
+		mounts:           make(map[string]*activeMount),
+		fuseHolderSocket: "/run/objectfs/fuse-holder.sock",
+		rpcTimeout:       30 * time.Second,
+		syncTimeout:      10 * time.Minute,
+	}
+	defer func() {
+		if closeErr := driver.Close(); closeErr != nil {
+			t.Errorf("driver.Close failed: %v", closeErr)
+		}
+	}()
+
+	publishRequest := &csi.NodePublishVolumeRequest{
+		VolumeId:      csiHandle,
+		TargetPath:    targetDirectory,
+		VolumeContext: map[string]string{"mode": "fuse", "volumeID": objectFSVolumeID},
+	}
+
+	publishResponse, err := driver.NodePublishVolume(ctx, publishRequest)
+	if err != nil {
+		t.Fatalf("NodePublishVolume failed: %v", err)
+	}
+	if publishResponse == nil {
+		t.Fatal("expected non-nil NodePublishVolumeResponse")
+	}
+
+	duplicateResponse, err := driver.NodePublishVolume(ctx, publishRequest)
+	if err != nil {
+		t.Fatalf("duplicate NodePublishVolume failed: %v", err)
+	}
+	if duplicateResponse == nil {
+		t.Fatal("expected non-nil duplicate NodePublishVolumeResponse")
+	}
+
+	unpublishRequest := &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   csiHandle,
+		TargetPath: targetDirectory,
+	}
+	unpublishResponse, err := driver.NodeUnpublishVolume(ctx, unpublishRequest)
+	if err != nil {
+		t.Fatalf("NodeUnpublishVolume failed: %v", err)
+	}
+	if unpublishResponse == nil {
+		t.Fatal("expected non-nil NodeUnpublishVolumeResponse")
+	}
+
+	for _, expectedMessage := range []string{
+		"publishing ObjectFS volume",
+		"successfully mounted ObjectFS FUSE volume",
+		"volume is already published",
+		"successfully unpublished ObjectFS volume",
+	} {
+		entry, found := sink.FindEntry(expectedMessage)
+		if !found {
+			t.Fatalf("expected log entry for %q", expectedMessage)
+		}
+		if entry["target"] != targetDirectory {
+			t.Fatalf("%s: expected target=%q, got %v", expectedMessage, targetDirectory, entry["target"])
+		}
+		if entry["volume"] != objectFSVolumeID {
+			t.Fatalf("%s: expected volume=%q (ObjectFS volume ID), got %v", expectedMessage, objectFSVolumeID, entry["volume"])
+		}
+	}
+
+	unpublishEntry, found := sink.FindEntry("unpublishing ObjectFS volume")
+	if !found {
+		t.Fatal("expected log entry for unpublishing ObjectFS volume")
+	}
+	if unpublishEntry["target"] != targetDirectory {
+		t.Fatalf("expected target=%q, got %v", targetDirectory, unpublishEntry["target"])
+	}
+}
