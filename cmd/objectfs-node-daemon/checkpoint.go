@@ -32,10 +32,10 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"k8s.io/klog/v2"
 )
 
 type OpType string
@@ -271,7 +271,7 @@ func scanXAttrs(lowerDir, upperDir, relPath string, existsInLower bool, prevEntr
 // ScanUpperLayer compares lowerDir and upperDir (optionally diffing against an existing CheckpointManifest)
 // and produces an ordered list of FileOps.
 // Renames appear as unlink+create; hard links are scanned as independent files.
-func ScanUpperLayer(lowerDir, upperDir string, manifests ...*CheckpointManifest) ([]FileOp, error) {
+func ScanUpperLayer(ctx context.Context, lowerDir, upperDir string, manifests ...*CheckpointManifest) ([]FileOp, error) {
 	if _, err := os.Stat(upperDir); os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -290,7 +290,7 @@ func ScanUpperLayer(lowerDir, upperDir string, manifests ...*CheckpointManifest)
 	}
 
 	// Phase 2: Scan creations, modifications, symlinks, and directory creations
-	creations, writes, attrs, err := scanModificationsAndCreations(lowerDir, upperDir, deletedInLower, manifest)
+	creations, writes, attrs, err := scanModificationsAndCreations(ctx, lowerDir, upperDir, deletedInLower, manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -496,7 +496,7 @@ func scanWhiteoutsAndOpaqueDirs(lowerDir, upperDir string, deletedInLower map[st
 	return deletions, nil
 }
 
-func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map[string]bool, manifest *CheckpointManifest) (creations, writes, attrs []FileOp, err error) {
+func scanModificationsAndCreations(ctx context.Context, lowerDir, upperDir string, deletedInLower map[string]bool, manifest *CheckpointManifest) (creations, writes, attrs []FileOp, err error) {
 	err = filepath.Walk(upperDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -606,7 +606,7 @@ func scanModificationsAndCreations(lowerDir, upperDir string, deletedInLower map
 
 		if fileType != 0 {
 			// Special files (fifos, sockets, character/block devices) are skipped with a warning
-			klog.Warningf("exclusive-local: skipping unsupported special file %s (mode %v)", relPath, info.Mode())
+			scoped.Log(ctx).Info("exclusive-local: skipping unsupported special file", "path", relPath, "mode", info.Mode())
 			return nil
 		}
 
@@ -932,6 +932,7 @@ func resolveInode(ctx context.Context, client pb.ObjectFSControllerClient, volum
 // and issues blocking fsyncs on all touched inodes. It returns the highest stream position
 // committed by the fsyncs.
 func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, volumeID string, ops []FileOp) (uint64, error) {
+	log := scoped.Log(ctx).WithValues("volume", volumeID)
 	pathInodes := make(map[string]uint64)
 	pathInodes[""] = 1
 	pathInodes["."] = 1
@@ -943,7 +944,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 		case OpUnlink:
 			parentIno, err := resolveInode(ctx, client, volumeID, pathInodes, op.Parent)
 			if err != nil {
-				klog.V(4).Infof("resolveInode parent for unlink %s: %v (skipping)", op.Path, err)
+				log.V(4).Info("resolveInode parent for unlink (skipping)", "path", op.Path, "err", err)
 				continue
 			}
 			resp, err := client.Unlink(ctx, &pb.UnlinkRequest{
@@ -965,7 +966,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 		case OpRmdir:
 			parentIno, err := resolveInode(ctx, client, volumeID, pathInodes, op.Parent)
 			if err != nil {
-				klog.V(4).Infof("resolveInode parent for rmdir %s: %v (skipping)", op.Path, err)
+				log.V(4).Info("resolveInode parent for rmdir (skipping)", "path", op.Path, "err", err)
 				continue
 			}
 			resp, err := client.Rmdir(ctx, &pb.RmdirRequest{
@@ -1105,7 +1106,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 		case OpSetAttr:
 			ino, err := resolveInode(ctx, client, volumeID, pathInodes, op.Path)
 			if err != nil {
-				klog.V(4).Infof("resolve inode for setAttr %s: %v", op.Path, err)
+				log.V(4).Info("resolve inode for setAttr", "path", op.Path, "err", err)
 				continue
 			}
 			req := &pb.SetAttrRequest{
@@ -1168,7 +1169,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 			}
 			if resp.GetError() != 0 {
 				if resp.GetError() == int32(syscall.ENODATA) {
-					klog.V(2).Infof("removeXAttr %s (%s): attribute already removed on inode %d", op.Path, op.Name, ino)
+					log.V(2).Info("removeXAttr attribute already removed on inode", "path", op.Path, "name", op.Name, "inode", ino)
 				} else {
 					return 0, fmt.Errorf("removeXAttr %s (%s) returned error: %d", op.Path, op.Name, resp.GetError())
 				}

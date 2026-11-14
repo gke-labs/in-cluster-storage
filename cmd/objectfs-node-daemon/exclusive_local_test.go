@@ -72,6 +72,7 @@ func setOpaqueDir(t *testing.T, dir string) {
 // 4. opaque directory
 // 5. nested create under new dir
 func TestScanUpperLayer_OperationList(t *testing.T) {
+	ctx := t.Context()
 	baseDir := t.TempDir()
 	lowerDir := filepath.Join(baseDir, "lower")
 	upperDir := filepath.Join(baseDir, "upper")
@@ -131,7 +132,7 @@ func TestScanUpperLayer_OperationList(t *testing.T) {
 	}
 
 	// Scan
-	ops, err := ScanUpperLayer(lowerDir, upperDir)
+	ops, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer failed: %v", err)
 	}
@@ -286,7 +287,7 @@ func TestReplayOperations(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(upperDir, "sub", "hello.txt"), []byte("world"), 0644)
 
 	// Scan
-	ops, err := ScanUpperLayer(lowerDir, upperDir)
+	ops, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer failed: %v", err)
 	}
@@ -584,6 +585,7 @@ func TestMaterialiseVolume(t *testing.T) {
 // TestScanUpperLayer_HardLinksBreakIntoSeparateFiles verifies that hard links in upper
 // are scanned as independent files (breaking the hard link into separate volume files on checkpoint).
 func TestScanUpperLayer_HardLinksBreakIntoSeparateFiles(t *testing.T) {
+	ctx := t.Context()
 	baseDir := t.TempDir()
 	lowerDir := filepath.Join(baseDir, "lower")
 	upperDir := filepath.Join(baseDir, "upper")
@@ -599,7 +601,7 @@ func TestScanUpperLayer_HardLinksBreakIntoSeparateFiles(t *testing.T) {
 		t.Fatalf("link failed: %v", err)
 	}
 
-	ops, err := ScanUpperLayer(lowerDir, upperDir)
+	ops, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer failed: %v", err)
 	}
@@ -620,6 +622,7 @@ func TestScanUpperLayer_HardLinksBreakIntoSeparateFiles(t *testing.T) {
 
 // TestScanUpperLayer_SpecialFilesSkipped verifies that special files (like FIFOs) are skipped with a warning.
 func TestScanUpperLayer_SpecialFilesSkipped(t *testing.T) {
+	ctx := t.Context()
 	baseDir := t.TempDir()
 	lowerDir := filepath.Join(baseDir, "lower")
 	upperDir := filepath.Join(baseDir, "upper")
@@ -631,7 +634,7 @@ func TestScanUpperLayer_SpecialFilesSkipped(t *testing.T) {
 		t.Skipf("mkfifo not supported in environment: %v", err)
 	}
 
-	ops, err := ScanUpperLayer(lowerDir, upperDir)
+	ops, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer failed: %v", err)
 	}

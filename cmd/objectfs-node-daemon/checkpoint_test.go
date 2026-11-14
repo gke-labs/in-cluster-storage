@@ -88,7 +88,7 @@ func TestCheckpointAppendPrefixAndRest(t *testing.T) {
 	}
 
 	// 2. Checkpoint 1: commits the initial 100-byte prefix
-	ops1, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops1, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 1 failed: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestCheckpointAppendPrefixAndRest(t *testing.T) {
 	_ = os.Chtimes(filePath, time.Now().Add(time.Second), time.Now().Add(time.Second))
 
 	// 4. Checkpoint 2: should commit ONLY the rest (offset 100, length 150)
-	ops2, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops2, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 2 failed: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestCheckpointAppendPrefixAndRest(t *testing.T) {
 	}
 
 	// 5. Checkpoint 3 without modifications: unchanged file must produce 0 operations
-	ops3, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops3, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 3 failed: %v", err)
 	}
@@ -234,6 +234,7 @@ func TestCheckpointAppendPrefixAndRest(t *testing.T) {
 // TestScanUpperLayer_ConcurrencyToleratesDeletedFile verifies that if a file is unlinked
 // while the scan is running, the scan tolerates it gracefully.
 func TestScanUpperLayer_ConcurrencyToleratesDeletedFile(t *testing.T) {
+	ctx := t.Context()
 	tempDir := t.TempDir()
 	lowerDir := filepath.Join(tempDir, "lower")
 	upperDir := filepath.Join(tempDir, "upper")
@@ -245,7 +246,7 @@ func TestScanUpperLayer_ConcurrencyToleratesDeletedFile(t *testing.T) {
 	_ = os.WriteFile(fPath, []byte("temporary data"), 0644)
 
 	// Scan should succeed
-	ops, err := ScanUpperLayer(lowerDir, upperDir)
+	ops, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer failed: %v", err)
 	}
@@ -422,6 +423,7 @@ func TestStartExclusiveLocalSync_IntervalTrigger(t *testing.T) {
 // volume has never executed an incremental checkpoint (no checkpoint.json manifest),
 // ScanUpperLayer produces the exact unmount operation list as PR #290.
 func TestScanUpperLayer_UnpublishWithNoManifestMatchesPR290(t *testing.T) {
+	ctx := t.Context()
 	tempDir := t.TempDir()
 	lowerDir := filepath.Join(tempDir, "lower")
 	upperDir := filepath.Join(tempDir, "upper")
@@ -448,13 +450,13 @@ func TestScanUpperLayer_UnpublishWithNoManifestMatchesPR290(t *testing.T) {
 	}
 
 	// 1. Scan with 0 manifests passed
-	opsDefault, err := ScanUpperLayer(lowerDir, upperDir)
+	opsDefault, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer with no args failed: %v", err)
 	}
 
 	// 2. Scan with nil manifest
-	opsNil, err := ScanUpperLayer(lowerDir, upperDir, nil)
+	opsNil, err := ScanUpperLayer(ctx, lowerDir, upperDir, nil)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer with nil manifest failed: %v", err)
 	}
@@ -464,7 +466,7 @@ func TestScanUpperLayer_UnpublishWithNoManifestMatchesPR290(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadCheckpointManifest non-existent failed: %v", err)
 	}
-	opsLoadedEmpty, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	opsLoadedEmpty, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer with empty manifest failed: %v", err)
 	}
@@ -521,6 +523,7 @@ func TestScanUpperLayer_UnpublishWithNoManifestMatchesPR290(t *testing.T) {
 }
 
 func TestScanUpperLayer_XAttrs(t *testing.T) {
+	ctx := t.Context()
 	tempDir := t.TempDir()
 	lowerDir := filepath.Join(tempDir, "lower")
 	upperDir := filepath.Join(tempDir, "upper")
@@ -557,7 +560,7 @@ func TestScanUpperLayer_XAttrs(t *testing.T) {
 		t.Fatalf("set new upper xattr: %v", err)
 	}
 
-	ops, err := ScanUpperLayer(lowerDir, upperDir)
+	ops, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer failed: %v", err)
 	}
@@ -592,6 +595,7 @@ func TestScanUpperLayer_XAttrs(t *testing.T) {
 }
 
 func TestScanUpperLayer_FailingGetFailsScan(t *testing.T) {
+	ctx := t.Context()
 	tempDir := t.TempDir()
 	lowerDir := filepath.Join(tempDir, "lower")
 	upperDir := filepath.Join(tempDir, "upper")
@@ -612,7 +616,7 @@ func TestScanUpperLayer_FailingGetFailsScan(t *testing.T) {
 		return 0, syscall.EIO
 	}
 
-	_, err := ScanUpperLayer(lowerDir, upperDir)
+	_, err := ScanUpperLayer(ctx, lowerDir, upperDir)
 	if err == nil {
 		t.Fatalf("expected ScanUpperLayer to fail when getxattr fails, got nil")
 	}
@@ -622,6 +626,7 @@ func TestScanUpperLayer_FailingGetFailsScan(t *testing.T) {
 }
 
 func TestScanUpperLayer_ManifestIncrementalXAttrs(t *testing.T) {
+	ctx := t.Context()
 	tempDir := t.TempDir()
 	lowerDir := filepath.Join(tempDir, "lower")
 	upperDir := filepath.Join(tempDir, "upper")
@@ -651,7 +656,7 @@ func TestScanUpperLayer_ManifestIncrementalXAttrs(t *testing.T) {
 	// Scan 1 (first checkpoint after mount):
 	// user.added should be emitted as OpSetXAttr
 	// user.removable should be emitted as OpRemoveXAttr
-	ops1, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops1, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 1 failed: %v", err)
 	}
@@ -679,7 +684,7 @@ func TestScanUpperLayer_ManifestIncrementalXAttrs(t *testing.T) {
 
 	// Scan 2 (consecutive scan with shared manifest without modifications):
 	// Must emit nothing (removal emitted once and not again; unchanged set not re-emitted)
-	ops2, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops2, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 2 failed: %v", err)
 	}
@@ -694,7 +699,7 @@ func TestScanUpperLayer_ManifestIncrementalXAttrs(t *testing.T) {
 
 	// Scan 3:
 	// A value change that is emitted as a set
-	ops3, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops3, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 3 failed: %v", err)
 	}
@@ -716,7 +721,7 @@ func TestScanUpperLayer_ManifestIncrementalXAttrs(t *testing.T) {
 	if err := UpdateCheckpointManifest(manifest, upperDir, ops3); err != nil {
 		t.Fatalf("checkpoint 3: UpdateCheckpointManifest failed: %v", err)
 	}
-	ops4, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops4, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 4 failed: %v", err)
 	}
@@ -745,7 +750,7 @@ func TestScanUpperLayer_ManifestIncrementalXAttrs(t *testing.T) {
 
 	// Checkpoint 5:
 	// copyup.txt has content ops and SetAttr, but NO xattr ops (unchanged relative to lower)
-	ops5, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops5, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 5 failed: %v", err)
 	}
@@ -767,7 +772,7 @@ func TestScanUpperLayer_ManifestIncrementalXAttrs(t *testing.T) {
 
 	// Checkpoint 6:
 	// Must emit exactly one OpRemoveXAttr for copyup.txt
-	ops6, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops6, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 6 failed: %v", err)
 	}
@@ -788,7 +793,7 @@ func TestScanUpperLayer_ManifestIncrementalXAttrs(t *testing.T) {
 	if err := UpdateCheckpointManifest(manifest, upperDir, ops6); err != nil {
 		t.Fatalf("checkpoint 6: UpdateCheckpointManifest failed: %v", err)
 	}
-	ops7, err := ScanUpperLayer(lowerDir, upperDir, manifest)
+	ops7, err := ScanUpperLayer(ctx, lowerDir, upperDir, manifest)
 	if err != nil {
 		t.Fatalf("ScanUpperLayer checkpoint 7 failed: %v", err)
 	}
