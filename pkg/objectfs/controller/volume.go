@@ -870,6 +870,9 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 			snapSeq := v.stagingSeq
 			pos := v.Position()
 			v.stagingMu.Unlock()
+			if err := v.waitForSequence(ctx, pos); err != nil {
+				return epoch, 0, err
+			}
 			if requirePermanent {
 				if err := v.stream.Flush(ctx); err != nil {
 					return epoch, 0, err
@@ -887,6 +890,9 @@ func (v *Volume) FsyncWithEpoch(ctx context.Context, inodeID uint64, blocking bo
 		if len(v.stagedChunks[inodeID]) == 0 {
 			pos := v.Position()
 			v.stagingMu.Unlock()
+			if err := v.waitForSequence(ctx, pos); err != nil {
+				return epoch, 0, err
+			}
 			return epoch, pos, nil
 		}
 
@@ -1245,6 +1251,9 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 		snapSeq := v.stagingSeq
 		pos := v.Position()
 		v.stagingMu.Unlock()
+		if err := v.waitForSequence(ctx, pos); err != nil {
+			return 0, v.finishEmptySync(snapSeq, err, 0, inodeFilter)
+		}
 		if v.stream.ReplicationLevel() == walclient.Permanent {
 			if err := v.stream.Flush(ctx); err != nil {
 				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
@@ -1271,6 +1280,9 @@ func (v *Volume) executeSyncLocked(ctx context.Context, trigger pb.FsyncRequest_
 		snapSeq := v.stagingSeq
 		pos := v.Position()
 		v.stagingMu.Unlock()
+		if err := v.waitForSequence(ctx, pos); err != nil {
+			return 0, v.finishEmptySync(snapSeq, err, 0, inodeFilter)
+		}
 		if v.stream.ReplicationLevel() == walclient.Permanent {
 			if err := v.stream.Flush(ctx); err != nil {
 				klog.Warningf("ObjectFS volume %s stream flush failed: %v", v.volumeID, err)
@@ -1699,6 +1711,13 @@ func (v *Volume) commitTxLocked(ctx context.Context, tx *sds.Tx) (uint64, error)
 		return 0, err
 	}
 	v.applyTxChangesLocked(ctx, tx)
+	// This is the only place lastCommitSeq advances, under v.mu when the transaction
+	// commits. It lives here (not in makeWaitFn, where it used to be a side effect
+	// of building a waiter) because sync barriers read it whether or not anyone built
+	// a waiter.
+	if commitSeq > v.lastCommitSeq {
+		v.lastCommitSeq = commitSeq
+	}
 	return commitSeq, nil
 }
 
@@ -1896,10 +1915,9 @@ func (v *Volume) Close() error {
 // If the durability wait fails (e.g. context cancelled, stream closed), the mutation
 // has already been applied to in-memory state and appended locally, so no rollback is
 // attempted; the error is returned to inform the caller that durability was not achieved.
+//
+// makeWaitFn only builds the wait and records nothing.
 func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(context.Context) error {
-	if commitSeq > v.lastCommitSeq {
-		v.lastCommitSeq = commitSeq
-	}
 	if commitSeq == 0 {
 		return nil
 	}
@@ -1919,6 +1937,14 @@ func (v *Volume) makeWaitFn(commitSeq uint64, reqLevel *walclient.Level) func(co
 		}
 		return nil
 	}
+}
+
+// waitForSequence waits until sequence reaches the volume's configured durability level.
+func (v *Volume) waitForSequence(ctx context.Context, sequence uint64) error {
+	if waitFn := v.makeWaitFn(sequence, nil); waitFn != nil {
+		return waitFn(ctx)
+	}
+	return nil
 }
 
 // Position returns the latest committed stream sequence number for this volume.
