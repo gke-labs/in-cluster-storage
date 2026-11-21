@@ -509,12 +509,12 @@ func (s *Server) evictIdleStreams() {
 
 	for sid, st := range s.streams {
 		st.mu.Lock()
-		attached := st.attachments > 0 || st.waiters > 0
+		active := st.attachments > 0 || st.waiters > 0 || st.inFlight > 0
 		witnessSeq := st.witnessSeq
 		s3Seq := st.s3Seq
 		st.mu.Unlock()
 
-		if attached {
+		if active {
 			continue
 		}
 
@@ -1070,9 +1070,7 @@ func (s *Server) applyBatchLocked(plan *batchPlan, err error) {
 		}
 		streamState.inFlight -= stream.count
 		if streamState.inFlight < 0 {
-			// A negative inFlight count indicates counter imbalance. This can only
-			// happen spuriously if a stream was evicted by evictIdleStreams and recreated
-			// in commitItems while items were still queued.
+			// A negative inFlight count indicates counter imbalance.
 			klog.Errorf("WAL buffer stream %s: negative inFlight count %d after committing %d items", streamID, streamState.inFlight, stream.count)
 		}
 		streamState.cond.Broadcast()

@@ -2061,3 +2061,87 @@ func TestServerStreams_AttachSessionDuringEvictionAttachedToMapState(t *testing.
 		server.evictIdleStreams()
 	}
 }
+
+// TestServerStreams_InFlightRecordPinsStateAgainstEviction verifies that a stream state
+// with records accounted as in flight (inFlight > 0) is not dropped by idle eviction
+// even when no sessions are attached; once commitItems processes the in-flight record,
+// the next evictIdleStreams removes the state and inFlight never goes negative.
+func TestServerStreams_InFlightRecordPinsStateAgainstEviction(t *testing.T) {
+	ctx := t.Context()
+	backend := inmemorystorage.New()
+	dataDir := t.TempDir()
+
+	server, err := NewServer(ctx, ServerConfig{
+		Backend:       backend,
+		DataDir:       dataDir,
+		FlushInterval: 10 * time.Second,
+		BatchMaxDelay: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close() error: %v", err)
+		}
+	}()
+
+	streamID := uuid.New()
+	_ = server.getOrCreateStream(ctx, streamID)
+
+	state, _, _, err := server.attachSession(ctx, streamID, 1)
+	if err != nil {
+		t.Fatalf("attachSession failed: %v", err)
+	}
+	server.detachSession(state)
+
+	state.mu.Lock()
+	state.inFlight = 1
+	state.mu.Unlock()
+
+	// (1) A stream state with one record accounted as in flight and no attached
+	// sessions is kept by evictIdleStreams.
+	server.evictIdleStreams()
+
+	server.mu.RLock()
+	mapState := server.streams[streamID.String()]
+	server.mu.RUnlock()
+
+	if mapState == nil {
+		t.Fatal("expected streamState to remain in Server.streams while inFlight > 0, but was evicted")
+	}
+	if mapState != state {
+		t.Fatalf("expected streamState %p in map, got %p", state, mapState)
+	}
+
+	// Process the queued in-flight record.
+	server.commitItems(ctx, []incomingItem{
+		{
+			streamID:  streamID,
+			streamSeq: 0,
+			epoch:     1,
+			payload:   []byte("queued-record"),
+		},
+	})
+
+	// (3) inFlight must never go negative.
+	state.mu.Lock()
+	inFlight := state.inFlight
+	state.mu.Unlock()
+
+	if inFlight != 0 {
+		t.Fatalf("expected inFlight 0 after commit, got %d", inFlight)
+	}
+
+	// (2) After commitItems has processed that record, the next evictIdleStreams
+	// removes the state.
+	server.evictIdleStreams()
+
+	server.mu.RLock()
+	mapStateAfter := server.streams[streamID.String()]
+	server.mu.RUnlock()
+
+	if mapStateAfter != nil {
+		t.Fatalf("expected streamState to be evicted after in-flight record processed, but still in map: %p", mapStateAfter)
+	}
+}
