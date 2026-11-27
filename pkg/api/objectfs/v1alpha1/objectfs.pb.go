@@ -2250,8 +2250,10 @@ type RenameRequest struct {
 	OldName        string                 `protobuf:"bytes,3,opt,name=old_name,json=oldName,proto3" json:"old_name,omitempty"`
 	NewParentInode uint64                 `protobuf:"varint,4,opt,name=new_parent_inode,json=newParentInode,proto3" json:"new_parent_inode,omitempty"`
 	NewName        string                 `protobuf:"bytes,5,opt,name=new_name,json=newName,proto3" json:"new_name,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+	RequestId     []byte `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RenameRequest) Reset() {
@@ -2317,6 +2319,13 @@ func (x *RenameRequest) GetNewName() string {
 		return x.NewName
 	}
 	return ""
+}
+
+func (x *RenameRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type RenameResponse struct {
@@ -6053,7 +6062,7 @@ type DirEntry struct {
 	Ino       uint64                 `protobuf:"varint,3,opt,name=ino,proto3" json:"ino,omitempty"`
 	IsDir     bool                   `protobuf:"varint,4,opt,name=is_dir,json=isDir,proto3" json:"is_dir,omitempty"`
 	Mode      uint32                 `protobuf:"varint,5,opt,name=mode,proto3" json:"mode,omitempty"`
-	// Idempotency key of the creating request; set only by creates.
+	// Idempotency key of the request that wrote this entry; set by creates and Rename.
 	RequestId     []byte `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -6560,13 +6569,15 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\rRmdirResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
-	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xb6\x01\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xd5\x01\n" +
 	"\rRenameRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12(\n" +
 	"\x10old_parent_inode\x18\x02 \x01(\x04R\x0eoldParentInode\x12\x19\n" +
 	"\bold_name\x18\x03 \x01(\tR\aoldName\x12(\n" +
 	"\x10new_parent_inode\x18\x04 \x01(\x04R\x0enewParentInode\x12\x19\n" +
-	"\bnew_name\x18\x05 \x01(\tR\anewName\"\x81\x01\n" +
+	"\bnew_name\x18\x05 \x01(\tR\anewName\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x06 \x01(\fR\trequestId\"\x81\x01\n" +
 	"\x0eRenameResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +

@@ -310,6 +310,8 @@ message RenameRequest {
   string old_name = 3;
   uint64 new_parent_inode = 4;
   string new_name = 5;
+  // Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
+  bytes request_id = 6;
 }
 
 message RenameResponse {
@@ -732,7 +734,7 @@ message DirEntry {
   uint64 ino = 3;
   bool is_dir = 4;
   uint32 mode = 5;
-  // Idempotency key of the creating request; set only by creates.
+  // Idempotency key of the request that wrote this entry; set by creates and Rename.
   bytes request_id = 6;
 }
 
