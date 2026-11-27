@@ -1296,6 +1296,46 @@ func TestFUSEMknodSpecialFiles(t *testing.T) {
 	}
 }
 
+func TestFUSEMknodUnlinkDeletesInode(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	rawFS := NewObjectFS(client, "fuse-mknod-unlink-vol", pb.WriteMode_FSYNC, NewNodeCache(1024*1024))
+
+	cases := []struct {
+		name string
+		mode uint32
+		rdev uint32
+	}{
+		{name: "fifo", mode: syscall.S_IFIFO | 0644},
+		{name: "chr", mode: syscall.S_IFCHR | 0660, rdev: 0x0103},
+		{name: "reg", mode: syscall.S_IFREG | 0644},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var entryOut fuse.EntryOut
+			status := rawFS.Mknod(nil, &fuse.MknodIn{
+				InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+				Mode:     testCase.mode,
+				Rdev:     testCase.rdev,
+			}, testCase.name, &entryOut)
+			if status != fuse.OK {
+				t.Fatalf("Mknod %s failed: %v", testCase.name, status)
+			}
+
+			if status := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, testCase.name); status != fuse.OK {
+				t.Fatalf("Unlink %s failed: %v", testCase.name, status)
+			}
+
+			var attrOut fuse.AttrOut
+			if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: entryOut.NodeId}}, &attrOut); status != fuse.ENOENT {
+				t.Fatalf("GetAttr after Unlink on %s (ino %d) = %v (nlink=%d), want ENOENT", testCase.name, entryOut.NodeId, status, attrOut.Attr.Nlink)
+			}
+		})
+	}
+}
+
 func TestFUSETruncateAndUnalignedWriteWithCacheInvalidation(t *testing.T) {
 	client, cleanup := createTestClient(t)
 	defer cleanup()
