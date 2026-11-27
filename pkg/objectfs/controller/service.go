@@ -1242,7 +1242,10 @@ func (s *Server) CreateFile(ctx context.Context, req *pb.CreateFileRequest) (*pb
 		}
 		return &pb.CreateFileResponse{Error: volErrToSyscall(err)}, nil
 	}
-	fh := vol.AllocFh(attr.GetInode().GetIno())
+	var fh uint64
+	if !req.GetNoHandle() {
+		fh = vol.AllocFh(attr.GetInode().GetIno())
+	}
 	return &pb.CreateFileResponse{Attr: attr, Fh: fh, StreamPosition: attr.GetStreamPosition()}, nil
 }
 

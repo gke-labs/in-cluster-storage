@@ -7920,3 +7920,60 @@ func TestVolume_DeletionMarker_LoadedRejectsOperations(t *testing.T) {
 		t.Fatalf("expected NotFound with 'has been deleted' on GetVolumeStats, got: %v", err)
 	}
 }
+
+func TestCreateFileNoHandle_UnlinkDeletesInode(t *testing.T) {
+	ctx := t.Context()
+	server := NewTestServer(t, NewMemoryBackend())
+	const volumeID = "vol-create-no-handle"
+
+	cases := []struct {
+		name string
+		mode uint32
+		rdev uint32
+	}{
+		{name: "fifo", mode: syscall.S_IFIFO | 0644},
+		{name: "chr", mode: syscall.S_IFCHR | 0660, rdev: 0x0103},
+		{name: "reg", mode: syscall.S_IFREG | 0644},
+	}
+
+	for _, testCase := range cases {
+		createResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        testCase.name,
+			Mode:        testCase.mode,
+			Rdev:        testCase.rdev,
+			NoHandle:    true,
+		})
+		if err != nil || createResponse.GetError() != 0 {
+			t.Fatalf("CreateFile %s: err=%v errno=%d", testCase.name, err, createResponse.GetError())
+		}
+		if createResponse.GetFh() != 0 {
+			t.Fatalf("CreateFile %s with NoHandle: got fh=%d, want 0", testCase.name, createResponse.GetFh())
+		}
+
+		inodeID := createResponse.GetAttr().GetInode().GetIno()
+		volume := mustGetVolume(t, server, volumeID)
+		volume.handlesMu.Lock()
+		handleCount := len(volume.handles)
+		openCount := volume.openInodes[inodeID]
+		volume.handlesMu.Unlock()
+		if handleCount != 0 || openCount != 0 {
+			t.Fatalf("after CreateFile %s: handles=%d openCount=%d, want 0, 0", testCase.name, handleCount, openCount)
+		}
+
+		unlinkResponse, err := server.Unlink(ctx, &pb.UnlinkRequest{
+			VolumeId:    volumeID,
+			ParentInode: 1,
+			Name:        testCase.name,
+		})
+		if err != nil || unlinkResponse.GetError() != 0 {
+			t.Fatalf("Unlink %s: err=%v errno=%d", testCase.name, err, unlinkResponse.GetError())
+		}
+
+		attrResponse, err := server.GetAttr(ctx, &pb.GetAttrRequest{VolumeId: volumeID, Inode: inodeID})
+		if err != nil || attrResponse.GetError() != int32(syscall.ENOENT) {
+			t.Fatalf("GetAttr after Unlink on %s (ino %d): err=%v errno=%d, want ENOENT", testCase.name, inodeID, err, attrResponse.GetError())
+		}
+	}
+}
