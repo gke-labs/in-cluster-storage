@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"os"
 	"path/filepath"
@@ -73,6 +74,14 @@ var ErrRecordDiscarded = errors.New("WAL record discarded due to history diverge
 
 // ErrClosed is returned when an operation is attempted on a closed stream or when the stream is closed while waiting.
 var ErrClosed = errors.New("stream closed")
+
+// processClientID is generated once per process and sent in Hello.client_id
+// so the WAL buffer can enforce per-process stream writer lock ownership.
+var processClientID = uuid.New().String()
+
+// releaseTimeout is the maximum time Close waits for the replication session to
+// half-close and end cleanly with the WAL buffer before cancelling it.
+const releaseTimeout = 2 * time.Second
 
 // DegradedError indicates that the WAL stream encountered an unrecoverable local store failure
 // (such as segment truncation error) and cannot safely accept or wait for further writes.
@@ -140,10 +149,21 @@ type options struct {
 	recoveredRecords            []*wal.ClientRecord
 	degradedRetryInitialBackoff time.Duration
 	degradedRetryMaxBackoff     time.Duration
+	clientID                    string
 }
 
 // Option configures Stream options.
 type Option func(*options)
+
+// WithClientID overrides the per-process client ID sent in Hello.
+// Production code does not pass this; tests use it to act as a second process.
+func WithClientID(id string) Option {
+	return func(o *options) {
+		if id != "" {
+			o.clientID = id
+		}
+	}
+}
 
 // WithoutFsync configures the local segment store to skip per-record fsync.
 // This is intended only for tests and benchmarks where fsync latency is not desired.
@@ -219,6 +239,8 @@ type syncWaiter struct {
 type streamImpl struct {
 	dir      string
 	streamID uuid.UUID
+	// clientID identifies this process on the WAL buffer for stream writer lock ownership.
+	clientID string
 	target   string
 	opts     options
 
@@ -237,6 +259,8 @@ type streamImpl struct {
 	flushRequestedWhileInFlight bool
 	degradedTruncateSeq         uint64
 	reconciling                 bool
+	// lastSessionErr records the most recent error from a failed replication session. Guarded by mu.
+	lastSessionErr error
 
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
@@ -250,8 +274,17 @@ type streamImpl struct {
 	newRecordSignal chan struct{}
 	cancelCtx       context.Context
 	cancelFunc      context.CancelFunc
-	closed          atomic.Bool
-	wg              sync.WaitGroup
+	// closing is closed by Close to ask the replication loop and active session to end cleanly.
+	closing chan struct{}
+	// replicationDone is closed when backgroundReplicationLoop returns.
+	replicationDone chan struct{}
+	// helloAckReceived is set once the first HelloAck is received, so Close only waits
+	// for a clean writer-lock release when a lock may have been granted.
+	helloAckReceived atomic.Bool
+	// releaseTimeout is the maximum time Close waits for a clean writer-lock release.
+	releaseTimeout time.Duration
+	closed         atomic.Bool
+	wg             sync.WaitGroup
 
 	replicationLevel Level
 	grpcClient       pb.WalBufferClient
@@ -260,9 +293,17 @@ type streamImpl struct {
 
 // Open opens or recovers a WAL stream on the local node.
 func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, opts ...Option) (Stream, error) {
+	return openStream(ctx, dir, streamID, target, releaseTimeout, opts...)
+}
+
+// openStream opens or recovers a WAL stream using lockReleaseTimeout as the
+// maximum time Close waits for a clean writer-lock release before cancelling
+// the replication session. Tests call openStream directly to bound that wait.
+func openStream(ctx context.Context, dir string, streamID uuid.UUID, target string, lockReleaseTimeout time.Duration, opts ...Option) (Stream, error) {
 	var opt options
 	opt.maxRetainedBytes = wal.DefaultMaxRetainedBytes
 	opt.maxSegmentSize = wal.DefaultMaxSegmentSize
+	opt.clientID = processClientID
 	for _, o := range opts {
 		o(&opt)
 	}
@@ -308,6 +349,7 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 	s := &streamImpl{
 		dir:                 dir,
 		streamID:            streamID,
+		clientID:            opt.clientID,
 		target:              target,
 		opts:                opt,
 		store:               store,
@@ -319,6 +361,9 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		newRecordSignal:     make(chan struct{}, 1),
 		cancelCtx:           cancelCtx,
 		cancelFunc:          cancelFunc,
+		closing:             make(chan struct{}),
+		replicationDone:     make(chan struct{}),
+		releaseTimeout:      lockReleaseTimeout,
 		replicationLevel:    Permanent,
 		initialHelloAckDone: make(chan struct{}),
 	}
@@ -349,6 +394,9 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		}
 	}
 
+	helloTimer := time.NewTimer(helloTimeout)
+	defer helloTimer.Stop()
+
 	select {
 	case <-s.initialHelloAckDone:
 		s.mu.RLock()
@@ -359,11 +407,23 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 			errutil.CloseAndLog(s, "wal stream")
 			return nil, initErr
 		}
-	case <-time.After(helloTimeout):
+	case <-helloTimer.C:
 		errutil.CloseAndLog(s, "wal stream")
+		s.mu.RLock()
+		lastErr := s.lastSessionErr
+		s.mu.RUnlock()
+		if lastErr != nil {
+			return nil, fmt.Errorf("timeout waiting for initial HelloAck from WAL buffer target %s: %w", target, lastErr)
+		}
 		return nil, fmt.Errorf("timeout waiting for initial HelloAck from WAL buffer target %s", target)
 	case <-ctx.Done():
 		errutil.CloseAndLog(s, "wal stream")
+		s.mu.RLock()
+		lastErr := s.lastSessionErr
+		s.mu.RUnlock()
+		if lastErr != nil {
+			return nil, fmt.Errorf("failed to receive initial HelloAck from WAL buffer: %w: %w", ctx.Err(), lastErr)
+		}
 		return nil, fmt.Errorf("failed to receive initial HelloAck from WAL buffer: %w", ctx.Err())
 	}
 
@@ -422,6 +482,11 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		case <-doneCh:
 		}
 		s.mu.Lock()
+	}
+
+	if s.closed.Load() {
+		s.mu.Unlock()
+		return 0, ErrClosed
 	}
 
 	if s.degradedErr != nil {
@@ -728,13 +793,14 @@ func (s *streamImpl) setDegradedLocked(ctx context.Context, cause error, truncat
 	return s.degradedErr
 }
 
-// Close closes the stream, stopping background tasks and closing local store.
+// Close closes the stream, asking the active replication session to end cleanly
+// so the server releases the writer lock, then stopping background tasks and closing local store.
 func (s *streamImpl) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
 
-	s.cancelFunc()
+	close(s.closing)
 	s.initialHelloAckOnce.Do(func() {
 		close(s.initialHelloAckDone)
 	})
@@ -746,6 +812,18 @@ func (s *streamImpl) Close() error {
 	s.cond.Broadcast()
 	s.mu.Unlock()
 
+	if s.helloAckReceived.Load() {
+		releaseTimer := time.NewTimer(s.releaseTimeout)
+		select {
+		case <-s.replicationDone:
+			releaseTimer.Stop()
+		case <-releaseTimer.C:
+			scoped.Log(s.cancelCtx).Info("timed out waiting for WAL replication session to release writer lock; cancelling",
+				"timeout", s.releaseTimeout)
+		}
+	}
+
+	s.cancelFunc()
 	s.wg.Wait()
 
 	if s.grpcConn != nil {
@@ -771,6 +849,8 @@ func (s *streamImpl) retryDegradedTruncate(ctx context.Context) bool {
 	for {
 		select {
 		case <-s.cancelCtx.Done():
+			return false
+		case <-s.closing:
 			return false
 		case <-time.After(backoff):
 		}
@@ -810,6 +890,7 @@ func (s *streamImpl) retryDegradedTruncate(ctx context.Context) bool {
 }
 
 func (s *streamImpl) backgroundReplicationLoop() {
+	defer close(s.replicationDone)
 	defer s.wg.Done()
 
 	backoff := 50 * time.Millisecond
@@ -819,6 +900,8 @@ func (s *streamImpl) backgroundReplicationLoop() {
 	for {
 		select {
 		case <-s.cancelCtx.Done():
+			return
+		case <-s.closing:
 			return
 		default:
 		}
@@ -836,6 +919,20 @@ func (s *streamImpl) backgroundReplicationLoop() {
 		}
 
 		err := s.runStreamSession()
+		if err != nil && !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+			s.mu.Lock()
+			s.lastSessionErr = err
+			s.mu.Unlock()
+		}
+		if _, resend := grpcutil.ResendDelay(err); resend && !s.helloAckReceived.Load() {
+			s.initialHelloAckOnce.Do(func() {
+				s.mu.Lock()
+				s.initialHelloAckErr = err
+				s.mu.Unlock()
+				close(s.initialHelloAckDone)
+			})
+			return
+		}
 		if err != nil && !s.closed.Load() {
 			s.mu.RLock()
 			degErr := s.degradedErr
@@ -861,6 +958,8 @@ func (s *streamImpl) backgroundReplicationLoop() {
 			select {
 			case <-s.cancelCtx.Done():
 				return
+			case <-s.closing:
+				return
 			case <-time.After(backoff):
 				backoff *= 2
 				if backoff > maxBackoff {
@@ -875,6 +974,12 @@ func (s *streamImpl) backgroundReplicationLoop() {
 }
 
 func (s *streamImpl) runStreamSession() error {
+	select {
+	case <-s.closing:
+		return nil
+	default:
+	}
+
 	ctx, cancel := context.WithCancel(s.cancelCtx)
 	defer cancel()
 
@@ -893,6 +998,7 @@ func (s *streamImpl) runStreamSession() error {
 		Msg: &pb.AppendRequest_Hello{
 			Hello: &pb.Hello{
 				StreamId: s.streamID[:],
+				ClientId: []byte(s.clientID),
 			},
 		},
 	})
@@ -909,6 +1015,7 @@ func (s *streamImpl) runStreamSession() error {
 	if helloAck == nil {
 		return fmt.Errorf("expected HelloAck as first response, got: %+v", resp)
 	}
+	s.helloAckReceived.Store(true)
 
 	if err := s.handleHelloAck(ctx, helloAck); err != nil {
 		s.initialHelloAckOnce.Do(func() {
@@ -919,6 +1026,7 @@ func (s *streamImpl) runStreamSession() error {
 	}
 	s.mu.Lock()
 	s.initialHelloAckErr = nil
+	s.lastSessionErr = nil
 	s.mu.Unlock()
 	s.initialHelloAckOnce.Do(func() {
 		close(s.initialHelloAckDone)
@@ -954,6 +1062,27 @@ func (s *streamImpl) runStreamSession() error {
 		}
 	}()
 
+	closeCleanly := func() error {
+		if err := stream.CloseSend(); err != nil {
+			return fmt.Errorf("failed to half-close Append stream: %w", err)
+		}
+		select {
+		case err := <-recvErrCh:
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	select {
+	case <-s.closing:
+		return closeCleanly()
+	default:
+	}
+
 	// 4. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
 	s.retainedMu.RLock()
 	var recordsToReplay []*wal.ClientRecord
@@ -972,6 +1101,11 @@ func (s *streamImpl) runStreamSession() error {
 	}
 
 	for _, rec := range recordsToReplay {
+		select {
+		case <-s.closing:
+			return closeCleanly()
+		default:
+		}
 		if err := stream.Send(&pb.AppendRequest{
 			Msg: &pb.AppendRequest_Record{
 				Record: rec.ToAppendProto(),
@@ -992,6 +1126,8 @@ func (s *streamImpl) runStreamSession() error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-s.closing:
+			return closeCleanly()
 		case err := <-recvErrCh:
 			return err
 		case <-s.newRecordSignal:

@@ -31,6 +31,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -185,6 +186,9 @@ func TestWriterLock_RefusedWhileHolderAttached(t *testing.T) {
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected codes.Unavailable, got %v", err)
 	}
+	if delay, resend := grpcutil.ResendDelay(err); !resend || delay != writerLockResendDelay {
+		t.Fatalf("ResendDelay(%v) = (%v, %v), want (%v, true)", err, delay, resend, writerLockResendDelay)
+	}
 	if !strings.Contains(err.Error(), "stream writer lock is held by another client") {
 		t.Fatalf("expected lock held message, got %v", err)
 	}
@@ -211,6 +215,9 @@ func TestWriterLock_InFlightRefusedUntilCommitted(t *testing.T) {
 	_, _, _, _, err = server.attachSession(ctx, streamID, 1, "client-2")
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected codes.Unavailable, got %v", err)
+	}
+	if delay, resend := grpcutil.ResendDelay(err); !resend || delay != writerLockResendDelay {
+		t.Fatalf("ResendDelay(%v) = (%v, %v), want (%v, true)", err, delay, resend, writerLockResendDelay)
 	}
 	if !strings.Contains(err.Error(), "stream writer lock is waiting for records of its previous holder to be committed") {
 		t.Fatalf("expected records in flight message, got %v", err)
@@ -272,6 +279,9 @@ func TestWriterLock_FencedLeavesNoHolderOrSessionCount(t *testing.T) {
 	_, _, _, _, err = server.attachSession(ctx, streamID, 2, "client-fenced")
 	if err == nil {
 		t.Fatal("expected fenced error, got nil")
+	}
+	if delay, resend := grpcutil.ResendDelay(err); resend {
+		t.Fatalf("expected fenced status not to satisfy ResendDelay, got delay %v", delay)
 	}
 
 	state.mu.Lock()
@@ -422,6 +432,9 @@ func TestWriterLock_GracePeriodRefusesOtherClient(t *testing.T) {
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected codes.Unavailable, got %v", err)
 	}
+	if delay, resend := grpcutil.ResendDelay(err); !resend || delay != 10*time.Second {
+		t.Fatalf("ResendDelay(%v) = (%v, %v), want (%v, true)", err, delay, resend, 10*time.Second)
+	}
 	if !strings.Contains(err.Error(), "stream writer lock is reserved for its previous holder") {
 		t.Fatalf("expected reservation message, got %v", err)
 	}
@@ -544,6 +557,9 @@ func TestAppend_RefusedHelloOverWire(t *testing.T) {
 	_, err = stream2.Recv()
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected codes.Unavailable, got %v", err)
+	}
+	if delay, resend := grpcutil.ResendDelay(err); !resend || delay != writerLockResendDelay {
+		t.Fatalf("ResendDelay(%v) = (%v, %v), want (%v, true)", err, delay, resend, writerLockResendDelay)
 	}
 	if !strings.Contains(err.Error(), "stream writer lock is held by another client") {
 		t.Fatalf("expected lock held message, got %v", err)

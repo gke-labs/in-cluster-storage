@@ -781,9 +781,11 @@ func (s *Server) Start(ctx context.Context) error {
 // Close discards unsynced staged writes; Server.Close alone does not drain.
 // Writes that were staged but not yet acknowledged by an fsync are lost; Close
 // has crash semantics. A caller who wants them kept must call Shutdown
-// as the draining path and check its error. Close does not call Stop itself
-// because it must never block (that is what lets it be used when the stream or
-// the object store is unreachable).
+// as the draining path and check its error. Close does not call Stop itself so
+// it can still complete when the object store or stream server is unreachable,
+// though closing an established WAL stream may wait up to the client's 2 s
+// release timeout against a silent stream server (volumes are closed
+// concurrently).
 func (s *Server) Close() error {
 	var errs []error
 	var ran bool

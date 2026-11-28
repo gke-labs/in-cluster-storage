@@ -29,6 +29,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/errutil"
+	"github.com/gke-labs/in-cluster-storage/pkg/grpcutil"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
@@ -193,18 +194,24 @@ func decideGrant(inputs grantDecisionInputs, requester string, now time.Time) (d
 	return grantDecisionLockGranted, false, time.Time{}
 }
 
-// grantDecisionStatus converts a refused grant decision to an Unavailable gRPC status with a descriptive message.
+// writerLockResendDelay is the retry delay advertised when a writer lock
+// refusal does not have a known expiry time (lock held by another client
+// or previous holder's records still in flight).
+const writerLockResendDelay = 1 * time.Second
+
+// grantDecisionStatus converts a refused grant decision to an Unavailable gRPC status
+// carrying a resend detail and delay.
 func grantDecisionStatus(decision grantDecision, remaining time.Duration) error {
 	switch decision {
 	case grantDecisionRefusedLockAlreadyHeld:
-		return status.Errorf(codes.Unavailable, "stream writer lock is held by another client")
+		return grpcutil.ResendStatus("stream writer lock is held by another client", writerLockResendDelay)
 	case grantDecisionRefusedRecordsInFlight:
-		return status.Errorf(codes.Unavailable, "stream writer lock is waiting for records of its previous holder to be committed")
+		return grpcutil.ResendStatus("stream writer lock is waiting for records of its previous holder to be committed", writerLockResendDelay)
 	case grantDecisionRefusedGracePeriod:
 		if remaining < 0 {
 			remaining = 0
 		}
-		return status.Errorf(codes.Unavailable, "stream writer lock is reserved for its previous holder for %v", remaining)
+		return grpcutil.ResendStatus(fmt.Sprintf("stream writer lock is reserved for its previous holder for %v", remaining), remaining)
 	default:
 		return status.Errorf(codes.Unavailable, "stream writer lock is unavailable")
 	}
