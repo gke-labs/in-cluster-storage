@@ -1383,24 +1383,29 @@ func TestWait_FailsWhenRecordDiscardedDueToDivergence(t *testing.T) {
 	handle2 := startBufferServerOnAddr(t, backend2, srv2DataDir, addr)
 	defer handle2.StopGraceful()
 
-	// 7. When stream reconnects, handleHelloAck observes divergence at witnessHead=1
-	// and discards local records 2 and 3. The in-flight waiter for seq 3 MUST fail promptly!
+	// 7. When stream reconnects after previously holding the lock, handleHelloAck observes
+	// another writer's record at witnessHead=1 and permanently degrades the handle with
+	// ErrWriterLockLost. The in-flight waiter for seq 3 MUST fail promptly!
 	select {
 	case err := <-waitErrCh:
 		if err == nil {
-			t.Fatalf("expected error from in-flight waiter for discarded sequence, got nil")
+			t.Fatalf("expected error from in-flight waiter after writer lock loss, got nil")
 		}
-		if !errors.Is(err, ErrRecordDiscarded) {
-			t.Fatalf("expected ErrRecordDiscarded, got: %v", err)
+		if !errors.Is(err, ErrWriterLockLost) {
+			t.Fatalf("expected ErrWriterLockLost, got: %v", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatalf("in-flight waiter for discarded sequence hung!")
+		t.Fatalf("in-flight waiter after writer lock loss hung!")
 	}
 
-	// 8. Any new call to Wait for the discarded sequence must also fail immediately with ErrRecordDiscarded
+	if degraded := stream.Degraded(); !errors.Is(degraded, ErrWriterLockLost) {
+		t.Fatalf("expected stream.Degraded() to wrap ErrWriterLockLost, got: %v", degraded)
+	}
+
+	// 8. Any new call to Wait on the degraded handle must also fail immediately with ErrWriterLockLost
 	err = stream.Wait(ctx, seq3, Witness, false)
-	if err == nil || !errors.Is(err, ErrRecordDiscarded) {
-		t.Fatalf("expected subsequent Wait for discarded sequence to return ErrRecordDiscarded, got: %v", err)
+	if err == nil || !errors.Is(err, ErrWriterLockLost) {
+		t.Fatalf("expected subsequent Wait after writer lock loss to return ErrWriterLockLost, got: %v", err)
 	}
 }
 
