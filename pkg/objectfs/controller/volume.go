@@ -6448,10 +6448,23 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 
 		v.handlesMu.Lock()
 		if fh != 0 {
-			if ino, ok := v.handles[fh]; ok {
-				inodeID = ino
-				delete(v.handles, fh)
+			ino, ok := v.handles[fh]
+			if !ok {
+				v.handlesMu.Unlock()
+				// A Release for a handle id this volume did not issue or has already
+				// released returns success and changes nothing. This happens when the
+				// same Release arrives twice, or when a Release arrives for a handle
+				// issued before a controller restart or a volume reload, since handles
+				// live only in memory. Ignoring it is safe because the open it refers
+				// to no longer exists on this volume, so there is no count to give
+				// back; falling through to the handleless per-inode path would
+				// decrement the count of some other open and could delete an unlinked
+				// file that is still open.
+				scoped.Log(ctx).V(2).Info("ignoring Release for unknown handle", "volume", v.volumeID, "inode", inodeID, "handle", fh)
+				return nil, nil
 			}
+			inodeID = ino
+			delete(v.handles, fh)
 		}
 		if v.openInodes != nil {
 			if v.openInodes[inodeID] > 1 {

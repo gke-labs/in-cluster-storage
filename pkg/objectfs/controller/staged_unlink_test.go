@@ -18,6 +18,8 @@ package controller
 
 import (
 	"bytes"
+	"errors"
+	"syscall"
 	"testing"
 	"time"
 
@@ -210,5 +212,54 @@ func TestStagedChunks_SyncSkipsInodeDeletedDuringUpload(t *testing.T) {
 	data, _, _, err := volume.ReadFile(ctx, survivorInodeID, 0, int64(len(survivorPayload)))
 	if err != nil || !bytes.Equal(data, survivorPayload) {
 		t.Fatalf("ReadFile survivor = (%q, %v), want %q", string(data), err, string(survivorPayload))
+	}
+}
+
+func TestRelease_RepeatedUnknownHandleIsNoOp(t *testing.T) {
+	ctx := t.Context()
+	server, volume := newStagedDropVolume(t, NewMemoryBackend())
+	inodeID, firstHandle := createFileHandle(t, server, "/repeated-release.bin")
+	secondHandle, _, _, err := volume.Open(ctx, inodeID, 0)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	initialPayload := bytes.Repeat([]byte("a"), 8192)
+	stageWrite(t, volume, inodeID, initialPayload)
+	stagedBefore := volume.StagedBytes()
+	if stagedBefore == 0 {
+		t.Fatal("expected non-zero staged bytes before unlink")
+	}
+
+	if _, err := volume.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "repeated-release.bin"}); err != nil {
+		t.Fatalf("Unlink failed: %v", err)
+	}
+	if err := volume.Release(ctx, inodeID, firstHandle); err != nil {
+		t.Fatalf("first Release(handle 1) failed: %v", err)
+	}
+	if err := volume.Release(ctx, inodeID, firstHandle); err != nil {
+		t.Fatalf("repeated Release(handle 1) failed: %v", err)
+	}
+
+	if staged := volume.StagedBytes(); staged != stagedBefore {
+		t.Fatalf("StagedBytes after repeated Release = %d, want %d", staged, stagedBefore)
+	}
+	appendedPayload := []byte("more-data")
+	if _, _, _, err := volume.WriteFile(ctx, inodeID, int64(len(initialPayload)), appendedPayload, pb.WriteMode_FSYNC); err != nil {
+		t.Fatalf("WriteFile after repeated Release failed: %v", err)
+	}
+	if err := volume.Fsync(ctx, inodeID); err != nil {
+		t.Fatalf("Fsync after repeated Release failed: %v", err)
+	}
+	expected := append(append([]byte(nil), initialPayload...), appendedPayload...)
+	data, _, _, err := volume.ReadFile(ctx, inodeID, 0, int64(len(expected)))
+	if err != nil || !bytes.Equal(data, expected) {
+		t.Fatalf("ReadFile after repeated Release = (%d bytes, %v), want %d bytes", len(data), err, len(expected))
+	}
+
+	if err := volume.Release(ctx, inodeID, secondHandle); err != nil {
+		t.Fatalf("Release(handle 2) failed: %v", err)
+	}
+	if _, err := volume.GetAttr(ctx, inodeID); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("GetAttr after releasing last handle = %v, want ENOENT", err)
 	}
 }
