@@ -7562,6 +7562,11 @@ func (c *captureRequestIDClient) Rmdir(_ context.Context, request *pb.RmdirReque
 	return &pb.RmdirResponse{Error: int32(syscall.EIO)}, nil
 }
 
+func (c *captureRequestIDClient) Rename(_ context.Context, request *pb.RenameRequest, _ ...grpc.CallOption) (*pb.RenameResponse, error) {
+	c.keys = append(c.keys, request.GetRequestId())
+	return &pb.RenameResponse{Error: int32(syscall.EIO)}, nil
+}
+
 func TestFUSECreateOperationsSetDistinctRequestIDs(t *testing.T) {
 	capture := &captureRequestIDClient{}
 	rawFS := NewObjectFS(capture, "vol-1", pb.WriteMode_FSYNC, nil)
@@ -7676,5 +7681,26 @@ func TestFUSECreatePassesOpenFlags(t *testing.T) {
 	}
 	if _, ok := cache.GetRange(existingIno, 0, 8192); ok {
 		t.Fatal("Create on existing non-empty file must not cache empty bytes in NodeCache")
+	}
+}
+
+func TestFUSERenameSetsDistinctRequestIDs(t *testing.T) {
+	capture := &captureRequestIDClient{}
+	rawFS := NewObjectFS(capture, "vol-1", pb.WriteMode_FSYNC, nil)
+
+	renameIn := &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}
+	rawFS.Rename(nil, renameIn, "a", "b")
+	rawFS.Rename(nil, renameIn, "c", "d")
+
+	if len(capture.keys) != 2 {
+		t.Fatalf("got %d captured request IDs, want 2", len(capture.keys))
+	}
+	for i, key := range capture.keys {
+		if len(key) != 16 {
+			t.Fatalf("call %d: got %d-byte request ID, want 16", i, len(key))
+		}
+	}
+	if bytes.Equal(capture.keys[0], capture.keys[1]) {
+		t.Fatalf("Rename calls received identical request ID %x", capture.keys[0])
 	}
 }

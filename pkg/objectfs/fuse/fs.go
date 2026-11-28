@@ -1320,6 +1320,7 @@ func (fs *ObjectFS) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName
 		OldName:        oldName,
 		NewParentInode: input.Newdir,
 		NewName:        newName,
+		RequestId:      nextRequestID(),
 	})
 	if err != nil {
 		return fs.grpcErrorToStatus(ctx, "Rename", err)
