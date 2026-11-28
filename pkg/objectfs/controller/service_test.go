@@ -7936,15 +7936,19 @@ func TestCreateFileNoHandle_UnlinkDeletesInode(t *testing.T) {
 		{name: "reg", mode: syscall.S_IFREG | 0644},
 	}
 
+	volume := mustGetVolume(t, server, volumeID)
 	for _, testCase := range cases {
-		createResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		request := &pb.CreateFileRequest{
 			VolumeId:    volumeID,
 			ParentInode: 1,
 			Name:        testCase.name,
 			Mode:        testCase.mode,
 			Rdev:        testCase.rdev,
+			RequestId:   []byte("mknod-" + testCase.name),
+			Exclusive:   true,
 			NoHandle:    true,
-		})
+		}
+		createResponse, err := server.CreateFile(ctx, request)
 		if err != nil || createResponse.GetError() != 0 {
 			t.Fatalf("CreateFile %s: err=%v errno=%d", testCase.name, err, createResponse.GetError())
 		}
@@ -7953,7 +7957,16 @@ func TestCreateFileNoHandle_UnlinkDeletesInode(t *testing.T) {
 		}
 
 		inodeID := createResponse.GetAttr().GetInode().GetIno()
-		volume := mustGetVolume(t, server, volumeID)
+		if testCase.mode&syscall.S_IFMT != syscall.S_IFREG {
+			repeatResponse, err := server.CreateFile(ctx, request)
+			if err != nil || repeatResponse.GetError() != 0 {
+				t.Fatalf("repeat CreateFile %s: err=%v errno=%d", testCase.name, err, repeatResponse.GetError())
+			}
+			if repeatResponse.GetFh() != 0 {
+				t.Fatalf("repeat CreateFile %s with NoHandle: got fh=%d, want 0", testCase.name, repeatResponse.GetFh())
+			}
+		}
+
 		volume.handlesMu.Lock()
 		handleCount := len(volume.handles)
 		openCount := volume.openInodes[inodeID]
@@ -7975,5 +7988,53 @@ func TestCreateFileNoHandle_UnlinkDeletesInode(t *testing.T) {
 		if err != nil || attrResponse.GetError() != int32(syscall.ENOENT) {
 			t.Fatalf("GetAttr after Unlink on %s (ino %d): err=%v errno=%d, want ENOENT", testCase.name, inodeID, err, attrResponse.GetError())
 		}
+	}
+
+	// Non-exclusive CreateFile with NoHandle on a fresh and then existing regular file
+	// returns handle 0 and counts no handle; without NoHandle it allocates and counts one.
+	noHandleResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "plain-no-handle",
+		Mode:        syscall.S_IFREG | 0644,
+		NoHandle:    true,
+	})
+	if err != nil || noHandleResponse.GetError() != 0 || noHandleResponse.GetFh() != 0 {
+		t.Fatalf("plain NoHandle CreateFile: err=%v errno=%d fh=%d, want fh=0", err, noHandleResponse.GetError(), noHandleResponse.GetFh())
+	}
+	existingNoHandleResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "plain-no-handle",
+		Mode:        syscall.S_IFREG | 0644,
+		NoHandle:    true,
+	})
+	if err != nil || existingNoHandleResponse.GetError() != 0 || existingNoHandleResponse.GetFh() != 0 {
+		t.Fatalf("existing NoHandle CreateFile: err=%v errno=%d fh=%d, want fh=0", err, existingNoHandleResponse.GetError(), existingNoHandleResponse.GetFh())
+	}
+	plainInodeID := noHandleResponse.GetAttr().GetInode().GetIno()
+	volume.handlesMu.Lock()
+	handleCount := len(volume.handles)
+	openCount := volume.openInodes[plainInodeID]
+	volume.handlesMu.Unlock()
+	if handleCount != 0 || openCount != 0 {
+		t.Fatalf("after NoHandle creates: handles=%d openCount=%d, want 0, 0", handleCount, openCount)
+	}
+
+	withHandleResponse, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "plain-no-handle",
+		Mode:        syscall.S_IFREG | 0644,
+	})
+	if err != nil || withHandleResponse.GetError() != 0 || withHandleResponse.GetFh() == 0 {
+		t.Fatalf("CreateFile without NoHandle: err=%v errno=%d fh=%d, want non-zero fh", err, withHandleResponse.GetError(), withHandleResponse.GetFh())
+	}
+	volume.handlesMu.Lock()
+	handleCount = len(volume.handles)
+	openCount = volume.openInodes[plainInodeID]
+	volume.handlesMu.Unlock()
+	if handleCount != 1 || openCount != 1 {
+		t.Fatalf("after CreateFile without NoHandle: handles=%d openCount=%d, want 1, 1", handleCount, openCount)
 	}
 }
