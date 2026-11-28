@@ -7523,7 +7523,9 @@ func TestFUSEOperationContextCarriesMountLogger(t *testing.T) {
 
 type captureRequestIDClient struct {
 	pb.ObjectFSControllerClient
-	keys [][]byte
+	keys       [][]byte
+	createReqs []*pb.CreateFileRequest
+	createResp *pb.CreateFileResponse
 }
 
 func (c *captureRequestIDClient) Mkdir(_ context.Context, request *pb.MkdirRequest, _ ...grpc.CallOption) (*pb.MkdirResponse, error) {
@@ -7543,6 +7545,10 @@ func (c *captureRequestIDClient) Link(_ context.Context, request *pb.LinkRequest
 
 func (c *captureRequestIDClient) CreateFile(_ context.Context, request *pb.CreateFileRequest, _ ...grpc.CallOption) (*pb.CreateFileResponse, error) {
 	c.keys = append(c.keys, request.GetRequestId())
+	c.createReqs = append(c.createReqs, request)
+	if c.createResp != nil {
+		return c.createResp, nil
+	}
 	return &pb.CreateFileResponse{Error: int32(syscall.EIO)}, nil
 }
 
@@ -7610,5 +7616,65 @@ func TestFUSERemovalOperationsSetDistinctRequestIDs(t *testing.T) {
 				t.Fatalf("calls %d and %d received identical request ID %x", j, i, key)
 			}
 		}
+	}
+}
+
+func TestFUSECreatePassesOpenFlags(t *testing.T) {
+	capture := &captureRequestIDClient{}
+	cache := NewNodeCache(1024 * 1024)
+	rawFS := NewObjectFS(capture, "vol-1", pb.WriteMode_FSYNC, cache)
+
+	cases := []struct {
+		name      string
+		flags     uint32
+		exclusive bool
+		truncate  bool
+	}{
+		{name: "plain", flags: syscall.O_CREAT | syscall.O_WRONLY, exclusive: false, truncate: false},
+		{name: "exclusive", flags: syscall.O_CREAT | syscall.O_EXCL | syscall.O_WRONLY, exclusive: true, truncate: false},
+		{name: "truncate", flags: syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY, exclusive: false, truncate: true},
+	}
+
+	for _, tc := range cases {
+		var createOut fuse.CreateOut
+		rawFS.Create(nil, &fuse.CreateIn{
+			InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+			Flags:    tc.flags,
+			Mode:     0644,
+		}, tc.name, &createOut)
+		got := capture.createReqs[len(capture.createReqs)-1]
+		if got.GetExclusive() != tc.exclusive || got.GetTruncate() != tc.truncate {
+			t.Fatalf("%s: got exclusive=%v truncate=%v, want exclusive=%v truncate=%v",
+				tc.name, got.GetExclusive(), got.GetTruncate(), tc.exclusive, tc.truncate)
+		}
+	}
+
+	var mknodOut fuse.EntryOut
+	rawFS.Mknod(nil, &fuse.MknodIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Mode:     syscall.S_IFREG | 0644,
+	}, "mknod-reg", &mknodOut)
+	gotMknod := capture.createReqs[len(capture.createReqs)-1]
+	if !gotMknod.GetExclusive() || gotMknod.GetTruncate() {
+		t.Fatalf("mknod: got exclusive=%v truncate=%v, want exclusive=true truncate=false",
+			gotMknod.GetExclusive(), gotMknod.GetTruncate())
+	}
+
+	// Opening an existing non-empty file via Create must not seed empty bytes into NodeCache.
+	const existingIno uint64 = 42
+	capture.createResp = &pb.CreateFileResponse{
+		Attr: &pb.EntryAttr{Inode: &pb.Inode{Ino: proto.Uint64(existingIno), Mode: syscall.S_IFREG | 0600, Size: 8192}},
+		Fh:   7,
+	}
+	var createOut fuse.CreateOut
+	if status := rawFS.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+		Flags:    syscall.O_CREAT | syscall.O_RDWR,
+		Mode:     0644,
+	}, "existing", &createOut); status != fuse.OK {
+		t.Fatalf("Create existing: got status %v, want OK", status)
+	}
+	if _, ok := cache.GetRange(existingIno, 0, 8192); ok {
+		t.Fatal("Create on existing non-empty file must not cache empty bytes in NodeCache")
 	}
 }

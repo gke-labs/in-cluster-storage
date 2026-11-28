@@ -1241,7 +1241,11 @@ type CreateFileRequest struct {
 	Gid            uint32                 `protobuf:"varint,7,opt,name=gid,proto3" json:"gid,omitempty"`
 	Rdev           uint32                 `protobuf:"varint,8,opt,name=rdev,proto3" json:"rdev,omitempty"`
 	// Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
-	RequestId     []byte `protobuf:"bytes,9,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId []byte `protobuf:"bytes,9,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	// Fail with EEXIST if the name already exists (corresponds to O_EXCL).
+	Exclusive bool `protobuf:"varint,10,opt,name=exclusive,proto3" json:"exclusive,omitempty"`
+	// Truncate an existing regular file when the name already exists (corresponds to O_TRUNC).
+	Truncate      bool `protobuf:"varint,11,opt,name=truncate,proto3" json:"truncate,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1337,6 +1341,20 @@ func (x *CreateFileRequest) GetRequestId() []byte {
 		return x.RequestId
 	}
 	return nil
+}
+
+func (x *CreateFileRequest) GetExclusive() bool {
+	if x != nil {
+		return x.Exclusive
+	}
+	return false
+}
+
+func (x *CreateFileRequest) GetTruncate() bool {
+	if x != nil {
+		return x.Truncate
+	}
+	return false
 }
 
 type CreateFileResponse struct {
@@ -6459,7 +6477,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\rMkdirResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
-	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xfb\x01\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xb5\x02\n" +
 	"\x11CreateFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
@@ -6470,7 +6488,10 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x03gid\x18\a \x01(\rR\x03gid\x12\x12\n" +
 	"\x04rdev\x18\b \x01(\rR\x04rdev\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\t \x01(\fR\trequestId\"\x95\x01\n" +
+	"request_id\x18\t \x01(\fR\trequestId\x12\x1c\n" +
+	"\texclusive\x18\n" +
+	" \x01(\bR\texclusive\x12\x1a\n" +
+	"\btruncate\x18\v \x01(\bR\btruncate\"\x95\x01\n" +
 	"\x12CreateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12\x0e\n" +

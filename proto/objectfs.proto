@@ -205,6 +205,10 @@ message CreateFileRequest {
   uint32 rdev = 8;
   // Idempotency key chosen by the caller; a repeat of the same request carries the same key; empty means none.
   bytes request_id = 9;
+  // Fail with EEXIST if the name already exists (corresponds to O_EXCL).
+  bool exclusive = 10;
+  // Truncate an existing regular file when the name already exists (corresponds to O_TRUNC).
+  bool truncate = 11;
 }
 
 message CreateFileResponse {

@@ -74,7 +74,7 @@ func runMetadataOperations(t *testing.T, ctx context.Context, server *Server, vo
 	assertWaits("CreateFile (new)", wantWaits)
 
 	// 2. CreateFile (overwrite existing file)
-	if response, err := server.CreateFile(ctx, &pb.CreateFileRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "file.txt", Mode: 0644}); err != nil || response.GetError() != 0 {
+	if response, err := server.CreateFile(ctx, &pb.CreateFileRequest{VolumeId: volume.volumeID, ParentInode: 1, Name: "file.txt", Mode: 0644, Truncate: true}); err != nil || response.GetError() != 0 {
 		t.Fatalf("CreateFile overwrite: %v", err)
 	}
 	assertWaits("CreateFile (overwrite)", wantWaits)

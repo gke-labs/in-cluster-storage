@@ -1029,6 +1029,7 @@ func ReplayOperations(ctx context.Context, client pb.ObjectFSControllerClient, v
 				Uid:            op.Uid,
 				Gid:            op.Gid,
 				InitialContent: op.Data,
+				Truncate:       true,
 			})
 			if err != nil {
 				return 0, fmt.Errorf("create file %s: %w", op.Path, err)

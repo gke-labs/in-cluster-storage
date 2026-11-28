@@ -3787,6 +3787,8 @@ func (v *Volume) CreateFile(ctx context.Context, request *pb.CreateFileRequest) 
 	gid := request.GetGid()
 	rdev := request.GetRdev()
 	requestID := request.GetRequestId()
+	exclusive := request.GetExclusive()
+	truncate := request.GetTruncate()
 
 	if len(name) > MaxNameLength {
 		return nil, fmt.Errorf("file name %q exceeds maximum length: %w", name, syscall.ENAMETOOLONG)
@@ -3870,6 +3872,12 @@ func (v *Volume) CreateFile(ctx context.Context, request *pb.CreateFileRequest) 
 			if fileType != syscall.S_IFREG || (childInode.Row.GetMode()&syscall.S_IFMT) != syscall.S_IFREG {
 				return nil, nil, fmt.Errorf("file %q already exists: %w", name, syscall.EEXIST)
 			}
+			if exclusive {
+				return nil, nil, fmt.Errorf("file %q already exists: %w", name, syscall.EEXIST)
+			}
+			if !truncate {
+				return v.toEntryAttr(childInode.Row, name, childInode.RedirectURL), nil, nil
+			}
 			if childInode.Data != nil {
 				errutil.CloseAndLog(childInode.Data, "inode data")
 				childInode.Data = nil
@@ -3884,12 +3892,9 @@ func (v *Volume) CreateFile(ctx context.Context, request *pb.CreateFileRequest) 
 			}
 
 			childInode.mutate(func(row *pb.Inode) {
-				row.Mode = mode
 				row.Size = int64(len(dataCopy))
 				row.Mtime = timestamppb.New(now)
 				row.Ctime = timestamppb.New(now)
-				row.Uid = uid
-				row.Gid = gid
 				row.ChunkSize = effectiveChunkSize
 				row.ContentSha256 = hashStr
 				row.Sha256 = ""

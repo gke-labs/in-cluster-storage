@@ -1183,6 +1183,7 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 	ctx, cancelFunc := fs.makeContext(cancel)
 	defer cancelFunc()
 
+	truncate := input.Flags&syscall.O_TRUNC != 0
 	resp, err := fs.client.CreateFile(ctx, &pb.CreateFileRequest{
 		VolumeId:    fs.volumeID,
 		ParentInode: input.NodeId,
@@ -1190,6 +1191,8 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 		Mode:        input.Mode,
 		Uid:         input.Uid,
 		Gid:         input.Gid,
+		Exclusive:   input.Flags&syscall.O_EXCL != 0,
+		Truncate:    truncate,
 	})
 	if err != nil {
 		return fs.grpcErrorToStatus(ctx, "CreateFile", err)
@@ -1202,10 +1205,17 @@ func (fs *ObjectFS) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 		return fuse.EIO
 	}
 
-	if fs.cache != nil && resp.GetStreamPosition() > 0 {
-		fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+	if truncate {
+		fs.invalidateManifest(attr.GetInode().GetIno())
 	}
-	fs.cache.Put(attr.GetInode().GetIno(), []byte{}, time.Now(), "")
+	if fs.cache != nil {
+		if resp.GetStreamPosition() > 0 {
+			fs.cache.RecordPosition(input.NodeId, resp.GetStreamPosition())
+		}
+		if attr.GetInode().GetSize() == 0 {
+			fs.cache.Put(attr.GetInode().GetIno(), []byte{}, time.Now(), "")
+		}
+	}
 	fs.fillEntryOut(attr, &out.EntryOut, input.NodeId, name)
 	out.OpenOut.Fh = resp.GetFh()
 	out.OpenOut.OpenFlags |= fuse.FOPEN_KEEP_CACHE
@@ -1228,6 +1238,7 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 		Uid:         input.Uid,
 		Gid:         input.Gid,
 		RequestId:   nextRequestID(),
+		Exclusive:   true,
 	})
 	if err != nil {
 		return fs.grpcErrorToStatus(ctx, "CreateFile", err)
