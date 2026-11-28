@@ -7688,9 +7688,9 @@ func TestFUSECreatePassesOpenFlags(t *testing.T) {
 			Mode:     0644,
 		}, tc.name, &createOut)
 		got := capture.createReqs[len(capture.createReqs)-1]
-		if got.GetExclusive() != tc.exclusive || got.GetTruncate() != tc.truncate {
-			t.Fatalf("%s: got exclusive=%v truncate=%v, want exclusive=%v truncate=%v",
-				tc.name, got.GetExclusive(), got.GetTruncate(), tc.exclusive, tc.truncate)
+		if got.GetExclusive() != tc.exclusive || got.GetTruncate() != tc.truncate || got.GetNoHandle() {
+			t.Fatalf("%s: got exclusive=%v truncate=%v no_handle=%v, want exclusive=%v truncate=%v no_handle=false",
+				tc.name, got.GetExclusive(), got.GetTruncate(), got.GetNoHandle(), tc.exclusive, tc.truncate)
 		}
 	}
 
@@ -7700,9 +7700,9 @@ func TestFUSECreatePassesOpenFlags(t *testing.T) {
 		Mode:     syscall.S_IFREG | 0644,
 	}, "mknod-reg", &mknodOut)
 	gotMknod := capture.createReqs[len(capture.createReqs)-1]
-	if !gotMknod.GetExclusive() || gotMknod.GetTruncate() {
-		t.Fatalf("mknod: got exclusive=%v truncate=%v, want exclusive=true truncate=false",
-			gotMknod.GetExclusive(), gotMknod.GetTruncate())
+	if !gotMknod.GetExclusive() || gotMknod.GetTruncate() || !gotMknod.GetNoHandle() {
+		t.Fatalf("mknod: got exclusive=%v truncate=%v no_handle=%v, want exclusive=true truncate=false no_handle=true",
+			gotMknod.GetExclusive(), gotMknod.GetTruncate(), gotMknod.GetNoHandle())
 	}
 
 	// Opening an existing non-empty file via Create must not seed empty bytes into NodeCache.
