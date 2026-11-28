@@ -263,3 +263,54 @@ func TestRelease_RepeatedUnknownHandleIsNoOp(t *testing.T) {
 		t.Fatalf("GetAttr after releasing last handle = %v, want ENOENT", err)
 	}
 }
+
+func TestRelease_PreRestartHandleDoesNotCloseReusedHandle(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+
+	firstServer, _ := newStagedDropVolume(t, backend)
+	oldInode, oldHandle := createFileHandle(t, firstServer, "/before-restart.bin")
+	if err := firstServer.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+	if err := firstServer.Close(); err != nil {
+		t.Fatalf("firstServer.Close failed: %v", err)
+	}
+
+	secondServer, volume := newStagedDropVolume(t, backend)
+	newInode, newHandle := createFileHandle(t, secondServer, "/after-restart.bin")
+	if newHandle != oldHandle || newInode == oldInode {
+		t.Fatalf("want reused handle %d on distinct inode, got handle=%d inode=%d (old inode=%d)", oldHandle, newHandle, newInode, oldInode)
+	}
+
+	payload := []byte("still-open")
+	stageWrite(t, volume, newInode, payload)
+	stagedBefore := volume.StagedBytes()
+	if stagedBefore == 0 {
+		t.Fatal("expected non-zero staged bytes before unlink")
+	}
+	if _, err := volume.Unlink(ctx, &pb.UnlinkRequest{ParentInode: 1, Name: "after-restart.bin"}); err != nil {
+		t.Fatalf("Unlink failed: %v", err)
+	}
+
+	if err := volume.Release(ctx, oldInode, oldHandle); err != nil {
+		t.Fatalf("stale Release failed: %v", err)
+	}
+	if staged := volume.StagedBytes(); staged != stagedBefore {
+		t.Fatalf("StagedBytes after stale Release = %d, want %d", staged, stagedBefore)
+	}
+	if err := volume.Fsync(ctx, newInode); err != nil {
+		t.Fatalf("Fsync after stale Release failed: %v", err)
+	}
+	data, _, _, err := volume.ReadFile(ctx, newInode, 0, int64(len(payload)))
+	if err != nil || !bytes.Equal(data, payload) {
+		t.Fatalf("ReadFile after stale Release = (%q, %v), want %q", string(data), err, string(payload))
+	}
+
+	if err := volume.Release(ctx, newInode, newHandle); err != nil {
+		t.Fatalf("Release(newHandle) failed: %v", err)
+	}
+	if _, err := volume.GetAttr(ctx, newInode); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("GetAttr after releasing new handle = %v, want ENOENT", err)
+	}
+}

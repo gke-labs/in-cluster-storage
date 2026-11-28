@@ -6461,21 +6461,25 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 		v.handlesMu.Lock()
 		if fh != 0 {
 			ino, ok := v.handles[fh]
-			if !ok {
+			if !ok || ino != inodeID {
 				v.handlesMu.Unlock()
-				// A Release for a handle id this volume did not issue or has already
-				// released returns success and changes nothing. This happens when the
-				// same Release arrives twice, or when a Release arrives for a handle
-				// issued before a controller restart or a volume reload, since handles
-				// live only in memory. Ignoring it is safe because the open it refers
-				// to no longer exists on this volume, so there is no count to give
-				// back; falling through to the handleless per-inode path would
-				// decrement the count of some other open and could delete an unlinked
-				// file that is still open.
-				scoped.Log(ctx).V(2).Info("ignoring Release for unknown handle", "volume", v.volumeID, "inode", inodeID, "handle", fh)
+				// A Release for a handle id this volume did not issue, has already
+				// released, or currently maps to a different inode returns success and
+				// changes nothing. An unknown handle happens when the same Release
+				// arrives twice, or when a Release arrives for a handle issued before a
+				// controller restart or a volume reload, since handles live only in
+				// memory. A handle id mapped to a different inode happens because
+				// handle ids come from a per-volume counter that starts again when the
+				// volume is loaded, so a Release for a handle issued before a restart
+				// or reload can carry the same id as a new, unrelated open. Ignoring
+				// either case is safe because the open the caller means no longer
+				// exists on this volume, so there is no count to give back; falling
+				// through to the handleless per-inode path or honouring the reused id
+				// would decrement or close somebody else's open and could delete an
+				// unlinked file that is still open.
+				scoped.Log(ctx).V(2).Info("ignoring Release for unknown or mismatched handle", "volume", v.volumeID, "inode", inodeID, "handleInode", ino, "handle", fh)
 				return nil, nil
 			}
-			inodeID = ino
 			delete(v.handles, fh)
 		}
 		if v.openInodes != nil {
