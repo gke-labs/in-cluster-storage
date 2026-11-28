@@ -322,7 +322,7 @@ type Volume struct {
 	// Immutable after construction; safe to read without holding mu.
 	limits volumeLimits
 
-	// Lock order: stagingMu may be held while taking mu for reading; mu must never be held while taking stagingMu.
+	// Lock order: mu must be acquired before stagingMu. Nothing may acquire mu (for reading or writing) while holding stagingMu.
 	mu           sync.RWMutex
 	volumeID     string
 	rootInodeID  uint64
@@ -344,7 +344,7 @@ type Volume struct {
 	uploadContext   context.Context
 	cancelUpload    context.CancelFunc
 
-	// Lock order: stagingMu may be held while taking mu for reading; mu must never be held while taking stagingMu.
+	// Lock order: mu must be acquired before stagingMu. Nothing may acquire mu (for reading or writing) while holding stagingMu.
 	stagingMu     sync.Mutex
 	stagingEpoch  int64
 	stagingSeq    uint64
@@ -373,8 +373,10 @@ type Volume struct {
 	stream   walclient.Stream
 	streamID uuid.UUID
 
-	metadataStream         *sds.Writer
-	lastCommitSeq          uint64
+	metadataStream *sds.Writer
+	// lastCommitSeq holds the highest committed stream sequence number for this volume.
+	// Written only under mu; readable lock-free via atomic load (for example Position).
+	lastCommitSeq          atomic.Uint64
 	snapshotPointers       []*sdsv1.SnapshotPointer
 	replayStartPos         uint64
 	replaySnapshotLocation string
@@ -1408,7 +1410,7 @@ func (v *Volume) appendSyncRecordsLocked(
 		nodes[ino] = node
 	}
 	if len(nodes) == 0 {
-		return v.lastCommitSeq, 0, nil, nil
+		return v.lastCommitSeq.Load(), 0, nil, nil
 	}
 
 	for ino, chunks := range snapshotChunks {
@@ -2229,8 +2231,8 @@ func (v *Volume) commitTxLocked(ctx context.Context, tx *sds.Tx) (uint64, error)
 	// commits. It lives here (not in makeWaitFn, where it used to be a side effect
 	// of building a waiter) because sync barriers read it whether or not anyone built
 	// a waiter.
-	if commitSeq > v.lastCommitSeq {
-		v.lastCommitSeq = commitSeq
+	if commitSeq > v.lastCommitSeq.Load() {
+		v.lastCommitSeq.Store(commitSeq)
 	}
 	return commitSeq, nil
 }
@@ -2299,7 +2301,7 @@ func (v *Volume) Stop(ctx context.Context) error {
 // staged chunks if needed, and waits for in-flight sync to complete under ctx.
 // It returns the volume's newest commit sequence once staging is drained, or
 // sequence 0 if staging is already closed.
-// Takes stagingMu, and takes v.mu for reading through Position() after stagingMu is released.
+// Takes stagingMu; reads the committed position atomically via Position().
 func (v *Volume) drainStagedData(ctx context.Context) (uint64, error) {
 	v.stagingMu.Lock()
 	if v.stagingClosed {
@@ -2560,10 +2562,9 @@ func (v *Volume) waitForSequence(ctx context.Context, sequence uint64) error {
 }
 
 // Position returns the latest committed stream sequence number for this volume.
+// Lock-free; safe to call with any or no locks held.
 func (v *Volume) Position() uint64 {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.lastCommitSeq
+	return v.lastCommitSeq.Load()
 }
 
 // SafeSnapshotPosition returns the highest stream sequence number that is safe to snapshot
@@ -2575,7 +2576,7 @@ func (v *Volume) SafeSnapshotPosition() uint64 {
 }
 
 func (v *Volume) safeSnapshotPositionLocked() uint64 {
-	snapPos := v.lastCommitSeq
+	snapPos := v.lastCommitSeq.Load()
 	_, _, s3Seq := v.stream.Watermarks()
 	if s3Seq > 0 && snapPos > s3Seq {
 		snapPos = s3Seq
@@ -2658,7 +2659,7 @@ func (v *Volume) Stats() VolumeStats {
 	v.stagingMu.Unlock()
 
 	return VolumeStats{
-		Lag:              v.metadataView.Lag(v.lastCommitSeq),
+		Lag:              v.metadataView.Lag(v.lastCommitSeq.Load()),
 		UnappliedBytes:   v.metadataView.UnappliedBytes(),
 		Failures:         v.metadataView.ApplierFailures(),
 		IsDegraded:       v.metadataView.IsDegraded(),
@@ -2752,7 +2753,7 @@ func (v *Volume) Index() sds.LocalIndex {
 func (v *Volume) FlushOverlay(ctx context.Context) error {
 	v.mu.Lock()
 	mView := v.metadataView
-	targetSeq := v.lastCommitSeq
+	targetSeq := v.lastCommitSeq.Load()
 	v.mu.Unlock()
 
 	if mView == nil {
@@ -2774,7 +2775,7 @@ func (v *Volume) flushOverlayLocked(ctx context.Context) error {
 	if v.metadataView == nil {
 		return nil
 	}
-	if err := v.metadataView.FlushTo(ctx, v.lastCommitSeq); err != nil {
+	if err := v.metadataView.FlushTo(ctx, v.lastCommitSeq.Load()); err != nil {
 		return err
 	}
 	v.assertStatsMatchLocked("after flushOverlayLocked")
@@ -3125,7 +3126,7 @@ func (v *Volume) toEntryAttr(row *pb.Inode, name, redirectURL string) *pb.EntryA
 		Inode:          row,
 		Name:           name,
 		RedirectUrl:    redirectURL,
-		StreamPosition: v.lastCommitSeq,
+		StreamPosition: v.lastCommitSeq.Load(),
 	}
 }
 
@@ -3687,7 +3688,7 @@ func (v *Volume) Mkdir(ctx context.Context, request *pb.MkdirRequest) (*pb.Entry
 		if exists {
 			if dirEntryCreatedByRequest(existingEntry, requestID, syscall.S_IFDIR) {
 				attr, err := v.toEntryAttrLocked(ctx, tx, existingEntry.GetIno(), name)
-				return attr, v.makeMetadataWaitFn(v.lastCommitSeq), err
+				return attr, v.makeMetadataWaitFn(v.lastCommitSeq.Load()), err
 			}
 			return nil, nil, fmt.Errorf("directory %s already exists under inode %d: %w", name, parentInodeID, syscall.EEXIST)
 		}
@@ -3860,7 +3861,7 @@ func (v *Volume) CreateFile(ctx context.Context, request *pb.CreateFileRequest) 
 		if exists {
 			if fileType != syscall.S_IFREG && dirEntryCreatedByRequest(existingEntry, requestID, fileType) {
 				attr, err := v.toEntryAttrLocked(ctx, tx, existingEntry.GetIno(), name)
-				return attr, v.makeMetadataWaitFn(v.lastCommitSeq), err
+				return attr, v.makeMetadataWaitFn(v.lastCommitSeq.Load()), err
 			}
 			childInode, err := v.getOrLoadInodeLocked(ctx, tx, existingEntry.GetIno())
 			if err != nil {
@@ -4170,7 +4171,7 @@ func (v *Volume) Symlink(ctx context.Context, request *pb.SymlinkRequest) (*pb.E
 		if ok {
 			if dirEntryCreatedByRequest(existingEntry, requestID, syscall.S_IFLNK) {
 				attr, err := v.toEntryAttrLocked(ctx, tx, existingEntry.GetIno(), name)
-				return attr, v.makeMetadataWaitFn(v.lastCommitSeq), err
+				return attr, v.makeMetadataWaitFn(v.lastCommitSeq.Load()), err
 			}
 			return nil, nil, fmt.Errorf("entry %q already exists: %w", name, syscall.EEXIST)
 		}
@@ -4320,7 +4321,7 @@ func (v *Volume) Link(ctx context.Context, request *pb.LinkRequest) (*pb.EntryAt
 		}
 		if ok {
 			if dirEntryCreatedByRequest(existingEntry, requestID, oldNode.Row.GetMode()&syscall.S_IFMT) && existingEntry.GetIno() == oldNode.Row.GetIno() {
-				return v.toEntryAttr(oldNode.Row, newName, oldNode.RedirectURL), v.makeMetadataWaitFn(v.lastCommitSeq), nil
+				return v.toEntryAttr(oldNode.Row, newName, oldNode.RedirectURL), v.makeMetadataWaitFn(v.lastCommitSeq.Load()), nil
 			}
 			return nil, nil, fmt.Errorf("entry %q already exists: %w", newName, syscall.EEXIST)
 		}
@@ -4991,7 +4992,7 @@ func (v *Volume) dropStagedChunkLocked(inodeID uint64, index int) {
 }
 
 // dropStagedChunksLocked removes all staged chunks for inodeID and updates byte
-// and pack-reference accounting. Requires v.stagingMu held (and v.mu not held).
+// and pack-reference accounting. Requires v.stagingMu held.
 func (v *Volume) dropStagedChunksLocked(inodeID uint64) {
 	chunks, ok := v.stagedChunks[inodeID]
 	if !ok {
@@ -5765,7 +5766,8 @@ func (v *Volume) Unlink(ctx context.Context, request *pb.UnlinkRequest) (uint64,
 					return nil, 0, err
 				}
 				if parentRemovedByRequest(parentInode.Row, requestID) {
-					return v.makeMetadataWaitFn(v.lastCommitSeq), v.lastCommitSeq, nil
+					seq := v.lastCommitSeq.Load()
+					return v.makeMetadataWaitFn(seq), seq, nil
 				}
 			}
 			return nil, 0, fmt.Errorf("file %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
@@ -5854,7 +5856,7 @@ func (v *Volume) Unlink(ctx context.Context, request *pb.UnlinkRequest) (uint64,
 		return 0, err
 	}
 	if deletedInode != 0 {
-		// Drop staged chunks under v.stagingMu after v.mu has been released (lock order forbids taking stagingMu under mu).
+		// Drop staged chunks under v.stagingMu after v.mu has been released.
 		v.stagingMu.Lock()
 		v.dropStagedChunksLocked(deletedInode)
 		v.stagingMu.Unlock()
@@ -5903,7 +5905,8 @@ func (v *Volume) Rmdir(ctx context.Context, request *pb.RmdirRequest) (uint64, e
 					return nil, 0, err
 				}
 				if parentRemovedByRequest(parentInode.Row, requestID) {
-					return v.makeMetadataWaitFn(v.lastCommitSeq), v.lastCommitSeq, nil
+					seq := v.lastCommitSeq.Load()
+					return v.makeMetadataWaitFn(seq), seq, nil
 				}
 			}
 			return nil, 0, fmt.Errorf("directory %s not found under inode %d: %w", name, parentInodeID, syscall.ENOENT)
@@ -6033,7 +6036,7 @@ func (v *Volume) Rename(ctx context.Context, request *pb.RenameRequest) (*pb.Ent
 				}
 				if destinationExists && dirEntryMatchesRequest(destinationEntry, requestID) {
 					attr, err := v.toEntryAttrLocked(ctx, tx, destinationEntry.GetIno(), newName)
-					return attr, v.makeMetadataWaitFn(v.lastCommitSeq), err
+					return attr, v.makeMetadataWaitFn(v.lastCommitSeq.Load()), err
 				}
 			}
 			return nil, nil, fmt.Errorf("source %s not found in parent %d: %w", oldName, oldParentInodeID, syscall.ENOENT)
@@ -6289,7 +6292,7 @@ func (v *Volume) Rename(ctx context.Context, request *pb.RenameRequest) (*pb.Ent
 		return nil, err
 	}
 	if deletedTargetInode != 0 {
-		// Drop staged chunks under v.stagingMu after v.mu has been released (lock order forbids taking stagingMu under mu).
+		// Drop staged chunks under v.stagingMu after v.mu has been released.
 		v.stagingMu.Lock()
 		v.dropStagedChunksLocked(deletedTargetInode)
 		v.stagingMu.Unlock()
@@ -6336,9 +6339,6 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 	barrierCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	v.stagingMu.Lock()
-	defer v.stagingMu.Unlock()
-
 	stopTimer := context.AfterFunc(barrierCtx, func() {
 		v.stagingMu.Lock()
 		v.syncCond.Broadcast()
@@ -6353,7 +6353,10 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 		if deg := v.Degraded(); deg != nil {
 			return syscall.EIO
 		}
+
+		v.stagingMu.Lock()
 		if barrierCtx.Err() != nil {
+			v.stagingMu.Unlock()
 			reason := waitReason
 			if reason == "" {
 				reason = "context_timeout"
@@ -6369,6 +6372,7 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 		}
 
 		if !hasStaged && !inFlight {
+			v.stagingMu.Unlock()
 			if waitReason != "" {
 				klog.Infof("ObjectFS volume %s inode %d open barrier satisfied in %v (waited on %s)", v.volumeID, inodeID, time.Since(barrierStartTime), waitReason)
 			}
@@ -6382,6 +6386,7 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 				waitReason = "in_flight_volume_sync"
 			}
 			v.syncCond.Wait()
+			v.stagingMu.Unlock()
 			continue
 		}
 
@@ -6399,7 +6404,6 @@ func (v *Volume) openBarrier(ctx context.Context, inodeID uint64) error {
 
 		waitReason = "staged_inode_sync"
 		_, err := v.syncInodesLocked(barrierCtx, map[uint64]struct{}{inodeID: {}}, trigger)
-		v.stagingMu.Lock()
 		if err != nil {
 			klog.Warningf("ObjectFS volume %s inode %d open barrier sync failed after %v: %v", v.volumeID, inodeID, time.Since(barrierStartTime), err)
 			return syscall.EIO
@@ -6439,7 +6443,7 @@ func (v *Volume) Open(ctx context.Context, inodeID uint64, flags uint32) (uint64
 		return 0, nil, 0, syscall.ENOENT
 	}
 	attr := v.toEntryAttr(node.Row, "", node.RedirectURL)
-	pos := v.lastCommitSeq
+	pos := v.lastCommitSeq.Load()
 	v.mu.RUnlock()
 
 	fh := v.AllocFh(inodeID)
@@ -6514,7 +6518,7 @@ func (v *Volume) Release(ctx context.Context, inodeID uint64, fh uint64) error {
 		return err
 	}
 	if deletedInode != 0 {
-		// Drop staged chunks under v.stagingMu after v.mu has been released (lock order forbids taking stagingMu under mu).
+		// Drop staged chunks under v.stagingMu after v.mu has been released.
 		v.stagingMu.Lock()
 		v.dropStagedChunksLocked(deletedInode)
 		v.stagingMu.Unlock()
@@ -6624,8 +6628,8 @@ func (v *Volume) ApplySDSChangeLocked(ctx context.Context, change sds.Change) er
 		if err := v.metadataView.ApplyChangesSync(ctx, []sds.Change{change}); err != nil {
 			return err
 		}
-		if change.Seq > v.lastCommitSeq {
-			v.lastCommitSeq = change.Seq
+		if change.Seq > v.lastCommitSeq.Load() {
+			v.lastCommitSeq.Store(change.Seq)
 		}
 		if change.TypeName == InodeTypeName {
 			if inode, ok := change.Row.(*pb.Inode); ok {
@@ -6689,7 +6693,7 @@ func (v *Volume) assertStatsMatchLocked(reason string) {
 	if !v.shouldDebugCheckStats() || v.liveStats == nil || v.metadataView == nil {
 		return
 	}
-	if v.metadataView.Lag(v.lastCommitSeq) > 0 || v.metadataView.UnappliedBytes() > 0 {
+	if v.metadataView.Lag(v.lastCommitSeq.Load()) > 0 || v.metadataView.UnappliedBytes() > 0 {
 		return
 	}
 	var durable *pb.VolumeStats
@@ -6729,7 +6733,8 @@ func (v *Volume) checkStatsOnBatchApplied(appliedPos uint64) {
 		if v.closed {
 			return
 		}
-		if appliedPos >= v.lastCommitSeq && v.lastCommitSeq > 0 {
+		lastSeq := v.lastCommitSeq.Load()
+		if appliedPos >= lastSeq && lastSeq > 0 {
 			v.assertStatsMatchLocked("batch brought appliedPos to lastCommitSeq")
 		}
 	}()
@@ -6851,7 +6856,7 @@ func (v *Volume) applyRestoreRecordLocked(ctx context.Context, ptr *sdsv1.Snapsh
 	}
 	v.replayStartPos = ptr.GetPosition()
 	v.replaySnapshotLocation = ptr.GetRestoredFrom()
-	v.lastCommitSeq = seq
+	v.lastCommitSeq.Store(seq)
 	return nil
 }
 
@@ -7259,8 +7264,8 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 		}
 	}
 
-	if snapPos > v.lastCommitSeq {
-		v.lastCommitSeq = snapPos
+	if snapPos > v.lastCommitSeq.Load() {
+		v.lastCommitSeq.Store(snapPos)
 	}
 	v.replayStartPos = snapPos
 	v.replaySnapshotLocation = remoteSnapKey
@@ -7280,8 +7285,8 @@ func (v *Volume) loadFromBackendMetadataLocked(ctx context.Context) error {
 			return fmt.Errorf("failed to apply recovered SDS changes: %w", err)
 		}
 		for _, ch := range changes {
-			if ch.Seq > v.lastCommitSeq {
-				v.lastCommitSeq = ch.Seq
+			if ch.Seq > v.lastCommitSeq.Load() {
+				v.lastCommitSeq.Store(ch.Seq)
 			}
 			if ch.TypeName == InodeTypeName {
 				if in, ok := ch.Row.(*pb.Inode); ok && in != nil && in.GetIno() > highestReplayedIno {
@@ -7876,9 +7881,9 @@ func (v *Volume) writeRestoreRecord(ctx context.Context, snapshotName string) (*
 		}
 		restoreSeq = seq
 	} else {
-		restoreSeq = v.lastCommitSeq + 1
+		restoreSeq = v.lastCommitSeq.Load() + 1
 	}
-	v.lastCommitSeq = restoreSeq
+	v.lastCommitSeq.Store(restoreSeq)
 
 	if v.stream.ReplicationLevel() == walclient.Permanent {
 		if err := v.stream.Flush(ctx); err != nil {
@@ -7903,7 +7908,7 @@ func (v *Volume) writeRestoreRecord(ctx context.Context, snapshotName string) (*
 	if err := v.initMetadataViewLocked(ctx, restoredIdx); err != nil {
 		return nil, 0, fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
 	}
-	v.lastCommitSeq = restoreSeq
+	v.lastCommitSeq.Store(restoreSeq)
 
 	v.metadataView.ClearCache()
 	// Active file handles (v.handles) and open inode refcounts (v.openInodes)
@@ -8021,7 +8026,7 @@ func (v *Volume) InitFromSnapshot(ctx context.Context, sourceVolumeID, snapshotN
 	if err := v.initMetadataViewLocked(ctx, restoredIndex); err != nil {
 		return fmt.Errorf("failed to init metadata view from restored snapshot: %w", err)
 	}
-	v.lastCommitSeq = 0
+	v.lastCommitSeq.Store(0)
 
 	v.metadataView.ClearCache()
 	v.initLiveStatsLocked()
