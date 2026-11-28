@@ -38,6 +38,7 @@ import (
 	"github.com/gke-labs/in-cluster-storage/pkg/metrics"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/waldurability"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/scoped"
 	"github.com/gke-labs/in-cluster-storage/pkg/sds/view"
 	walclient "github.com/gke-labs/in-cluster-storage/pkg/wal/client"
@@ -137,6 +138,12 @@ func checkRPCErr(err error) error {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return status.Errorf(codes.DeadlineExceeded, "%v", err)
+	}
+	if errors.Is(err, objectstore.ErrUnavailable) {
+		// Safe to re-send: sync uploads all pending packs before appending any
+		// metadata record, so a failed upload leaves nothing committed and the
+		// node side, not the controller, does the retrying.
+		return grpcutil.ResendStatus("object store unavailable", time.Second)
 	}
 	return nil
 }
