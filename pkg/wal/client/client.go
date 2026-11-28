@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"os"
 	"path/filepath"
@@ -74,8 +75,21 @@ var ErrRecordDiscarded = errors.New("WAL record discarded due to history diverge
 // ErrClosed is returned when an operation is attempted on a closed stream or when the stream is closed while waiting.
 var ErrClosed = errors.New("stream closed")
 
-// DegradedError indicates that the WAL stream encountered an unrecoverable local store failure
-// (such as segment truncation error) and cannot safely accept or wait for further writes.
+// ErrWriterLockLost is returned when a stream handle that previously held the writer
+// lock reconnects and finds that another client wrote to the stream in between.
+var ErrWriterLockLost = errors.New("writer lock lost")
+
+// processClientID is generated once per process and sent in Hello.client_id
+// so the WAL buffer can enforce per-process stream writer lock ownership.
+var processClientID = uuid.New().String()
+
+// releaseTimeout is the maximum time Close waits for the replication session to
+// half-close and end cleanly with the WAL buffer before cancelling it.
+const releaseTimeout = 2 * time.Second
+
+// DegradedError indicates that the WAL stream encountered an unrecoverable failure
+// (such as a segment truncation error or writer lock loss) and cannot safely accept
+// or wait for further writes.
 type DegradedError struct {
 	Cause error
 	At    time.Time
@@ -140,10 +154,21 @@ type options struct {
 	recoveredRecords            []*wal.ClientRecord
 	degradedRetryInitialBackoff time.Duration
 	degradedRetryMaxBackoff     time.Duration
+	clientID                    string
 }
 
 // Option configures Stream options.
 type Option func(*options)
+
+// WithClientID overrides the per-process client ID sent in Hello.
+// Production code does not pass this; tests use it to act as a second process.
+func WithClientID(id string) Option {
+	return func(o *options) {
+		if id != "" {
+			o.clientID = id
+		}
+	}
+}
 
 // WithoutFsync configures the local segment store to skip per-record fsync.
 // This is intended only for tests and benchmarks where fsync latency is not desired.
@@ -219,6 +244,8 @@ type syncWaiter struct {
 type streamImpl struct {
 	dir      string
 	streamID uuid.UUID
+	// clientID identifies this process on the WAL buffer for stream writer lock ownership.
+	clientID string
 	target   string
 	opts     options
 
@@ -237,6 +264,13 @@ type streamImpl struct {
 	flushRequestedWhileInFlight bool
 	degradedTruncateSeq         uint64
 	reconciling                 bool
+	// lockGranted is set after the first completed HelloAck and never cleared. Guarded by mu.
+	lockGranted bool
+	// unverifiedGrant records that a non-resumed reconnect grant has not yet finished
+	// checking for writes by another client (for example if Tail failed transiently). Guarded by mu.
+	unverifiedGrant bool
+	// lastSessionErr records the most recent error from a failed replication session. Guarded by mu.
+	lastSessionErr error
 
 	initialHelloAckDone chan struct{}
 	initialHelloAckOnce sync.Once
@@ -250,8 +284,17 @@ type streamImpl struct {
 	newRecordSignal chan struct{}
 	cancelCtx       context.Context
 	cancelFunc      context.CancelFunc
-	closed          atomic.Bool
-	wg              sync.WaitGroup
+	// closing is closed by Close to ask the replication loop and active session to end cleanly.
+	closing chan struct{}
+	// replicationDone is closed when backgroundReplicationLoop returns.
+	replicationDone chan struct{}
+	// helloAckReceived is set once the first HelloAck is received, so Close only waits
+	// for a clean writer-lock release when a lock may have been granted.
+	helloAckReceived atomic.Bool
+	// releaseTimeout is the maximum time Close waits for a clean writer-lock release.
+	releaseTimeout time.Duration
+	closed         atomic.Bool
+	wg             sync.WaitGroup
 
 	replicationLevel Level
 	grpcClient       pb.WalBufferClient
@@ -260,9 +303,17 @@ type streamImpl struct {
 
 // Open opens or recovers a WAL stream on the local node.
 func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, opts ...Option) (Stream, error) {
+	return openStream(ctx, dir, streamID, target, releaseTimeout, opts...)
+}
+
+// openStream opens or recovers a WAL stream using lockReleaseTimeout as the
+// maximum time Close waits for a clean writer-lock release before cancelling
+// the replication session. Tests call openStream directly to bound that wait.
+func openStream(ctx context.Context, dir string, streamID uuid.UUID, target string, lockReleaseTimeout time.Duration, opts ...Option) (Stream, error) {
 	var opt options
 	opt.maxRetainedBytes = wal.DefaultMaxRetainedBytes
 	opt.maxSegmentSize = wal.DefaultMaxSegmentSize
+	opt.clientID = processClientID
 	for _, o := range opts {
 		o(&opt)
 	}
@@ -308,6 +359,7 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 	s := &streamImpl{
 		dir:                 dir,
 		streamID:            streamID,
+		clientID:            opt.clientID,
 		target:              target,
 		opts:                opt,
 		store:               store,
@@ -319,6 +371,9 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		newRecordSignal:     make(chan struct{}, 1),
 		cancelCtx:           cancelCtx,
 		cancelFunc:          cancelFunc,
+		closing:             make(chan struct{}),
+		replicationDone:     make(chan struct{}),
+		releaseTimeout:      lockReleaseTimeout,
 		replicationLevel:    Permanent,
 		initialHelloAckDone: make(chan struct{}),
 	}
@@ -349,6 +404,9 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 		}
 	}
 
+	helloTimer := time.NewTimer(helloTimeout)
+	defer helloTimer.Stop()
+
 	select {
 	case <-s.initialHelloAckDone:
 		s.mu.RLock()
@@ -359,11 +417,23 @@ func Open(ctx context.Context, dir string, streamID uuid.UUID, target string, op
 			errutil.CloseAndLog(s, "wal stream")
 			return nil, initErr
 		}
-	case <-time.After(helloTimeout):
+	case <-helloTimer.C:
 		errutil.CloseAndLog(s, "wal stream")
+		s.mu.RLock()
+		lastErr := s.lastSessionErr
+		s.mu.RUnlock()
+		if lastErr != nil {
+			return nil, fmt.Errorf("timeout waiting for initial HelloAck from WAL buffer target %s: %w", target, lastErr)
+		}
 		return nil, fmt.Errorf("timeout waiting for initial HelloAck from WAL buffer target %s", target)
 	case <-ctx.Done():
 		errutil.CloseAndLog(s, "wal stream")
+		s.mu.RLock()
+		lastErr := s.lastSessionErr
+		s.mu.RUnlock()
+		if lastErr != nil {
+			return nil, fmt.Errorf("failed to receive initial HelloAck from WAL buffer: %w: %w", ctx.Err(), lastErr)
+		}
 		return nil, fmt.Errorf("failed to receive initial HelloAck from WAL buffer: %w", ctx.Err())
 	}
 
@@ -422,6 +492,11 @@ func (s *streamImpl) Append(ctx context.Context, payload []byte) (uint64, error)
 		case <-doneCh:
 		}
 		s.mu.Lock()
+	}
+
+	if s.closed.Load() {
+		s.mu.Unlock()
+		return 0, ErrClosed
 	}
 
 	if s.degradedErr != nil {
@@ -728,13 +803,14 @@ func (s *streamImpl) setDegradedLocked(ctx context.Context, cause error, truncat
 	return s.degradedErr
 }
 
-// Close closes the stream, stopping background tasks and closing local store.
+// Close closes the stream, asking the active replication session to end cleanly
+// so the server releases the writer lock, then stopping background tasks and closing local store.
 func (s *streamImpl) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
 
-	s.cancelFunc()
+	close(s.closing)
 	s.initialHelloAckOnce.Do(func() {
 		close(s.initialHelloAckDone)
 	})
@@ -746,6 +822,18 @@ func (s *streamImpl) Close() error {
 	s.cond.Broadcast()
 	s.mu.Unlock()
 
+	if s.helloAckReceived.Load() {
+		releaseTimer := time.NewTimer(s.releaseTimeout)
+		select {
+		case <-s.replicationDone:
+			releaseTimer.Stop()
+		case <-releaseTimer.C:
+			scoped.Log(s.cancelCtx).Info("timed out waiting for WAL replication session to release writer lock; cancelling",
+				"timeout", s.releaseTimeout)
+		}
+	}
+
+	s.cancelFunc()
 	s.wg.Wait()
 
 	if s.grpcConn != nil {
@@ -759,6 +847,13 @@ func (s *streamImpl) Close() error {
 }
 
 func (s *streamImpl) retryDegradedTruncate(ctx context.Context) bool {
+	s.mu.RLock()
+	permanent := errors.Is(s.degradedErr, ErrWriterLockLost)
+	s.mu.RUnlock()
+	if permanent {
+		return false
+	}
+
 	backoff := 1 * time.Second
 	if s.opts.degradedRetryInitialBackoff > 0 {
 		backoff = s.opts.degradedRetryInitialBackoff
@@ -771,6 +866,8 @@ func (s *streamImpl) retryDegradedTruncate(ctx context.Context) bool {
 	for {
 		select {
 		case <-s.cancelCtx.Done():
+			return false
+		case <-s.closing:
 			return false
 		case <-time.After(backoff):
 		}
@@ -810,6 +907,7 @@ func (s *streamImpl) retryDegradedTruncate(ctx context.Context) bool {
 }
 
 func (s *streamImpl) backgroundReplicationLoop() {
+	defer close(s.replicationDone)
 	defer s.wg.Done()
 
 	backoff := 50 * time.Millisecond
@@ -819,6 +917,8 @@ func (s *streamImpl) backgroundReplicationLoop() {
 	for {
 		select {
 		case <-s.cancelCtx.Done():
+			return
+		case <-s.closing:
 			return
 		default:
 		}
@@ -836,6 +936,20 @@ func (s *streamImpl) backgroundReplicationLoop() {
 		}
 
 		err := s.runStreamSession()
+		if err != nil && !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+			s.mu.Lock()
+			s.lastSessionErr = err
+			s.mu.Unlock()
+		}
+		if _, resend := grpcutil.ResendDelay(err); resend && !s.helloAckReceived.Load() {
+			s.initialHelloAckOnce.Do(func() {
+				s.mu.Lock()
+				s.initialHelloAckErr = err
+				s.mu.Unlock()
+				close(s.initialHelloAckDone)
+			})
+			return
+		}
 		if err != nil && !s.closed.Load() {
 			s.mu.RLock()
 			degErr := s.degradedErr
@@ -861,6 +975,8 @@ func (s *streamImpl) backgroundReplicationLoop() {
 			select {
 			case <-s.cancelCtx.Done():
 				return
+			case <-s.closing:
+				return
 			case <-time.After(backoff):
 				backoff *= 2
 				if backoff > maxBackoff {
@@ -875,6 +991,12 @@ func (s *streamImpl) backgroundReplicationLoop() {
 }
 
 func (s *streamImpl) runStreamSession() error {
+	select {
+	case <-s.closing:
+		return nil
+	default:
+	}
+
 	ctx, cancel := context.WithCancel(s.cancelCtx)
 	defer cancel()
 
@@ -893,6 +1015,7 @@ func (s *streamImpl) runStreamSession() error {
 		Msg: &pb.AppendRequest_Hello{
 			Hello: &pb.Hello{
 				StreamId: s.streamID[:],
+				ClientId: []byte(s.clientID),
 			},
 		},
 	})
@@ -909,27 +1032,16 @@ func (s *streamImpl) runStreamSession() error {
 	if helloAck == nil {
 		return fmt.Errorf("expected HelloAck as first response, got: %+v", resp)
 	}
+	s.helloAckReceived.Store(true)
 
-	if err := s.handleHelloAck(ctx, helloAck); err != nil {
+	err = s.handleHelloAck(ctx, helloAck)
+	lockLost := errors.Is(err, ErrWriterLockLost)
+	if err != nil && !lockLost {
 		s.initialHelloAckOnce.Do(func() {
 			s.initialHelloAckErr = err
 			close(s.initialHelloAckDone)
 		})
 		return fmt.Errorf("handleHelloAck failed: %w", err)
-	}
-	s.mu.Lock()
-	s.initialHelloAckErr = nil
-	s.mu.Unlock()
-	s.initialHelloAckOnce.Do(func() {
-		close(s.initialHelloAckDone)
-	})
-
-	// The stream ID is kept in the message string because tests/e2e matches it verbatim.
-	if s.target != "" {
-		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID),
-			"target", s.target)
-	} else {
-		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID))
 	}
 
 	// 3. Concurrently receive Acks while replaying and sending newly appended records.
@@ -944,7 +1056,7 @@ func (s *streamImpl) runStreamSession() error {
 				recvErrCh <- err
 				return
 			}
-			if ack := ackResp.GetAck(); ack != nil {
+			if ack := ackResp.GetAck(); ack != nil && !lockLost {
 				firstAck.Do(func() {
 					scoped.Log(ctx).Info("WAL client stream first ack after reconnect",
 						"witnessWatermark", ack.WitnessAckedStreamSeq, "s3Watermark", ack.S3AckedStreamSeq)
@@ -953,6 +1065,64 @@ func (s *streamImpl) runStreamSession() error {
 			}
 		}
 	}()
+
+	closeCleanly := func() error {
+		if err := stream.CloseSend(); err != nil {
+			return fmt.Errorf("failed to half-close Append stream: %w", err)
+		}
+		timeout := s.releaseTimeout
+		if timeout <= 0 {
+			timeout = releaseTimeout
+		}
+		releaseTimer := time.NewTimer(timeout)
+		defer releaseTimer.Stop()
+		select {
+		case err := <-recvErrCh:
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		case <-releaseTimer.C:
+			scoped.Log(ctx).Info("timed out waiting for WAL buffer to release writer lock; cancelling", "timeout", timeout)
+			cancel()
+			<-recvErrCh
+			return context.DeadlineExceeded
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	if lockLost {
+		if closeErr := closeCleanly(); closeErr != nil {
+			scoped.Log(ctx).Info("failed to close Append stream cleanly after writer lock loss", "err", closeErr)
+		}
+		s.mu.Lock()
+		degradedErr := s.setDegradedLocked(ctx, ErrWriterLockLost, 0)
+		s.mu.Unlock()
+		return degradedErr
+	}
+
+	s.mu.Lock()
+	s.initialHelloAckErr = nil
+	s.lastSessionErr = nil
+	s.mu.Unlock()
+	s.initialHelloAckOnce.Do(func() {
+		close(s.initialHelloAckDone)
+	})
+
+	// The stream ID is kept in the message string because tests/e2e matches it verbatim.
+	if s.target != "" {
+		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID),
+			"target", s.target)
+	} else {
+		scoped.Log(ctx).Info(fmt.Sprintf("WAL client stream %s: replication session established", s.streamID))
+	}
+
+	select {
+	case <-s.closing:
+		return closeCleanly()
+	default:
+	}
 
 	// 4. Replay unacknowledged records (stream_seq > witnessAckedStreamSeq)
 	s.retainedMu.RLock()
@@ -972,6 +1142,11 @@ func (s *streamImpl) runStreamSession() error {
 	}
 
 	for _, rec := range recordsToReplay {
+		select {
+		case <-s.closing:
+			return closeCleanly()
+		default:
+		}
 		if err := stream.Send(&pb.AppendRequest{
 			Msg: &pb.AppendRequest_Record{
 				Record: rec.ToAppendProto(),
@@ -992,6 +1167,8 @@ func (s *streamImpl) runStreamSession() error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-s.closing:
+			return closeCleanly()
 		case err := <-recvErrCh:
 			return err
 		case <-s.newRecordSignal:
@@ -1027,15 +1204,24 @@ func (s *streamImpl) handleHelloAck(ctx context.Context, helloAck *pb.HelloAck) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	mayHaveLostLock := s.unverifiedGrant || (s.lockGranted && !helloAck.Resumed)
+	if mayHaveLostLock {
+		s.unverifiedGrant = true
+	}
+
 	witnessHead := helloAck.WitnessAckedStreamSeq
 	scoped.Log(ctx).Info("WAL client stream HelloAck received",
-		"witnessWatermark", witnessHead, "s3Watermark", helloAck.S3AckedStreamSeq, "localHead", s.localSeq)
+		"witnessWatermark", witnessHead, "s3Watermark", helloAck.S3AckedStreamSeq, "localHead", s.localSeq, "resumed", helloAck.Resumed)
 	if witnessHead > s.localSeq {
+		if mayHaveLostLock {
+			s.reconciling = true
+			return ErrWriterLockLost
+		}
 		scoped.Log(ctx).Info("buffer witness watermark is ahead of local stream head; continuing sequence numbering from buffer head",
 			"witnessWatermark", witnessHead, "localHead", s.localSeq)
 		s.localSeq = witnessHead
-	} else if witnessHead > 0 && s.localSeq > witnessHead {
-		// Local history has records above the buffer's witness watermark.
+	} else if witnessHead > 0 && (s.localSeq > witnessHead || (mayHaveLostLock && s.localSeq == witnessHead)) {
+		// Local history has records at or above the buffer's witness watermark.
 		// Check if local record at witnessHead matches the authoritative buffer record.
 		s.retainedMu.RLock()
 		var localRecAtHead *wal.ClientRecord
@@ -1070,8 +1256,12 @@ func (s *streamImpl) handleHelloAck(ctx context.Context, helloAck *pb.HelloAck) 
 				return fmt.Errorf("record at witness head %d not found in buffer stream tail", witnessHead)
 			}
 
-			// Only discard if buffer returns a record at witnessHead and its content differs
+			// Only diverge if buffer returns a record at witnessHead and its content differs
 			if !bytes.Equal(localRecAtHead.Payload, bufferPayload) {
+				if mayHaveLostLock {
+					s.reconciling = true
+					return ErrWriterLockLost
+				}
 				// 1. Order on-disk truncate before the memory mutation so that a failure
 				// leaves memory and disk consistent, allowing divergence to be re-detected on retry.
 				if s.store != nil {
@@ -1136,6 +1326,8 @@ func (s *streamImpl) handleHelloAck(ctx context.Context, helloAck *pb.HelloAck) 
 		s.cleanupS3AckedLocked(ctx, helloAck.S3AckedStreamSeq)
 	}
 
+	s.lockGranted = true
+	s.unverifiedGrant = false
 	s.notifyWaitersLocked()
 	s.reconciling = false
 	if s.cond != nil {

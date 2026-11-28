@@ -447,6 +447,7 @@ func (d *objectFSDriver) getClient(ctx context.Context) (pb.ObjectFSControllerCl
 		grpcutil.DialOptions(
 			grpc.WithTransportCredentials(creds),
 			grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+			grpc.WithChainUnaryInterceptor(grpcutil.ResendUnaryClientInterceptor()),
 		)...,
 	)
 	if err != nil {
