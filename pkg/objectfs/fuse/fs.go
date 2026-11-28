@@ -1239,6 +1239,7 @@ func (fs *ObjectFS) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name stri
 		Gid:         input.Gid,
 		RequestId:   nextRequestID(),
 		Exclusive:   true,
+		NoHandle:    true,
 	})
 	if err != nil {
 		return fs.grpcErrorToStatus(ctx, "CreateFile", err)
