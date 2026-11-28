@@ -742,6 +742,34 @@ func (s *Server) getOrCreateVolume(volumeID string) (*Volume, error) {
 	if ok && volume.IsDeleted() {
 		return nil, status.Errorf(codes.NotFound, "volume %s has been deleted", volumeID)
 	}
+	if ok && volume.writerLockLost() {
+		log := scoped.Log(context.Background())
+		// Another controller wrote to the volume's stream, so everything this
+		// Volume holds in memory is stale. Move staged pack files aside before
+		// Close deletes the staging directory, close (not Stop: nothing may
+		// drain through the lost stream), move local WAL segments aside so the
+		// reopened stream cannot replay them, then fall through to reload.
+		if volume.stagingDir != "" && volume.localStorageDir != "" {
+			stagingDestination := fmt.Sprintf("%s.writer-lock-lost-%d", filepath.Clean(volume.localStorageDir), time.Now().UnixNano())
+			if err := os.Rename(volume.stagingDir, stagingDestination); err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					log.Error(err, "failed to move staging directory aside after writer lock loss", "volume", volumeID, "destination", stagingDestination)
+				}
+			} else {
+				log.Info("moved staging directory aside after writer lock loss", "volume", volumeID, "destination", stagingDestination)
+			}
+		}
+		if err := volume.Close(); err != nil {
+			log.Error(err, "failed to close volume after writer lock loss", "volume", volumeID)
+		}
+		if movedSegments, err := walclient.MoveSegmentsAside(s.wal.dir, volume.StreamID()); err != nil {
+			return nil, fmt.Errorf("failed to move WAL segments aside for volume %s after writer lock loss: %w", volumeID, err)
+		} else if movedSegments != "" {
+			log.Info("moved WAL segments aside after writer lock loss", "volume", volumeID, "destination", movedSegments)
+		}
+		delete(s.volumes, volumeID)
+		ok = false
+	}
 	if !ok {
 		var err error
 		volume, err = s.createVolumeInstanceLocked(volumeID)
@@ -781,9 +809,11 @@ func (s *Server) Start(ctx context.Context) error {
 // Close discards unsynced staged writes; Server.Close alone does not drain.
 // Writes that were staged but not yet acknowledged by an fsync are lost; Close
 // has crash semantics. A caller who wants them kept must call Shutdown
-// as the draining path and check its error. Close does not call Stop itself
-// because it must never block (that is what lets it be used when the stream or
-// the object store is unreachable).
+// as the draining path and check its error. Close does not call Stop itself so
+// it can still complete when the object store or stream server is unreachable,
+// though closing an established WAL stream may wait up to the client's 2 s
+// release timeout against a silent stream server (volumes are closed
+// concurrently).
 func (s *Server) Close() error {
 	var errs []error
 	var ran bool
