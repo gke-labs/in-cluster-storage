@@ -616,21 +616,6 @@ func (s *StreamStore) EnsureDiscovered(ctx context.Context, streamID uuid.UUID) 
 	return w.uploadedTo
 }
 
-// Watermarks returns the highest known sequence for each stream held in the store.
-func (s *StreamStore) Watermarks() map[string]uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	watermarks := make(map[string]uint64, len(s.streams))
-	for streamID, writer := range s.streams {
-		writer.mu.Lock()
-		if writer.lastSeq > 0 {
-			watermarks[streamID] = writer.lastSeq
-		}
-		writer.mu.Unlock()
-	}
-	return watermarks
-}
-
 func (s *StreamStore) getOrCreateStream(streamID uuid.UUID) *streamWriter {
 	s.mu.Lock()
 	defer s.mu.Unlock()

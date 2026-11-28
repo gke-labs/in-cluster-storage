@@ -322,12 +322,6 @@ type Server struct {
 	// flushSeq is incremented on each successful flush. Guarded by flushMu.
 	flushSeq uint64
 
-	// pendingListPosition is non-zero when startup skipped the object store listing
-	// because the store was unavailable, recording the highest local position seen at startup.
-	// The stale-disk check compares positions only, not content.
-	// Read and cleared only inside doFlush, which runs one at a time while isFlushing is true.
-	pendingListPosition uint64
-
 	// Lifecycle and background worker coordination (self-synchronized; not guarded by a mutex).
 
 	// stopChan is closed on Server.Close to signal background workers and sessions to terminate.
@@ -398,9 +392,9 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	dataDir := cfg.DataDir
 
 	// 1. Discover existing segments from backend
-	discoveredSegments, lastFlushedPos, listError := ListSegmentsFromBackend(ctx, cfg.Backend)
-	if listError != nil && !errors.Is(listError, objectstore.ErrUnavailable) {
-		return nil, fmt.Errorf("failed to list segments from backend: %w", listError)
+	discoveredSegments, lastFlushedPos, err := ListSegmentsFromBackend(ctx, cfg.Backend)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list segments from backend: %w", err)
 	}
 
 	streamStore := NewStreamStore(dataDir, cfg.Backend, cfg.StreamSealInterval, cfg.StreamSealBytes)
@@ -455,11 +449,6 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize local segment store: %w", err)
 	}
-	defer func() {
-		if localStore != nil {
-			errutil.CloseAndLog(localStore, "local segment store")
-		}
-	}()
 
 	localWatermarks := make(map[string]uint64)
 	localMaxPos := lastFlushedPos
@@ -471,18 +460,6 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		if rec.Position > localMaxPos {
 			localMaxPos = rec.Position
 		}
-	}
-
-	var pendingListPosition uint64
-	if listError != nil {
-		if localMaxPos == 0 {
-			// An empty local log may be a fresh, lost, or fully flushed disk;
-			// without the object store listing the next position is unknown.
-			return nil, fmt.Errorf("failed to list segments from backend: %w", listError)
-		}
-		pendingListPosition = localMaxPos
-		scoped.Log(ctx).Error(listError, "object store unavailable at startup; starting from local disk",
-			"localMaxPosition", localMaxPos, "localRecords", len(localRecords))
 	}
 
 	// Build combined stream watermarks across backend and local segments
@@ -513,13 +490,6 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	allDiscoveredRecords = append(allDiscoveredRecords, localRecords...)
 	if err := streamStore.Recover(ctx, allDiscoveredRecords); err != nil {
 		klog.Warningf("Error during stream store recovery: %v", err)
-	}
-	if pendingListPosition > 0 {
-		for streamID, sequence := range streamStore.Watermarks() {
-			if sequence > streamWatermarks[streamID] {
-				streamWatermarks[streamID] = sequence
-			}
-		}
 	}
 
 	nextPosition := localMaxPos + 1
@@ -552,7 +522,6 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		localStore:          localStore,
 		unflushedRecords:    unflushed,
 		unflushedBytes:      unflushedBytes,
-		pendingListPosition: pendingListPosition,
 		incomingChan:        make(chan incomingItem, 1024),
 		tailWaiters:         make(map[chan struct{}]struct{}),
 		stopChan:            make(chan struct{}),
@@ -566,14 +535,13 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	s.streamStore.SetEvictHook(s.evictIdleStreams)
 
 	// Flush the local-only tail before serving
-	if pendingListPosition == 0 {
-		if len(unflushed) > 0 {
-			if _, err := s.flushInternal(ctx); err != nil {
-				klog.Warningf("Failed to flush local-only tail during startup recovery: %v", err)
-			}
+	if len(unflushed) > 0 {
+		if _, err := s.flushInternal(ctx); err != nil {
+			klog.Warningf("Failed to flush local-only tail during startup recovery: %v", err)
 		}
-		s.checkAggregatedSegmentGC(ctx)
 	}
+
+	s.checkAggregatedSegmentGC(ctx)
 
 	// Start background group commit worker
 	s.groupCommitWg.Add(1)
@@ -590,7 +558,6 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	s.dataDirectoryLock = dataDirectoryLock
 	dataDirectoryLock = nil
 	streamStore = nil
-	localStore = nil
 
 	return s, nil
 }
@@ -1654,71 +1621,37 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 		return nil
 	}
 
-	var discoveredSegments []string
-	var storeLastFlushedPosition uint64
-	reconciling := s.pendingListPosition > 0
-	if reconciling {
-		var err error
-		discoveredSegments, storeLastFlushedPosition, err = ListSegmentsFromBackend(ctx, s.backend)
-		if err != nil {
-			return fmt.Errorf("failed to list segments from backend before flush: %w", err)
-		}
-		if storeLastFlushedPosition > s.pendingListPosition {
-			return fmt.Errorf("refusing to flush from stale local disk: object store has position %d beyond startup local position %d",
-				storeLastFlushedPosition, s.pendingListPosition)
-		}
-	}
+	firstPos := records[0].Position
+	lastPos := records[len(records)-1].Position
 
+	// 1. Encode all records into segment byte buffer
+	var segBuf bytes.Buffer
+	segBuf.Write(wal.DefaultSegmentHeader().Encode())
 	streamMaxSeq := make(map[string]uint64)
-	var recordsToUpload []*wal.LogRecord
-	for _, record := range records {
-		streamID := record.StreamID.String()
-		if record.StreamSeq > streamMaxSeq[streamID] {
-			streamMaxSeq[streamID] = record.StreamSeq
-		}
-		if !reconciling || record.Position > storeLastFlushedPosition {
-			recordsToUpload = append(recordsToUpload, record)
+
+	for _, rec := range records {
+		encoded := rec.Encode()
+		segBuf.Write(encoded)
+		sid := rec.StreamID.String()
+		if rec.StreamSeq > streamMaxSeq[sid] {
+			streamMaxSeq[sid] = rec.StreamSeq
 		}
 	}
 
-	var segmentPath string
-	var lastPosition uint64
-	var segmentBytes int
-	if len(recordsToUpload) > 0 {
-		firstPosition := recordsToUpload[0].Position
-		lastPosition = recordsToUpload[len(recordsToUpload)-1].Position
+	segPath := fmt.Sprintf("%s%012d-%012d.wal", SegmentsPrefix, firstPos, lastPos)
+	segStream := blob.NewByteStreamFromBytes(segBuf.Bytes())
+	defer errutil.CloseAndLog(segStream, fmt.Sprintf("segment stream %s", segPath))
 
-		// 1. Encode all records into segment byte buffer
-		var segmentBuffer bytes.Buffer
-		segmentBuffer.Write(wal.DefaultSegmentHeader().Encode())
-		for _, record := range recordsToUpload {
-			segmentBuffer.Write(record.Encode())
-		}
-
-		segmentPath = fmt.Sprintf("%s%012d-%012d.wal", SegmentsPrefix, firstPosition, lastPosition)
-		segmentBytes = segmentBuffer.Len()
-		segmentStream := blob.NewByteStreamFromBytes(segmentBuffer.Bytes())
-		defer errutil.CloseAndLog(segmentStream, fmt.Sprintf("segment stream %s", segmentPath))
-
-		// 2. Put segment object to object storage
-		if _, err := s.backend.PutObject(ctx, "", segmentPath, segmentStream); err != nil {
-			return fmt.Errorf("failed to upload segment %s: %w", segmentPath, err)
-		}
+	// 2. Put segment object to object storage
+	if _, err := s.backend.PutObject(ctx, "", segPath, segStream); err != nil {
+		return fmt.Errorf("failed to upload segment %s: %w", segPath, err)
 	}
 
 	// 3. Update flushed segments list and stream watermarks
 	s.mu.Lock()
-	if reconciling {
-		s.flushedSegments = discoveredSegments
-		if storeLastFlushedPosition > s.lastFlushedPosition {
-			s.lastFlushedPosition = storeLastFlushedPosition
-		}
-	}
-	if segmentPath != "" {
-		s.flushedSegments = append(s.flushedSegments, segmentPath)
-		if lastPosition > s.lastFlushedPosition {
-			s.lastFlushedPosition = lastPosition
-		}
+	s.flushedSegments = append(s.flushedSegments, segPath)
+	if lastPos > s.lastFlushedPosition {
+		s.lastFlushedPosition = lastPos
 	}
 	lastFlushedPosition := s.lastFlushedPosition
 
@@ -1735,14 +1668,8 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 	}
 	s.mu.Unlock()
 
-	if reconciling {
-		s.pendingListPosition = 0
-	}
-
-	if segmentPath != "" {
-		s.streamStore.TrackSegmentCoverage(segmentPath, recordsToUpload)
-		s.checkAggregatedSegmentGC(ctx)
-	}
+	s.streamStore.TrackSegmentCoverage(segPath, records)
+	s.checkAggregatedSegmentGC(ctx)
 
 	// 4. Clean up local segment files that have been flushed to permanent storage
 	if err := s.localStore.DeleteSegmentsThrough(lastFlushedPosition, s.cfg.TailCacheBytes); err != nil {
@@ -1755,9 +1682,7 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 		st.cond.Broadcast()
 	}
 
-	if segmentPath != "" {
-		scoped.Log(ctx).Info("flushed WAL segment to permanent storage", "segment", segmentPath, "records", len(recordsToUpload), "bytes", segmentBytes)
-	}
+	klog.Infof("Flushed WAL segment %s (%d records, %d bytes) to permanent storage", segPath, len(records), segBuf.Len())
 	return nil
 }
 
