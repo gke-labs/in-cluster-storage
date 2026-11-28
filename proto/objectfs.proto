@@ -209,6 +209,8 @@ message CreateFileRequest {
   bool exclusive = 10;
   // Truncate an existing regular file when the name already exists (corresponds to O_TRUNC).
   bool truncate = 11;
+  // When true, create the node without allocating an open file handle (used by mknod).
+  bool no_handle = 12;
 }
 
 message CreateFileResponse {

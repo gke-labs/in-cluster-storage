@@ -1296,6 +1296,46 @@ func TestFUSEMknodSpecialFiles(t *testing.T) {
 	}
 }
 
+func TestFUSEMknodUnlinkDeletesInode(t *testing.T) {
+	client, cleanup := createTestClient(t)
+	defer cleanup()
+
+	rawFS := NewObjectFS(client, "fuse-mknod-unlink-vol", pb.WriteMode_FSYNC, NewNodeCache(1024*1024))
+
+	cases := []struct {
+		name string
+		mode uint32
+		rdev uint32
+	}{
+		{name: "fifo", mode: syscall.S_IFIFO | 0644},
+		{name: "chr", mode: syscall.S_IFCHR | 0660, rdev: 0x0103},
+		{name: "reg", mode: syscall.S_IFREG | 0644},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var entryOut fuse.EntryOut
+			status := rawFS.Mknod(nil, &fuse.MknodIn{
+				InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID},
+				Mode:     testCase.mode,
+				Rdev:     testCase.rdev,
+			}, testCase.name, &entryOut)
+			if status != fuse.OK {
+				t.Fatalf("Mknod %s failed: %v", testCase.name, status)
+			}
+
+			if status := rawFS.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, testCase.name); status != fuse.OK {
+				t.Fatalf("Unlink %s failed: %v", testCase.name, status)
+			}
+
+			var attrOut fuse.AttrOut
+			if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: entryOut.NodeId}}, &attrOut); status != fuse.ENOENT {
+				t.Fatalf("GetAttr after Unlink on %s (ino %d) = %v (nlink=%d), want ENOENT", testCase.name, entryOut.NodeId, status, attrOut.Attr.Nlink)
+			}
+		})
+	}
+}
+
 func TestFUSETruncateAndUnalignedWriteWithCacheInvalidation(t *testing.T) {
 	client, cleanup := createTestClient(t)
 	defer cleanup()
@@ -7648,9 +7688,9 @@ func TestFUSECreatePassesOpenFlags(t *testing.T) {
 			Mode:     0644,
 		}, tc.name, &createOut)
 		got := capture.createReqs[len(capture.createReqs)-1]
-		if got.GetExclusive() != tc.exclusive || got.GetTruncate() != tc.truncate {
-			t.Fatalf("%s: got exclusive=%v truncate=%v, want exclusive=%v truncate=%v",
-				tc.name, got.GetExclusive(), got.GetTruncate(), tc.exclusive, tc.truncate)
+		if got.GetExclusive() != tc.exclusive || got.GetTruncate() != tc.truncate || got.GetNoHandle() {
+			t.Fatalf("%s: got exclusive=%v truncate=%v no_handle=%v, want exclusive=%v truncate=%v no_handle=false",
+				tc.name, got.GetExclusive(), got.GetTruncate(), got.GetNoHandle(), tc.exclusive, tc.truncate)
 		}
 	}
 
@@ -7660,9 +7700,9 @@ func TestFUSECreatePassesOpenFlags(t *testing.T) {
 		Mode:     syscall.S_IFREG | 0644,
 	}, "mknod-reg", &mknodOut)
 	gotMknod := capture.createReqs[len(capture.createReqs)-1]
-	if !gotMknod.GetExclusive() || gotMknod.GetTruncate() {
-		t.Fatalf("mknod: got exclusive=%v truncate=%v, want exclusive=true truncate=false",
-			gotMknod.GetExclusive(), gotMknod.GetTruncate())
+	if !gotMknod.GetExclusive() || gotMknod.GetTruncate() || !gotMknod.GetNoHandle() {
+		t.Fatalf("mknod: got exclusive=%v truncate=%v no_handle=%v, want exclusive=true truncate=false no_handle=true",
+			gotMknod.GetExclusive(), gotMknod.GetTruncate(), gotMknod.GetNoHandle())
 	}
 
 	// Opening an existing non-empty file via Create must not seed empty bytes into NodeCache.

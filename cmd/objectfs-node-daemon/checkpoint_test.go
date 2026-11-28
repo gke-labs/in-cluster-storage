@@ -897,3 +897,91 @@ func TestScanUpperLayer_SpecialBits(t *testing.T) {
 		t.Errorf("sticky_dir mode = %#o, want %#o", got, 01777)
 	}
 }
+
+type recordingCreateClient struct {
+	pb.ObjectFSControllerClient
+	createRequests  []*pb.CreateFileRequest
+	createResponses []*pb.CreateFileResponse
+}
+
+func (c *recordingCreateClient) CreateFile(ctx context.Context, request *pb.CreateFileRequest, opts ...grpc.CallOption) (*pb.CreateFileResponse, error) {
+	response, err := c.ObjectFSControllerClient.CreateFile(ctx, request, opts...)
+	c.createRequests = append(c.createRequests, request)
+	c.createResponses = append(c.createResponses, response)
+	return response, err
+}
+
+func TestReplayOperations_CreateUnlinkDeletesInode(t *testing.T) {
+	ctx := t.Context()
+	server := controllertest.NewTestServer(nil)
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("close server: %v", err)
+		}
+	})
+	const volumeID = "test-replay-create-unlink-vol"
+
+	listener := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+	defer grpcServer.Stop()
+
+	connection, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("dial bufnet: %v", err)
+	}
+	defer func() {
+		if err := connection.Close(); err != nil {
+			t.Errorf("close connection: %v", err)
+		}
+	}()
+
+	baseClient := pb.NewObjectFSControllerClient(connection)
+	client := &recordingCreateClient{ObjectFSControllerClient: baseClient}
+
+	if _, err := ReplayOperations(ctx, client, volumeID, []FileOp{
+		{Type: OpCreateFile, Path: "file.txt", Name: "file.txt", Mode: 0644, Data: []byte("hello")},
+	}); err != nil {
+		t.Fatalf("ReplayOperations create failed: %v", err)
+	}
+
+	lookupResponse, err := baseClient.Lookup(ctx, &pb.LookupRequest{
+		VolumeId:    volumeID,
+		ParentInode: 1,
+		Name:        "file.txt",
+	})
+	if err != nil || lookupResponse.GetError() != 0 {
+		t.Fatalf("Lookup file.txt: err=%v errno=%d", err, lookupResponse.GetError())
+	}
+	inodeID := lookupResponse.GetAttr().GetInode().GetIno()
+
+	if _, err := ReplayOperations(ctx, client, volumeID, []FileOp{
+		{Type: OpUnlink, Path: "file.txt", Name: "file.txt"},
+	}); err != nil {
+		t.Fatalf("ReplayOperations unlink failed: %v", err)
+	}
+
+	attrResponse, err := baseClient.GetAttr(ctx, &pb.GetAttrRequest{
+		VolumeId: volumeID,
+		Inode:    inodeID,
+	})
+	if err != nil || attrResponse.GetError() != int32(syscall.ENOENT) {
+		t.Errorf("GetAttr after Unlink on inode %d: err=%v errno=%d nlink=%d, want ENOENT",
+			inodeID, err, attrResponse.GetError(), attrResponse.GetAttr().GetInode().GetNlink())
+	}
+	if len(client.createRequests) != 1 {
+		t.Fatalf("recorded %d CreateFile requests, want 1", len(client.createRequests))
+	}
+	if !client.createRequests[0].GetNoHandle() || client.createResponses[0].GetFh() != 0 {
+		t.Errorf("CreateFile no_handle=%v fh=%d, want no_handle=true fh=0",
+			client.createRequests[0].GetNoHandle(), client.createResponses[0].GetFh())
+	}
+}

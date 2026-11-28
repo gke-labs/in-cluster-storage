@@ -1245,7 +1245,9 @@ type CreateFileRequest struct {
 	// Fail with EEXIST if the name already exists (corresponds to O_EXCL).
 	Exclusive bool `protobuf:"varint,10,opt,name=exclusive,proto3" json:"exclusive,omitempty"`
 	// Truncate an existing regular file when the name already exists (corresponds to O_TRUNC).
-	Truncate      bool `protobuf:"varint,11,opt,name=truncate,proto3" json:"truncate,omitempty"`
+	Truncate bool `protobuf:"varint,11,opt,name=truncate,proto3" json:"truncate,omitempty"`
+	// When true, create the node without allocating an open file handle (used by mknod).
+	NoHandle      bool `protobuf:"varint,12,opt,name=no_handle,json=noHandle,proto3" json:"no_handle,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1353,6 +1355,13 @@ func (x *CreateFileRequest) GetExclusive() bool {
 func (x *CreateFileRequest) GetTruncate() bool {
 	if x != nil {
 		return x.Truncate
+	}
+	return false
+}
+
+func (x *CreateFileRequest) GetNoHandle() bool {
+	if x != nil {
+		return x.NoHandle
 	}
 	return false
 }
@@ -6486,7 +6495,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\rMkdirResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12'\n" +
-	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xb5\x02\n" +
+	"\x0fstream_position\x18\x03 \x01(\x04R\x0estreamPosition\"\xd2\x02\n" +
 	"\x11CreateFileRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12!\n" +
 	"\fparent_inode\x18\x02 \x01(\x04R\vparentInode\x12\x12\n" +
@@ -6500,7 +6509,8 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"request_id\x18\t \x01(\fR\trequestId\x12\x1c\n" +
 	"\texclusive\x18\n" +
 	" \x01(\bR\texclusive\x12\x1a\n" +
-	"\btruncate\x18\v \x01(\bR\btruncate\"\x95\x01\n" +
+	"\btruncate\x18\v \x01(\bR\btruncate\x12\x1b\n" +
+	"\tno_handle\x18\f \x01(\bR\bnoHandle\"\x95\x01\n" +
 	"\x12CreateFileResponse\x120\n" +
 	"\x04attr\x18\x01 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\x05R\x05error\x12\x0e\n" +
