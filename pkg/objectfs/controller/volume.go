@@ -2033,6 +2033,13 @@ func (v *Volume) Degraded() *walclient.DegradedError {
 	return stream.Degraded()
 }
 
+// writerLockLost reports whether the volume's stream is degraded because it lost
+// its writer lock to another client.
+func (v *Volume) writerLockLost() bool {
+	degraded := v.Degraded()
+	return degraded != nil && errors.Is(degraded, walclient.ErrWriterLockLost)
+}
+
 // ResetStream updates the volume's underlying WAL stream after repair or reconfiguration.
 func (v *Volume) ResetStream(stream walclient.Stream) error {
 	v.mu.Lock()
@@ -2415,9 +2422,10 @@ func (v *Volume) closeStagingLocked() bool {
 // Close discards unsynced staged writes and deletes the staging directory.
 // Writes that were staged but not yet acknowledged by an fsync are lost; Close
 // has crash semantics. A caller who wants them kept must call Stop(ctx) first
-// and check its error. Close does not call Stop itself because it must never
-// block (that is what lets it be used when the stream or the object store is
-// unreachable).
+// and check its error. Close does not call Stop itself so it can still complete
+// when the object store or stream server is unreachable, though closing an
+// established WAL stream may wait up to the client's 2 s release timeout
+// against a silent stream server.
 func (v *Volume) Close() error {
 	v.mu.Lock()
 	if v.closed {

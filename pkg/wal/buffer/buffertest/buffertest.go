@@ -89,6 +89,8 @@ type config struct {
 	bufSize            int
 	noFsync            bool
 	acceptUnversioned  bool
+	writerLockGrace    time.Duration
+	clock              buffer.Clock
 }
 
 // WithBackend configures the backend object storage for the buffer.
@@ -147,6 +149,45 @@ func WithAcceptUnversioned(accept bool) Option {
 	}
 }
 
+// FakeClock implements buffer.Clock with a manually controlled timestamp.
+type FakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+// NewFakeClock returns a FakeClock fixed at start.
+func NewFakeClock(start time.Time) *FakeClock {
+	return &FakeClock{now: start}
+}
+
+// Now returns the current clock time.
+func (clock *FakeClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+// Advance moves the clock forward by duration.
+func (clock *FakeClock) Advance(duration time.Duration) {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	clock.now = clock.now.Add(duration)
+}
+
+// WithWriterLockGrace configures the writer lock grace period on the buffer server.
+func WithWriterLockGrace(gracePeriod time.Duration) Option {
+	return func(c *config) {
+		c.writerLockGrace = gracePeriod
+	}
+}
+
+// WithClock configures the clock used by the buffer server for writer lock grace periods.
+func WithClock(clock buffer.Clock) Option {
+	return func(c *config) {
+		c.clock = clock
+	}
+}
+
 // Start launches an in-process WAL buffer server over bufconn.
 // If t is provided, the buffer's Close is automatically registered via t.Cleanup.
 func Start(ctx context.Context, t testing.TB, opts ...Option) (*BufferTest, func()) {
@@ -185,6 +226,8 @@ func Start(ctx context.Context, t testing.TB, opts ...Option) (*BufferTest, func
 		StreamSealInterval: cfg.streamSealInterval,
 		NoFsync:            cfg.noFsync,
 		AcceptUnversioned:  cfg.acceptUnversioned,
+		WriterLockGrace:    cfg.writerLockGrace,
+		Clock:              cfg.clock,
 	})
 	if err != nil {
 		if t != nil {
